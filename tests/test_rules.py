@@ -51,3 +51,20 @@ def test_device_name_suffix_is_a_conflict_copy() -> None:
     match = classify_file("money/plan-hermon.xlsx", 10_000, device_names=["zefat", "hermon"])
     assert match is not None and match.category == rules.CAT_CONFLICT
     assert classify_file("money/plan-hermon.xlsx", 10_000, device_names=["zefat"]) is None
+
+
+@pytest.mark.parametrize(
+    ("name", "original"),
+    [
+        ("report (1).pdf", "report.pdf"),
+        ("plan-zefat.xlsx", "plan.xlsx"),
+        ("note-safeBackup-0001.one", "note.one"),
+        ("note-zefat-safeBackup-0001.one", "note.one"),
+        ("abc [conflicted].unity3d", "abc.unity3d"),
+        ("file.txt.conflict1", "file.txt"),
+        ("FFXIV - コピー.cfg", "FFXIV.cfg"),
+        ("zefat.txt", None),
+    ],
+)
+def test_conflict_original(name: str, original: str | None) -> None:
+    assert rules.conflict_original(name, ["zefat"]) == original

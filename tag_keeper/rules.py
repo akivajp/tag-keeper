@@ -36,6 +36,20 @@ CATEGORY_ORDER = [
     CAT_EMPTY_DIR,
 ]
 
+# コマンドラインでカテゴリを指定するための短い名前
+CATEGORY_KEYS = {
+    "app-data": CAT_APP_DATA,
+    "regenerable": CAT_REGENERABLE,
+    "vm-image": CAT_VM_IMAGE,
+    "installer": CAT_INSTALLER,
+    "conflict": CAT_CONFLICT,
+    "office-lock": CAT_OFFICE_LOCK,
+    "os-junk": CAT_OS_JUNK,
+    "temp": CAT_TEMP,
+    "empty-file": CAT_EMPTY_FILE,
+    "empty-dir": CAT_EMPTY_DIR,
+}
+
 # 作り直せる生成物のフォルダ名（中身ごと候補にする）
 REGENERABLE_DIRS = frozenset(
     {
@@ -136,6 +150,33 @@ def classify_file(
     if size == 0:
         return Match(CAT_EMPTY_FILE, "中身が空")
     return None
+
+
+def conflict_original(name: str, device_names: Iterable[str] = ()) -> str | None:
+    """競合コピー・複製の名前から、元のファイルの名前を推定する。推定できなければ None。
+
+    例: "report (1).pdf" → "report.pdf"、"plan-zefat.xlsx" → "plan.xlsx"、
+    "note-zefat-safeBackup-0001.one" → "note.one"、"a.txt.conflict1" → "a.txt"
+    """
+    stem, ext = os.path.splitext(name)  # 元の名前なので、拡張子の大文字・小文字はそのまま使う
+    base: str | None = None
+    for _reason, pattern in _CONFLICT_PATTERNS:
+        if pattern.search(stem):
+            stem = pattern.sub("", stem).rstrip()
+            base = stem
+            break
+        if pattern.search(name):
+            # 拡張子の後ろに印が付く形（a.txt.conflict1）
+            stem, ext = os.path.splitext(pattern.sub("", name).rstrip())
+            base = stem
+            break
+    # 端末名の印（単独で付く場合と、onedrive クライアントの -safeBackup- の前に付く場合）
+    for device in device_names:
+        suffix = "-" + device.lower()
+        if device and stem.lower().endswith(suffix) and len(stem) > len(suffix):
+            base = stem[: -len(suffix)]
+            break
+    return base + ext if base else None
 
 
 # バージョン管理システムが中身を管理するフォルダ

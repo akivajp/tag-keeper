@@ -8,6 +8,8 @@
   条件を満たすフォルダのうち最も深いものだけを報告する
   （ゲームのデータを抱えた「ドキュメント」全体を候補にして、利用者の書類まで隠さないため）。
 - 重複は、ハッシュを計算済みのファイルだけで判定する（推測では報告しない）。
+- 競合コピー・複製は、同じフォルダに元のファイルがあるものだけを報告する。
+  元が無ければ、それが今の唯一の版（または意図して名前を付けた控え）なので、置く価値が薄いとは言えない。
 """
 
 from __future__ import annotations
@@ -33,6 +35,9 @@ class Finding:
     files: int
     size: int
     reason: str
+    # 人が中身を確かめてから判断すべきもの（元のファイルと内容が異なる競合コピーなど）。
+    # 整理プランには既定で含めない
+    needs_review: bool = False
 
 
 @dataclass
@@ -210,6 +215,7 @@ def build_report(
         )
 
     # 3. ファイル単位の候補と重複（フォルダ単位の候補の配下と、報告しないパスは除く）
+    by_path = {r["relpath"]: r for r in files}
     by_hash: dict[str, list[sqlite3.Row]] = defaultdict(list)
     direct_files: Counter[str] = Counter()
     for r in files:
@@ -218,8 +224,13 @@ def build_report(
             continue
         direct_files[parent_of(rel)] += 1
         match = rules.classify_file(rel, r["size"], hygiene.device_names)
+        needs_review = False
+        if match is not None and match.category == rules.CAT_CONFLICT:
+            match, needs_review = _check_conflict_original(r, by_path, match, hygiene.device_names)
         if match is not None:
-            report.findings.append(Finding(match.category, rel, False, 1, r["size"], match.reason))
+            report.findings.append(
+                Finding(match.category, rel, False, 1, r["size"], match.reason, needs_review)
+            )
         if r["size"] > 0 and _hash_is_current(r):
             by_hash[r["sha256"]].append(r)
 
@@ -236,6 +247,35 @@ def build_report(
     report.duplicates = sorted(groups, key=lambda g: g.waste, reverse=True)
     report.fanout = direct_files.most_common(top_fanout)
     return report
+
+
+def _check_conflict_original(
+    row: sqlite3.Row,
+    by_path: dict[str, sqlite3.Row],
+    match: rules.Match,
+    device_names: Iterable[str],
+) -> tuple[rules.Match | None, bool]:
+    """競合コピー・複製の元のファイルを探し、理由に内容の比較結果を足す。
+
+    Returns:
+        （理由を足した一致結果, 人の確認が要るか）。元のファイルが無ければ（None, False）。
+        内容が同じと確かめられたものだけを、確認不要とする。
+    """
+    rel = row["relpath"]
+    original = rules.conflict_original(rel.rsplit("/", 1)[-1], device_names)
+    if original is None:
+        return None, False
+    parent = parent_of(rel)
+    orig = by_path.get(f"{parent}/{original}" if parent else original)
+    if orig is None:
+        return None, False
+    if _hash_is_current(row) and _hash_is_current(orig) and row["sha256"] == orig["sha256"]:
+        return rules.Match(match.category, f"{match.reason}。元のファイルと内容が同じ"), False
+    if _hash_is_current(row) and _hash_is_current(orig):
+        note = "元のファイルと内容が異なる。中身の確認が必要"
+    else:
+        note = "元のファイルがある（内容は未比較）"
+    return rules.Match(match.category, f"{match.reason}。{note}"), True
 
 
 def _hash_is_current(row: sqlite3.Row) -> bool:

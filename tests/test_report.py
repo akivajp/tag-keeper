@@ -122,3 +122,22 @@ def test_to_dict_includes_waste(conn, root_id, root) -> None:
     write(root / "b.bin", b"z" * 50)
     report = make_report(conn, root_id, root, hashed=True)
     assert report.to_dict()["duplicates"][0]["waste"] == 50
+
+
+def test_conflict_copies_need_an_original(conn: sqlite3.Connection, root_id: int, root: Path) -> None:
+    """元のファイルが無い「競合コピーらしい名前」は、唯一の版かもしれないので報告しない。"""
+    write(root / "tax" / "form.pdf", "v1")
+    write(root / "tax" / "form (1).pdf", "v1")
+    write(root / "tax" / "plan.xlsx", "mine")
+    write(root / "tax" / "plan-zefat.xlsx", "theirs")
+    write(root / "bills" / "invoice-zefat.pdf", "only copy")
+    scan_root(conn, root_id, root, SafetyConfig())
+    hash_root(conn, root_id, root)
+    report = build_report(conn, root_id, "test", HygieneConfig(device_names=["zefat"]))
+
+    conflicts = {f.relpath: f.reason for f in report.findings if f.category == rules.CAT_CONFLICT}
+    assert set(conflicts) == {"tax/form (1).pdf", "tax/plan-zefat.xlsx"}
+    assert conflicts["tax/form (1).pdf"].endswith("元のファイルと内容が同じ")
+    assert conflicts["tax/plan-zefat.xlsx"].endswith("中身の確認が必要")
+    review = {f.relpath for f in report.findings if f.needs_review}
+    assert review == {"tax/plan-zefat.xlsx"}
