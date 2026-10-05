@@ -4,9 +4,9 @@ Tag, search and tidy your existing file trees from the outside — without movin
 
 [日本語版 README はこちら](README.ja.md)
 
-> **Status: pre-alpha.** What works today is the read-only inventory: scanning, content
-> hashing and a hygiene report. Tagging, search and tidy-up plans come next. See
-> [Roadmap](#roadmap).
+> **Status: pre-alpha.** What works today is the inventory (scanning, content hashing, a
+> hygiene report) and cleaning up with plans you approve, with undo. Tagging and search
+> come next. See [Roadmap](#roadmap).
 
 ## Why
 
@@ -22,8 +22,9 @@ there it helps you keep the tree clean:
 - **It never takes ownership.** No copying, renaming or converting. You keep using your
   file manager and shell as before.
 - **It follows what you do outside it.** Files you move or rename keep their records.
-- **Changes are proposals.** Anything that would move or delete a file is shown first and
-  only runs once you approve it (planned).
+- **Changes are proposals.** Anything that would move a file is written down as a plan,
+  shown first, and only runs once you approve it. Nothing is ever deleted: files go to a
+  quarantine folder, and every plan can be undone.
 
 ## What it does today
 
@@ -49,12 +50,42 @@ $ tag-keeper report ~/CloudSync/OneDrive   # what is probably not worth keeping 
   - rebuildable artifacts (`node_modules`, `__pycache__`, …), VM disk images, installers
     and disk images, temporary files and Office lock files
   - sync conflict copies (OneDrive for Linux `-safeBackup-`, pCloud `[conflicted]`,
-    rclone bisync `.conflict1`, device-name suffixes, `(1)` copies)
+    rclone bisync `.conflict1`, device-name suffixes, `(1)` copies) — only when the
+    original sits next to it, since a lone "copy" may be the only version. Copies whose
+    content differs from the original are marked as needing review
   - empty files and folders
   - exact duplicates, confirmed by hash (never guessed from size)
 
 The catalog is an SQLite file outside the tree (`~/.local/share/tag-keeper/catalog.db` by
-default). Nothing is ever written into the tree.
+default). None of these commands writes into the tree.
+
+### Cleaning up with a plan
+
+```console
+$ tag-keeper plan onedrive                  # write the report's candidates to a plan file
+$ $EDITOR ~/.local/share/tag-keeper/plans/<plan-id>.toml   # delete the lines you want to keep
+$ tag-keeper apply <plan file>              # preview only
+$ tag-keeper apply <plan file> --yes        # move them to the quarantine folder
+$ tag-keeper undo <plan-id> --yes           # put everything back
+```
+
+- **plan** writes one line per item, grouped by category. `--category` limits it to some
+  categories (`app-data`, `vm-image`, `conflict`, …). Candidates that need review stay out
+  unless you pass `--include-review`.
+- **apply** previews by default. With `--yes` it moves each item, by rename, to
+  `<quarantine_dir>/<plan-id>/` under its original relative path. Right before each move
+  it checks that the item has not changed since the plan was written (inode, size,
+  modification time, and for folders the file count and total size); changed items are
+  skipped and reported.
+- With `snapper_config` set, a snapper *pre* snapshot is taken before the run and a *post*
+  snapshot after it. If the pre snapshot fails, nothing is moved.
+- Every move is appended to a journal (`~/.local/share/tag-keeper/journal/<plan-id>.jsonl`).
+  **undo** reads the journal and moves items back; it never overwrites something that has
+  appeared at the original path since.
+- The catalog is updated as items move, so the next scan does not mistake a large
+  quarantine for a mass disappearance.
+- Items leave the cloud when the sync client notices they are gone, but they stay on this
+  disk until you empty the quarantine folder yourself.
 
 ## Install
 
@@ -84,6 +115,10 @@ app_data_names = ["MyLauncher"]      # extra folder names to treat as applicatio
 [safety]
 mass_missing_ratio = 0.2             # hold deletions when more than this share vanishes
 mass_missing_min = 100
+
+[plan]
+quarantine_dir = "~/.local/share/tag-keeper/quarantine"  # must be on the root's filesystem
+snapper_config = "home"              # snapper config for pre/post snapshots ("" = none)
 ```
 
 With roots configured, `tag-keeper scan` (no arguments) scans all of them.
@@ -91,14 +126,16 @@ Every command accepts `--log-file PATH` to keep a timestamped log.
 
 ## Roadmap
 
-1. **Inventory and hygiene report** — read-only. *(you are here)*
+1. **Inventory and hygiene report**, and tidy-up plans that quarantine what you approve,
+   with snapper snapshots and undo. *(you are here)*
 2. **Tags and search** — tags with aliases and parents, typed fields, tags inherited from
    folders, a catalog of records kept as append-only logs, a small web UI.
 3. **Content extraction** — text, OCR (including Japanese), transcripts; AI suggestions
    that wait for your confirmation.
-4. **Tidy-up plans** — placement suggestions for unsorted files based on the folders you
-   already have, structure review, and executing approved plans with undo. Version history
-   from btrfs snapshots via [btrfs-timeline](https://github.com/akivajp/btrfs-timeline).
+4. **Placement and structure** — placement suggestions for unsorted files based on the
+   folders you already have, structure review, and renames and moves inside the tree.
+   Version history from btrfs snapshots via
+   [btrfs-timeline](https://github.com/akivajp/btrfs-timeline).
 
 ## License
 

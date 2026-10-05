@@ -34,6 +34,10 @@ device_names = ["zefat", "hermon"]
 
 [safety]
 mass_missing_min = 50
+
+[plan]
+quarantine_dir = "~/quarantine"
+snapper_config = "home"
 """,
     )
     config = load_config(cfg)
@@ -41,6 +45,8 @@ mass_missing_min = 50
     assert config.roots[0].exclude == ["*.partial"]
     assert config.hygiene.device_names == ["zefat", "hermon"]
     assert config.safety.mass_missing_min == 50
+    assert config.plan.quarantine_dir == (tmp_path / "quarantine").resolve()
+    assert config.plan.snapper_config == "home"
 
 
 def test_duplicate_root_names_are_rejected(tmp_path: Path) -> None:

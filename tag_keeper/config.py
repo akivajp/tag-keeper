@@ -15,6 +15,10 @@
     [safety]
     mass_missing_ratio = 0.2         # 一度に消えたとみなす割合がこれを超えたら確定を保留する
     mass_missing_min = 100
+
+    [plan]
+    quarantine_dir = "~/.local/share/tag-keeper/quarantine"  # 隔離先（ルートと同じファイルシステム）
+    snapper_config = "home"          # 実行の前後にスナップショットを撮る snapper の設定名（"" で撮らない）
 """
 
 from __future__ import annotations
@@ -32,13 +36,19 @@ def default_config_path() -> Path:
     return Path(base) / "tag-keeper" / "config.toml"
 
 
-def default_db_path() -> Path:
-    """既定のカタログ（SQLite）のパス（XDG_DATA_HOME に従う）を返す。
+def default_data_dir() -> Path:
+    """既定のデータフォルダ（XDG_DATA_HOME に従う）を返す。
 
-    カタログは管理対象のツリーの外に置く。クラウド同期の対象にしないため。
+    カタログ・整理プラン・実行記録・隔離フォルダは、管理対象のツリーの外のここに置く。
+    クラウド同期の対象にしないため。
     """
     base = os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share")
-    return Path(base) / "tag-keeper" / "catalog.db"
+    return Path(base) / "tag-keeper"
+
+
+def default_db_path() -> Path:
+    """既定のカタログ（SQLite）のパスを返す。"""
+    return default_data_dir() / "catalog.db"
 
 
 @dataclass
@@ -76,12 +86,24 @@ class SafetyConfig:
 
 
 @dataclass
+class PlanConfig:
+    """整理プランの実行に関する設定（要件 F-PL・F-VS-3）。"""
+
+    # 隔離先のフォルダ。プランごとに <quarantine_dir>/<プラン ID>/ の下へ、元の相対パスのまま移す。
+    # 移動は改名で行うので、ルートと同じファイルシステム（btrfs なら同じサブボリューム）に置く
+    quarantine_dir: Path = field(default_factory=lambda: default_data_dir() / "quarantine")
+    # 実行の前後にスナップショットを撮る snapper の設定名。空なら撮らない
+    snapper_config: str = ""
+
+
+@dataclass
 class Config:
     """tag-keeper 全体の設定。"""
 
     roots: list[RootConfig] = field(default_factory=list)
     hygiene: HygieneConfig = field(default_factory=HygieneConfig)
     safety: SafetyConfig = field(default_factory=SafetyConfig)
+    plan: PlanConfig = field(default_factory=PlanConfig)
 
     def find_root(self, name: str) -> RootConfig | None:
         """名前でルートを探す。見つからなければ None を返す。"""
@@ -142,4 +164,11 @@ def load_config(path: Path | None = None) -> Config:
     if "mass_missing_min" in sf:
         safety.mass_missing_min = int(sf["mass_missing_min"])
 
-    return Config(roots=roots, hygiene=hygiene, safety=safety)
+    pl = data.get("plan", {})
+    plan = PlanConfig()
+    if "quarantine_dir" in pl:
+        plan.quarantine_dir = _expand(str(pl["quarantine_dir"]))
+    if "snapper_config" in pl:
+        plan.snapper_config = str(pl["snapper_config"])
+
+    return Config(roots=roots, hygiene=hygiene, safety=safety, plan=plan)

@@ -4,6 +4,9 @@
     tag-keeper scan [ROOT ...]       ルートを走査してカタログを更新する（読み取り専用）
     tag-keeper hash [ROOT ...]       変わったファイルだけ内容ハッシュを計算する
     tag-keeper report [ROOT ...]     整理候補（置く価値の薄いファイル・重複）を報告する
+    tag-keeper plan ROOT             整理候補を隔離するプラン（TOML）を書き出す
+    tag-keeper apply PLAN [--yes]    プランを確認する。--yes で実行する（隔離フォルダへ移す）
+    tag-keeper undo PLAN_ID [--yes]  実行したプランを取り消す
 
 ROOT には、設定ファイルのルート名か、フォルダのパスを指定する。省略すると設定済みの全ルート。
 """
@@ -14,7 +17,7 @@ import argparse
 import json
 import logging
 import sys
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from pathlib import Path
 
 from rich.console import Console
@@ -32,7 +35,7 @@ from rich.progress import (
 )
 from rich.table import Table
 
-from tag_keeper import __version__
+from tag_keeper import __version__, rules
 from tag_keeper.catalog import connect, ensure_root, last_scan
 from tag_keeper.config import (
     Config,
@@ -43,6 +46,22 @@ from tag_keeper.config import (
     load_config,
 )
 from tag_keeper.hashing import hash_root
+from tag_keeper.plan import (
+    OpOutcome,
+    Plan,
+    PlanError,
+    RunResult,
+    Snapper,
+    SnapshotError,
+    apply_plan,
+    build_plan,
+    check_op,
+    journal_path,
+    load_plan,
+    pending_restores,
+    undo_plan,
+    write_plan,
+)
 from tag_keeper.report import Report, build_report
 from tag_keeper.scan import RootUnavailableError, scan_root
 
@@ -293,6 +312,192 @@ def cmd_report(args: argparse.Namespace, config: Config) -> int:
     return 0
 
 
+def _plans_dir(args: argparse.Namespace) -> Path:
+    """プランの既定の置き場所（カタログと同じフォルダの plans/）。"""
+    return Path(args.db).parent / "plans"
+
+
+def _journal_dir(args: argparse.Namespace) -> Path:
+    """実行記録の置き場所（カタログと同じフォルダの journal/）。"""
+    return Path(args.db).parent / "journal"
+
+
+def _snapper(args: argparse.Namespace, config: Config) -> Snapper | None:
+    """設定と --no-snapshot に従って、スナップショットを撮るものを返す。"""
+    if args.no_snapshot or not config.plan.snapper_config:
+        return None
+    return Snapper(config.plan.snapper_config)
+
+
+def _parse_categories(values: Sequence[str] | None) -> list[str] | None:
+    """--category の値（短い名前か表示名）を表示名に直す。"""
+    if not values:
+        return None
+    labels = set(rules.CATEGORY_KEYS.values())
+    out: list[str] = []
+    for v in values:
+        if v in rules.CATEGORY_KEYS:
+            out.append(rules.CATEGORY_KEYS[v])
+        elif v in labels:
+            out.append(v)
+        else:
+            raise ConfigError(f"カテゴリが不明です: {v}（使えるもの: {', '.join(rules.CATEGORY_KEYS)}）")
+    return out
+
+
+def cmd_plan(args: argparse.Namespace, config: Config) -> int:
+    """整理候補を隔離するプランを書き出す。"""
+    conn = connect(args.db)
+    rc = resolve_roots(config, [args.root])[0]
+    row = conn.execute("SELECT id FROM roots WHERE name = ?", (rc.name,)).fetchone()
+    if row is None or last_scan(conn, row["id"]) is None:
+        log.error("まだ走査していません: %s（先に tag-keeper scan を実行してください）", rc.name)
+        return 2
+    report = build_report(conn, row["id"], rc.name, config.hygiene)
+    plan = build_plan(
+        report, rc.name, rc.path, _parse_categories(args.category), include_review=args.include_review
+    )
+    review = sum(1 for f in report.findings if f.needs_review)
+    if review and not args.include_review:
+        log.info("中身の確認が要る候補 %d 件はプランに含めていません（report で確認できます。含めるには --include-review）", review)
+    out = args.output or _plans_dir(args) / f"{plan.id}.toml"
+    write_plan(plan, out)
+
+    table = Table(title=f"整理プラン {plan.id}")
+    for col, just in (("カテゴリ", "left"), ("件数", "right"), ("ファイル", "right"), ("容量", "right")):
+        table.add_column(col, justify=just)  # type: ignore[arg-type]
+    by_cat: dict[str, list] = {}
+    for op in plan.ops:
+        by_cat.setdefault(op.category, []).append(op)
+    for cat in sorted(by_cat, key=lambda c: rules.CATEGORY_ORDER.index(c) if c in rules.CATEGORY_ORDER else len(rules.CATEGORY_ORDER)):
+        ops = by_cat[cat]
+        table.add_row(cat, f"{len(ops):,}", f"{sum(o.files for o in ops):,}", human_size(sum(o.size for o in ops)))
+    table.add_row(
+        "[bold]合計",
+        f"[bold]{len(plan.ops):,}",
+        f"[bold]{sum(o.files for o in plan.ops):,}",
+        f"[bold]{human_size(sum(o.size for o in plan.ops))}",
+    )
+    out_console.print(table)
+    out_console.print(f"プランを書き出しました: {out}")
+    out_console.print("残したいものの行を消してから、次のコマンドで確認・実行してください。")
+    out_console.print(f"  tag-keeper apply {out}          # 確認だけ")
+    out_console.print(f"  tag-keeper apply {out} --yes    # 隔離フォルダへ移す")
+    return 0
+
+
+def render_outcomes(title: str, outcomes: Sequence[OpOutcome], limit: int) -> None:
+    """操作の結果（または確認結果）を表にする。飛ばすものを先に、容量の大きい順に並べる。"""
+    table = Table(title=title)
+    for col, just in (("状態", "left"), ("ファイル", "right"), ("容量", "right"), ("パス", "left")):
+        table.add_column(col, justify=just)  # type: ignore[arg-type]
+    ordered = sorted(outcomes, key=lambda o: (o.done, -o.size))
+    for o in ordered[:limit]:
+        state = "[green]OK" if o.done else f"[yellow]飛ばす: {o.detail}"
+        table.add_row(state, f"{o.files:,}", human_size(o.size), o.path + ("/" if o.is_dir else ""))
+    if len(ordered) > limit:
+        table.add_row("…", "", "", f"ほか {len(ordered) - limit:,} 件（--limit で増やせます）")
+    out_console.print(table)
+
+
+def _summary(result: RunResult, verb: str) -> str:
+    """実行結果の1行の要約。"""
+    done = result.done
+    return (
+        f"{verb} {len(done):,} 件（ファイル {sum(o.files for o in done):,}、"
+        f"{human_size(sum(o.size for o in done))}） / 飛ばした {len(result.skipped):,} 件"
+    )
+
+
+def _run_with_progress(total: int, description: str, run: Callable[[Callable[[OpOutcome], None]], RunResult]) -> RunResult:
+    """操作の件数で進捗バーを出しながら実行する。"""
+    with Progress(
+        TextColumn("{task.description}"),
+        BarColumn(),
+        MofNCompleteColumn(),
+        TimeElapsedColumn(),
+        TimeRemainingColumn(),
+        console=err_console,
+    ) as progress:
+        task = progress.add_task(description, total=total)
+        return run(lambda _o: progress.advance(task))
+
+
+def cmd_apply(args: argparse.Namespace, config: Config) -> int:
+    """プランを確認し、--yes なら実行する。"""
+    plan: Plan = load_plan(args.plan)
+    conn = connect(args.db)
+    if not args.yes:
+        checks = []
+        for op in plan.ops:
+            problem = check_op(plan, op)
+            checks.append(OpOutcome(op.path, op.is_dir, op.files, op.size, problem is None, problem or ""))
+        render_outcomes(f"確認: {plan.id}（{plan.root_path}）", checks, args.limit)
+        ok = [c for c in checks if c.done]
+        out_console.print(
+            f"実行できる {len(ok):,} 件（ファイル {sum(c.files for c in ok):,}、{human_size(sum(c.size for c in ok))}）"
+            f"を {config.plan.quarantine_dir / plan.id} へ移します。"
+            f"飛ばすもの {len(checks) - len(ok):,} 件。"
+        )
+        out_console.print("[bold]確認だけで、何も動かしていません。[/bold]実行するには --yes を付けてください。")
+        return 0
+    result = _run_with_progress(
+        len(plan.ops),
+        f"隔離中: {plan.id}",
+        lambda on_op: apply_plan(
+            conn,
+            plan,
+            quarantine_dir=config.plan.quarantine_dir,
+            journal_dir=_journal_dir(args),
+            snapshot=_snapper(args, config),
+            on_op=on_op,
+        ),
+    )
+    render_outcomes(f"実行結果: {plan.id}", result.outcomes, args.limit)
+    log.info("%s", _summary(result, "隔離した"))
+    log.info(
+        "スナップショット: 実行前 %s / 実行後 %s。取り消すには: tag-keeper undo %s --yes",
+        result.pre_snapshot if result.pre_snapshot is not None else "なし",
+        result.post_snapshot if result.post_snapshot is not None else "なし",
+        plan.id,
+    )
+    return 1 if result.skipped else 0
+
+
+def _plan_id_of(value: str) -> str:
+    """undo の引数（プラン ID か、プランのファイル）からプラン ID を得る。"""
+    path = Path(value)
+    if path.suffix == ".toml" and path.exists():
+        return load_plan(path).id
+    return value
+
+
+def cmd_undo(args: argparse.Namespace, config: Config) -> int:
+    """実行したプランを取り消し、隔離したものを元の場所へ戻す。"""
+    plan_id = _plan_id_of(args.plan)
+    conn = connect(args.db)
+    if not args.yes:
+        items = pending_restores(journal_path(_journal_dir(args), plan_id))
+        render_outcomes(
+            f"取り消しの確認: {plan_id}",
+            [OpOutcome(i.path, i.is_dir, i.files, i.size, True) for i in items],
+            args.limit,
+        )
+        out_console.print("[bold]確認だけで、何も動かしていません。[/bold]元に戻すには --yes を付けてください。")
+        return 0
+    total = len(pending_restores(journal_path(_journal_dir(args), plan_id)))
+    result = _run_with_progress(
+        total,
+        f"復元中: {plan_id}",
+        lambda on_op: undo_plan(
+            conn, plan_id, journal_dir=_journal_dir(args), snapshot=_snapper(args, config), on_op=on_op
+        ),
+    )
+    render_outcomes(f"取り消しの結果: {plan_id}", result.outcomes, args.limit)
+    log.info("%s", _summary(result, "元に戻した"))
+    return 1 if result.skipped else 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     """コマンドラインの解析器を作る。"""
     parser = argparse.ArgumentParser(
@@ -332,11 +537,41 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--examples", type=int, default=3, help="カテゴリごとに載せる例の数")
     p.add_argument("--top", type=int, default=15, help="直下のファイルが多いフォルダを何件載せるか")
     p.set_defaults(func=cmd_report)
+
+    p = sub.add_parser("plan", help="整理候補を隔離するプラン（TOML）を書き出す（ファイルは動かさない）")
+    p.add_argument("root", metavar="ROOT", help="ルート名かフォルダのパス")
+    p.add_argument(
+        "--category",
+        action="append",
+        metavar="CAT",
+        help=f"含めるカテゴリ（複数指定可、省略時はすべて）: {', '.join(rules.CATEGORY_KEYS)}",
+    )
+    p.add_argument("-o", "--output", type=Path, default=None, help="プランの書き出し先（既定: カタログと同じフォルダの plans/）")
+    p.add_argument(
+        "--include-review",
+        action="store_true",
+        help="中身の確認が要る候補（元のファイルと内容が異なる競合コピーなど）もプランに含める",
+    )
+    p.set_defaults(func=cmd_plan)
+
+    p = sub.add_parser("apply", help="プランを確認する。--yes を付けると実行し、対象を隔離フォルダへ移す")
+    p.add_argument("plan", type=Path, metavar="PLAN", help="プランのファイル（TOML）")
+    p.add_argument("--yes", action="store_true", help="確認だけでなく、実際に実行する")
+    p.add_argument("--no-snapshot", action="store_true", help="設定があっても、前後のスナップショットを撮らない")
+    p.add_argument("--limit", type=int, default=30, help="表に載せる件数")
+    p.set_defaults(func=cmd_apply)
+
+    p = sub.add_parser("undo", help="実行したプランを取り消し、隔離したものを元の場所へ戻す")
+    p.add_argument("plan", metavar="PLAN", help="プラン ID か、プランのファイル")
+    p.add_argument("--yes", action="store_true", help="確認だけでなく、実際に元に戻す")
+    p.add_argument("--no-snapshot", action="store_true", help="設定があっても、前後のスナップショットを撮らない")
+    p.add_argument("--limit", type=int, default=30, help="表に載せる件数")
+    p.set_defaults(func=cmd_undo)
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    """CLI の入口。終了コードを返す（0: 成功、1: 確定を保留した、2: エラー）。"""
+    """CLI の入口。終了コードを返す（0: 成功、1: 確定を保留した・飛ばした操作がある、2: エラー）。"""
     parser = build_parser()
     args = parser.parse_args(argv)
     setup_logging(args.log_file, args.verbose)
@@ -344,7 +579,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         config = load_config(args.config)
         return int(args.func(args, config))
-    except ConfigError as e:
+    except (ConfigError, PlanError, SnapshotError) as e:
         log.error("%s", e)
         return 2
 
