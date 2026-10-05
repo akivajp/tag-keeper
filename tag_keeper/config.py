@@ -1,0 +1,145 @@
+"""設定ファイル（TOML）の読み込みと、既定のパス。
+
+設定ファイルの例::
+
+    [[roots]]
+    name = "onedrive"
+    path = "~/CloudSync/OneDrive"
+    exclude = ["*.partial"]          # 走査しないパス（ルートからの相対パスに対する glob）
+
+    [hygiene]
+    allow = ["archive/**"]           # 報告しないパス（「残す」と判断したもの）
+    device_names = ["zefat", "hermon"]  # 競合コピーの名前に付く端末名
+    app_data_names = ["MyGameLauncher"] # 既定に加えて、アプリのデータとみなすフォルダ名
+
+    [safety]
+    mass_missing_ratio = 0.2         # 一度に消えたとみなす割合がこれを超えたら確定を保留する
+    mass_missing_min = 100
+"""
+
+from __future__ import annotations
+
+import os
+import socket
+import tomllib
+from dataclasses import dataclass, field
+from pathlib import Path
+
+
+def default_config_path() -> Path:
+    """既定の設定ファイルのパス（XDG_CONFIG_HOME に従う）を返す。"""
+    base = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+    return Path(base) / "tag-keeper" / "config.toml"
+
+
+def default_db_path() -> Path:
+    """既定のカタログ（SQLite）のパス（XDG_DATA_HOME に従う）を返す。
+
+    カタログは管理対象のツリーの外に置く。クラウド同期の対象にしないため。
+    """
+    base = os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share")
+    return Path(base) / "tag-keeper" / "catalog.db"
+
+
+@dataclass
+class RootConfig:
+    """管理対象のルート（トップフォルダ）の設定。"""
+
+    name: str
+    path: Path
+    # 走査しないパス。ルートからの相対パス（区切りは /）に対する glob
+    exclude: list[str] = field(default_factory=list)
+
+
+@dataclass
+class HygieneConfig:
+    """整理候補の検出に関する設定。"""
+
+    # 報告しないパス（「残す」と判断したもの）。ルートからの相対パスに対する glob
+    allow: list[str] = field(default_factory=list)
+    # 競合コピーの名前に付く端末名（例: "report-zefat.xlsx"）。既定はこのマシンのホスト名
+    device_names: list[str] = field(default_factory=lambda: [socket.gethostname()])
+    # 既定に加えて、アプリのデータとみなすフォルダ名
+    app_data_names: list[str] = field(default_factory=list)
+    # この数以上のファイルを抱え、拡張子の無いファイルが過半数のフォルダをアプリのデータとみなす
+    app_data_min_files: int = 500
+
+
+@dataclass
+class SafetyConfig:
+    """大量消失の安全弁の設定（要件 F-SC-7）。"""
+
+    # 一度の走査で消えたファイルの割合がこれを超えたら、削除として確定せずに保留する
+    mass_missing_ratio: float = 0.2
+    # ただし、消えた件数がこの数以下なら保留しない（小さいルートで誤って止まらないように）
+    mass_missing_min: int = 100
+
+
+@dataclass
+class Config:
+    """tag-keeper 全体の設定。"""
+
+    roots: list[RootConfig] = field(default_factory=list)
+    hygiene: HygieneConfig = field(default_factory=HygieneConfig)
+    safety: SafetyConfig = field(default_factory=SafetyConfig)
+
+    def find_root(self, name: str) -> RootConfig | None:
+        """名前でルートを探す。見つからなければ None を返す。"""
+        return next((r for r in self.roots if r.name == name), None)
+
+
+class ConfigError(ValueError):
+    """設定ファイルの内容が不正なときの例外。"""
+
+
+def _expand(path: str) -> Path:
+    """`~` と環境変数を展開した絶対パスを返す。"""
+    return Path(os.path.expandvars(os.path.expanduser(path))).resolve()
+
+
+def load_config(path: Path | None = None) -> Config:
+    """設定ファイルを読み込む。ファイルが無ければ既定値の設定を返す。
+
+    Args:
+        path: 設定ファイルのパス。None なら既定のパスを使う。
+    """
+    path = path or default_config_path()
+    if not path.exists():
+        return Config()
+    with path.open("rb") as f:
+        data = tomllib.load(f)
+
+    roots: list[RootConfig] = []
+    for i, item in enumerate(data.get("roots", [])):
+        if "name" not in item or "path" not in item:
+            raise ConfigError(f"{path}: roots[{i}] には name と path が必要です")
+        roots.append(
+            RootConfig(
+                name=str(item["name"]),
+                path=_expand(str(item["path"])),
+                exclude=[str(p) for p in item.get("exclude", [])],
+            )
+        )
+    names = [r.name for r in roots]
+    if len(names) != len(set(names)):
+        raise ConfigError(f"{path}: roots の name が重複しています")
+
+    hy = data.get("hygiene", {})
+    hygiene = HygieneConfig()
+    if "allow" in hy:
+        hygiene.allow = [str(p) for p in hy["allow"]]
+    if "device_names" in hy:
+        hygiene.device_names = [str(n) for n in hy["device_names"]]
+    if "app_data_names" in hy:
+        hygiene.app_data_names = [str(n) for n in hy["app_data_names"]]
+    if "app_data_min_files" in hy:
+        hygiene.app_data_min_files = int(hy["app_data_min_files"])
+
+    sf = data.get("safety", {})
+    safety = SafetyConfig()
+    if "mass_missing_ratio" in sf:
+        safety.mass_missing_ratio = float(sf["mass_missing_ratio"])
+    if "mass_missing_min" in sf:
+        safety.mass_missing_min = int(sf["mass_missing_min"])
+
+    return Config(roots=roots, hygiene=hygiene, safety=safety)

@@ -1,0 +1,63 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "tag-keeper"
+dynamic = ["version"]
+description = "Tag, search and tidy your existing file trees from the outside, without moving a file"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Akiva Miura", email = "akiva.miura@gmail.com" }]
+keywords = ["file-management", "tagging", "catalog", "cloud-drive", "onedrive", "pcloud", "self-hosted"]
+classifiers = [
+    "Development Status :: 2 - Pre-Alpha",
+    "Environment :: Console",
+    "Intended Audience :: End Users/Desktop",
+    "Intended Audience :: System Administrators",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: System :: Filesystems",
+    "Topic :: Utilities",
+]
+# 進捗表示と表の描画に rich を使う。それ以外は標準ライブラリだけで動かす
+dependencies = [
+    "rich>=13",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/akivajp/tag-keeper"
+Repository = "https://github.com/akivajp/tag-keeper"
+Issues = "https://github.com/akivajp/tag-keeper/issues"
+
+[project.scripts]
+tag-keeper = "tag_keeper.cli:main"
+
+[tool.hatch.version]
+path = "tag_keeper/__init__.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["tag_keeper"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "/tag_keeper",
+    "/tests",
+    "/README.md",
+    "/README.ja.md",
+    "/CHANGELOG.md",
+    "/LICENSE",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
