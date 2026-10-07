@@ -22,6 +22,17 @@
     [plan]
     quarantine_dir = "~/.local/share/tag-keeper/quarantine"  # 隔離先（ルートと同じファイルシステム）
     snapper_config = "home"          # 実行の前後にスナップショットを撮る snapper の設定名（"" で撮らない）
+
+    [tags]
+    dir = "~/.local/share/tag-keeper/tags"  # タグのログ（端末ごとの JSONL）の置き場所
+
+    [organize]
+    inbox_patterns = ["tmp", "temp", "*未整理*", "*inbox*"]  # 受け皿とみなすフォルダ名（大文字・小文字を区別しない glob）
+    ollama_url = "http://127.0.0.1:11434"
+    model = "gemma3:12b"             # 名前と移動先の提案に使うモデル（画像を読めるもの）
+    use_images = true                # 画像と、文字の無いスキャン PDF をモデルに見せる
+    max_chars = 4000                 # モデルに渡す本文の上限（文字数）
+    candidates = 15                  # モデルに選ばせる移動先の候補の数
 """
 
 from __future__ import annotations
@@ -106,6 +117,36 @@ class PlanConfig:
 
 
 @dataclass
+class TagsConfig:
+    """タグの設定。"""
+
+    # タグのログ（端末ごとの追記専用 JSONL）の置き場所。ツリーの外に置く（P6）
+    dir: Path = field(default_factory=lambda: default_data_dir() / "tags")
+
+
+@dataclass
+class OrganizeConfig:
+    """受け皿のフォルダの整理の提案（名前と移動先）の設定。"""
+
+    # 受け皿とみなすフォルダ名。大文字・小文字を区別しない glob で、フォルダ名（パスの最後）に照合する
+    inbox_patterns: list[str] = field(default_factory=lambda: ["tmp", "temp", "*未整理*", "*inbox*"])
+    # ollama の API の URL（外部のサービスには送らない。手元のモデルだけを使う）
+    ollama_url: str = "http://127.0.0.1:11434"
+    # 名前と移動先の提案に使うモデル。画像を読めるものにする
+    model: str = "gemma3:12b"
+    # 画像と、文字を取り出せないスキャン PDF を、画像としてモデルに見せるか
+    use_images: bool = True
+    # モデルに渡す本文の上限（文字数）
+    max_chars: int = 4000
+    # 似ているフォルダから絞り込み、モデルに選ばせる移動先の候補の数
+    candidates: int = 15
+    # 生成の温度（低いほど毎回同じ提案になる）
+    temperature: float = 0.2
+    # 1件の問い合わせの待ち時間の上限（秒）
+    timeout: float = 300.0
+
+
+@dataclass
 class Config:
     """tag-keeper 全体の設定。"""
 
@@ -113,6 +154,8 @@ class Config:
     hygiene: HygieneConfig = field(default_factory=HygieneConfig)
     safety: SafetyConfig = field(default_factory=SafetyConfig)
     plan: PlanConfig = field(default_factory=PlanConfig)
+    tags: TagsConfig = field(default_factory=TagsConfig)
+    organize: OrganizeConfig = field(default_factory=OrganizeConfig)
 
     def find_root(self, name: str) -> RootConfig | None:
         """名前でルートを探す。見つからなければ None を返す。"""
@@ -189,4 +232,25 @@ def load_config(path: Path | None = None) -> Config:
     if "snapper_config" in pl:
         plan.snapper_config = str(pl["snapper_config"])
 
-    return Config(roots=roots, hygiene=hygiene, safety=safety, plan=plan)
+    tg = data.get("tags", {})
+    tags = TagsConfig()
+    if "dir" in tg:
+        tags.dir = _expand(str(tg["dir"]))
+
+    og = data.get("organize", {})
+    organize = OrganizeConfig()
+    if "inbox_patterns" in og:
+        organize.inbox_patterns = [str(x) for x in og["inbox_patterns"]]
+    for key, conv in (
+        ("ollama_url", str),
+        ("model", str),
+        ("use_images", bool),
+        ("max_chars", int),
+        ("candidates", int),
+        ("temperature", float),
+        ("timeout", float),
+    ):
+        if key in og:
+            setattr(organize, key, conv(og[key]))
+
+    return Config(roots=roots, hygiene=hygiene, safety=safety, plan=plan, tags=tags, organize=organize)

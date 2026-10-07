@@ -19,7 +19,7 @@ function h(tag, attrs, ...children) {
     else if (v === true) el.setAttribute(k, '');
     else el.setAttribute(k, v);
   }
-  for (const c of children.flat()) {
+  for (const c of children.flat(Infinity)) {
     if (c === null || c === undefined || c === false) continue;
     el.append(c instanceof Node ? c : String(c));
   }
@@ -28,7 +28,7 @@ function h(tag, attrs, ...children) {
 
 /** 要素の中身を入れ替える（null・undefined・false は飛ばす。replaceChildren は "null" と表示してしまうため）。 */
 function setChildren(el, ...children) {
-  el.replaceChildren(...children.flat().filter((c) => c !== null && c !== undefined && c !== false));
+  el.replaceChildren(...children.flat(Infinity).filter((c) => c !== null && c !== undefined && c !== false));
 }
 
 /** バイト数を読みやすい単位にする。 */
@@ -473,7 +473,8 @@ async function pagePlan(main, id) {
               type: 'checkbox', disabled: !editable, checked: !skip.has(op.path),
               onchange: (e) => setSkip([op.path], !e.target.checked),
             })),
-            h('td', { class: 'path' }, op.path + (op.is_dir ? '/' : '')),
+            h('td', { class: 'path' }, op.path + (op.is_dir ? '/' : ''),
+              op.action === 'move' ? h('div', { class: 'muted' }, '→ ', op.dest) : null),
             h('td', { class: 'hide-narrow muted' }, op.reason),
             h('td', { class: 'num' }, num(op.files)),
             h('td', { class: 'num' }, size(op.size)),
@@ -556,12 +557,17 @@ async function pagePlan(main, id) {
 
 async function route() {
   const main = document.getElementById('main');
-  const hash = location.hash.replace(/^#/, '') || '/';
-  const parts = hash.split('/').filter(Boolean).map(decodeURIComponent);
-  document.querySelectorAll('[data-nav]').forEach((a) => a.classList.toggle('active',
-    (parts[0] || 'roots') === a.dataset.nav || (parts[0] === 'report' && a.dataset.nav === 'roots')));
+  // # の後ろは「パス?問い合わせ」（例: #/browse/onedrive/99_Inbox?at=17533）
+  const [hashPath, hashQuery] = (location.hash.replace(/^#/, '') || '/').split('?');
+  const parts = hashPath.split('/').filter(Boolean).map(decodeURIComponent);
+  const params = new URLSearchParams(hashQuery || '');
+  const navOf = { report: 'roots', browse: 'browse', organize: 'organize', tags: 'tags', plans: 'plans' };
+  document.querySelectorAll('[data-nav]').forEach((a) => a.classList.toggle('active', (navOf[parts[0]] || 'roots') === a.dataset.nav));
   let render;
-  if (parts[0] === 'report' && parts[1]) render = () => pageReport(main, parts[1]);
+  if (parts[0] === 'browse') render = () => pageBrowse(main, parts[1], parts.slice(2).join('/'), params);
+  else if (parts[0] === 'organize') render = () => pageOrganize(main, parts[1]);
+  else if (parts[0] === 'tags') render = () => pageTags(main, params.get('tag'));
+  else if (parts[0] === 'report' && parts[1]) render = () => pageReport(main, parts[1]);
   else if (parts[0] === 'plans' && parts[1]) render = () => pagePlan(main, parts[1]);
   else if (parts[0] === 'plans') render = () => pagePlans(main);
   else render = () => pageRoots(main);

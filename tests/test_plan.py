@@ -264,3 +264,71 @@ def test_cli_unknown_category_fails(tmp_path: Path, tree: Path) -> None:
     assert main([*common, "scan", str(tree)]) == 0
     assert main([*common, "plan", str(tree), "--category", "nope"]) == 2
 
+
+
+# --- 移動・改名（整理の提案から作るプラン） ---
+
+
+def make_move_plan(conn: sqlite3.Connection, root_id: int, root: Path, tmp_path: Path, moves: list[tuple[str, str]]) -> Plan:
+    """移動・改名のプランを作り、書いて読み直す。"""
+    from tag_keeper.plan import ACTION_MOVE, CAT_MOVE, PlanOp, fingerprint
+
+    scan_root(conn, root_id, root, SAFETY)
+    plan = Plan("20260101-000000-test-organize", "test", root, "t")
+    for src, dest in moves:
+        fp = fingerprint(root / src)
+        plan.ops.append(PlanOp(ACTION_MOVE, src, False, fp.files, fp.size, fp.inode, fp.mtime_ns, CAT_MOVE, "", dest=dest))
+    write_plan(plan, tmp_path / "plans" / "m.toml")
+    return load_plan(tmp_path / "plans" / "m.toml")
+
+
+def test_move_plan_renames_and_follows_catalog_and_tags(
+    conn: sqlite3.Connection, root_id: int, root: Path, tmp_path: Path
+) -> None:
+    from tag_keeper.tags import TagStore
+
+    write(root / "inbox" / "downloadfile.pdf", "statement")
+    write(root / "bank" / "old.pdf", "old")
+    conn.execute("UPDATE entries SET sha256 = 'abc'")  # 走査前なので何も起きない
+    plan = make_move_plan(conn, root_id, root, tmp_path, [("inbox/downloadfile.pdf", "bank/2025/20250414_明細書.pdf")])
+    conn.execute("UPDATE entries SET sha256 = 'abc' WHERE relpath = 'inbox/downloadfile.pdf'")
+    conn.commit()
+    tags = TagStore(tmp_path / "tags", host="t")
+    tags.add("test", ["inbox/downloadfile.pdf"], "相手:Revolut")
+
+    result = apply_plan(conn, plan, quarantine_dir=tmp_path / "q", journal_dir=tmp_path / "journal", snapshot=None, tags=tags)
+    assert len(result.done) == 1
+    assert (root / "bank" / "2025" / "20250414_明細書.pdf").read_text() == "statement"  # 無いフォルダは作る
+    # カタログの行（ハッシュ）とタグが新しいパスへ移り、移動の履歴も残る
+    row = conn.execute("SELECT sha256 FROM entries WHERE relpath = 'bank/2025/20250414_明細書.pdf' AND gone_at IS NULL").fetchone()
+    assert row["sha256"] == "abc"
+    assert conn.execute("SELECT old_relpath, source FROM moves").fetchone()[:] == ("inbox/downloadfile.pdf", "plan")
+    assert tags.tags_of("test", "bank/2025/20250414_明細書.pdf")["direct"][0]["tag"] == "相手:Revolut"
+    res = scan_root(conn, root_id, root, SAFETY)
+    assert (res.added, res.moved, res.gone) == (0, 0, 0)  # カタログは更新済みなので、走査で何も起きない
+
+    undone = undo_plan(conn, plan.id, journal_dir=tmp_path / "journal", snapshot=None, tags=tags)
+    assert len(undone.done) == 1
+    assert (root / "inbox" / "downloadfile.pdf").exists()
+    assert (root / "bank" / "old.pdf").exists()  # 移動先のフォルダは片付けない（利用者のフォルダ）
+    assert tags.tags_of("test", "inbox/downloadfile.pdf")["direct"][0]["tag"] == "相手:Revolut"
+    assert conn.execute("SELECT sha256 FROM entries WHERE relpath = 'inbox/downloadfile.pdf' AND gone_at IS NULL").fetchone()["sha256"] == "abc"
+
+
+def test_move_never_overwrites(conn: sqlite3.Connection, root_id: int, root: Path, tmp_path: Path) -> None:
+    write(root / "inbox" / "a.pdf", "new")
+    plan = make_move_plan(conn, root_id, root, tmp_path, [("inbox/a.pdf", "done/a.pdf")])
+    write(root / "done" / "a.pdf", "existing")
+    result = apply_plan(conn, plan, quarantine_dir=tmp_path / "q", journal_dir=tmp_path / "journal", snapshot=None)
+    assert [o.detail for o in result.skipped] == ["移動先に同じ名前のものがある"]
+    assert (root / "done" / "a.pdf").read_text() == "existing"
+
+
+def test_move_plan_rejects_names_the_cloud_cannot_store(tmp_path: Path) -> None:
+    bad = write(
+        tmp_path / "bad.toml",
+        'id = "x"\nroot = "r"\nroot_path = "/tmp/r"\ncreated_at = "t"\n'
+        'ops = [{ action = "move", path = "a.pdf", dest = "b?.pdf", is_dir = false, files = 1, size = 1, inode = 1, mtime_ns = 1 }]\n',
+    )
+    with pytest.raises(PlanError, match="使えない文字"):
+        load_plan(bad)

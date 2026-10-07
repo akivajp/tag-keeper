@@ -73,6 +73,7 @@ from tag_keeper.plan import (
 from tag_keeper.report import Report, build_report
 from tag_keeper.scan import RootUnavailableError, scan_root
 from tag_keeper.syncguard import SyncError, SyncGuard, make_guard
+from tag_keeper.tags import TagStore
 
 log = logging.getLogger("tag_keeper")
 
@@ -210,6 +211,8 @@ def cmd_scan(args: argparse.Namespace, config: Config) -> int:
             f"{res.held:,}",
             f"{res.unreadable:,}",
         )
+        # ツールの外での移動・改名に、タグを追従させる（P4）
+        TagStore(config.tags.dir).follow_moves(rc.name, res.moves)
         if res.held:
             status = max(status, 1)
     return status
@@ -502,6 +505,7 @@ def cmd_apply(args: argparse.Namespace, config: Config) -> int:
             snapshot=_snapper(args, config),
             sync=_sync_guard(config, plan.root),
             reporter=RichReporter(progress),
+            tags=TagStore(config.tags.dir),
         )
     render_outcomes(f"実行結果: {plan.id}", result.outcomes, args.limit)
     log.info("%s", _summary(result, "隔離した"))
@@ -545,6 +549,7 @@ def cmd_undo(args: argparse.Namespace, config: Config) -> int:
             journal_dir=_journal_dir(args),
             snapshot=_snapper(args, config),
             reporter=RichReporter(progress),
+            tags=TagStore(config.tags.dir),
         )
     render_outcomes(f"取り消しの結果: {plan_id}", result.outcomes, args.limit)
     log.info("%s", _summary(result, "元に戻した"))

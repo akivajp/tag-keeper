@@ -4,9 +4,10 @@ Tag, search and tidy your existing file trees from the outside — without movin
 
 [日本語版 README はこちら](README.ja.md)
 
-> **Status: pre-alpha.** What works today is the inventory (scanning, content hashing, a
-> hygiene report) and cleaning up with plans you approve, with undo — from the command line
-> or a web UI. Tagging and search come next. See [Roadmap](#roadmap).
+> **Status: pre-alpha.** What works today: the inventory (scanning, content hashing, a
+> hygiene report), cleaning up with plans you approve (with undo), a file browser with tags
+> and version history from btrfs snapshots, and name and folder suggestions for your inbox
+> folders from a local model. Search and the rest of tagging come next. See [Roadmap](#roadmap).
 
 ## Why
 
@@ -126,6 +127,41 @@ bar, speed, time remaining and the latest log lines. It works on a phone too.
 - One job runs at a time. Each job also writes its own log under
   `~/.local/share/tag-keeper/logs/jobs/`.
 
+### Files, tags and history
+
+- **Browse** a root folder by folder, preview PDFs, images, audio, video and text in the
+  page, and download anything. Only types that cannot run scripts open in the page; HTML
+  and SVG are shown as plain text, everything else downloads. Paths never leave the root,
+  symlinks included.
+- **Tag** files and folders from the browser. A folder's tags are inherited by everything
+  under it. Tags live in append-only JSONL logs, one file per machine
+  (`~/.local/share/tag-keeper/tags/<host>.jsonl`), so they stay readable without the tool
+  and never conflict when synced. When a tagged item is moved — by you or by a plan — the
+  log records the move and the tags follow.
+- **Version history** comes from btrfs snapshots through
+  [btrfs-timeline](https://github.com/akivajp/btrfs-timeline): the versions of a file, a
+  folder as it was at any snapshot (including what has since been deleted), and restoring
+  an old version next to the current file under a dated name (never overwriting).
+  tag-keeper records renames and moves it sees, so a file's history continues across them.
+
+### Inbox suggestions
+
+Folders whose name matches `inbox_patterns` (by default `tmp`, `temp`, `*未整理*`,
+`*inbox*`) are treated as inboxes. For each file in them, a local model served by
+[ollama](https://ollama.com/) reads the content — text from PDFs and Office files, the image
+itself for photos and scanned PDFs — and suggests:
+
+- a name, by default `YYYYMMDD_title`, following the date style of the destination folder
+  when it has one and keeping a meaningful existing name;
+- up to three destination folders, chosen from folders you already have: candidates are
+  narrowed by character-bigram TF-IDF over each folder's path and file names, then the model
+  picks. Year and month folders are moved to the document's date;
+- tags, and whether the same content already exists elsewhere.
+
+Nothing is sent anywhere else. Suggestions are stored by content hash, so a file is read
+once. The ones you accept become a plan of renames and moves, which you check, run and undo
+like any other plan.
+
 ## Install
 
 Requires Python 3.11+ and Linux.
@@ -171,21 +207,35 @@ sync_service = "onedrive.service"    # the systemd --user unit running `onedrive
 sync_guard = "auto"                  # "auto": only for big deletions / "always": every run
 ```
 
+Tags and inbox suggestions:
+
+```toml
+[tags]
+dir = "~/.local/share/tag-keeper/tags"   # where the per-machine tag logs live
+
+[organize]
+inbox_patterns = ["tmp", "temp", "*未整理*", "*inbox*"]  # case-insensitive globs on folder names
+ollama_url = "http://127.0.0.1:11434"
+model = "gemma3:12b"                     # needs image input for photos and scans
+use_images = true
+max_chars = 4000                         # text passed to the model
+candidates = 15                          # destination folders the model chooses from
+```
+
 With roots configured, `tag-keeper scan` (no arguments) scans all of them.
 Every command accepts `--log-file PATH` to keep a timestamped log.
 
 ## Roadmap
 
 1. **Inventory and hygiene report**, and tidy-up plans that quarantine what you approve,
-   with snapper snapshots and undo. *(you are here)*
-2. **Tags and search** — tags with aliases and parents, typed fields, tags inherited from
-   folders, a catalog of records kept as append-only logs, a small web UI.
-3. **Content extraction** — text, OCR (including Japanese), transcripts; AI suggestions
-   that wait for your confirmation.
-4. **Placement and structure** — placement suggestions for unsorted files based on the
-   folders you already have, structure review, and renames and moves inside the tree.
-   Version history from btrfs snapshots via
-   [btrfs-timeline](https://github.com/akivajp/btrfs-timeline).
+   with snapper snapshots and undo. *(done)*
+2. **Tags and search** — *partly done:* tags inherited from folders in append-only logs, a
+   file browser, version history across moves. *Next:* aliases and parents, typed fields,
+   search by tag, name and content.
+3. **Content extraction** — *partly done:* text from PDF and Office files, images through a
+   local model, for inbox suggestions. *Next:* OCR and transcripts for full-text search.
+4. **Placement and structure** — *partly done:* name and folder suggestions for inbox files.
+   *Next:* directory cards, structure review.
 
 ## License
 

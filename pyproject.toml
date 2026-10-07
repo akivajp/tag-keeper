@@ -25,10 +25,12 @@ classifiers = [
     "Topic :: System :: Filesystems",
     "Topic :: Utilities",
 ]
-# 進捗表示と表の描画に rich、Web の画面に bottle（依存の無い1ファイルのライブラリ）を使う。
+# 進捗表示と表の描画に rich、Web の画面に bottle（依存の無い1ファイルのライブラリ）、
+# スナップショットからの版の履歴に btrfs-timeline（同じ作者の、実行時の依存が無いライブラリ）を使う。
 # それ以外は標準ライブラリだけで動かす
 dependencies = [
     "bottle>=0.12",
+    "btrfs-timeline>=0.8.4",
     "rich>=13",
 ]
 

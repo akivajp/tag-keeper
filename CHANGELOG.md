@@ -34,6 +34,24 @@
   Basic auth. Writes must be same-origin.
 - Plans accept `skip = true` on an item, so items can be left out without deleting lines.
 
+- File browser in the web UI: folders, in-page previews (PDF, images, audio, video, text),
+  downloads. Only types that cannot run scripts open in the page; paths never leave the
+  root, symlinks included.
+- Tags: tag files and folders from the browser; folder tags are inherited. Tags are kept
+  in append-only JSONL logs, one per machine, and follow moves made outside the tool (seen
+  by `scan`) and by plans.
+- Version history from btrfs snapshots via btrfs-timeline: versions of a file, a folder at
+  any snapshot, and restoring an old version beside the current file. Renames and moves are
+  now recorded in the catalog (schema version 2, migrated automatically), so history
+  continues across them.
+- Inbox suggestions: for files in folders named like `tmp` or `*未整理*`, a local ollama
+  model reads the content and suggests a `YYYYMMDD_title` name that respects the
+  destination's conventions, destination folders chosen among existing ones (year and month
+  folders adjusted to the document's date) and tags. Suggestions are cached by content
+  hash; accepted ones become a plan of renames and moves.
+- Plans support a `move` action (rename or move inside the tree) with undo. Destinations
+  are checked against OneDrive's naming rules.
+
 ### Changed
 
 - `report`: conflict copies are reported only when the original is next to them (a lone

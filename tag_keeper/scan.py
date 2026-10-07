@@ -19,7 +19,7 @@ from dataclasses import dataclass, field
 from fnmatch import fnmatchcase
 from pathlib import Path
 
-from tag_keeper.catalog import utcnow
+from tag_keeper.catalog import record_move, utcnow
 from tag_keeper.config import SafetyConfig
 
 log = logging.getLogger(__name__)
@@ -62,6 +62,8 @@ class ScanResult:
     gone: int = 0
     held: int = 0
     unreadable: int = 0
+    # 検出した移動（旧パス, 新パス）。フォルダごと動いたものは、そのフォルダだけを含む
+    moves: list[tuple[str, str]] = field(default_factory=list)
 
     @property
     def status(self) -> str:
@@ -233,6 +235,7 @@ def scan_root(
         for rel, row in missing.items():
             by_inode.setdefault((row["inode"], bool(row["is_dir"])), []).append(rel)
         added: list[tuple] = []
+        moved: list[tuple[int, str, str, bool]] = []  # (行 ID, 旧パス, 新パス, フォルダか)
         for rel in new_paths:
             ob = observed[rel]
             cands = by_inode.get((ob.inode, ob.is_dir))
@@ -244,6 +247,7 @@ def scan_root(
                     " last_seen = ?, missing_count = 0 WHERE id = ?",
                     (rel, ob.size, ob.mtime_ns, now, row["id"]),
                 )
+                moved.append((row["id"], old_rel, rel, ob.is_dir))
                 if not ob.is_dir:
                     res.moved += 1
                     if (row["size"], row["mtime_ns"]) != (ob.size, ob.mtime_ns):
@@ -259,6 +263,15 @@ def scan_root(
             " first_seen, last_seen) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             added,
         )
+
+        # 移動の履歴: 親フォルダごと動いたもの（親の旧パス→新パスも移動に含まれるもの）は省く
+        pairs = {(old, new) for _id, old, new, _d in moved}
+        for entry_id, old, new, is_dir in moved:
+            if "/" in old and "/" in new and (old.rsplit("/", 1)[0], new.rsplit("/", 1)[0]) in pairs:
+                if old.rsplit("/", 1)[1] == new.rsplit("/", 1)[1]:
+                    continue
+            record_move(conn, root_id, entry_id, old, new, is_dir, "scan", now)
+            res.moves.append((old, new))
 
         # 4. 消えたものの確定（大量消失なら保留）
         missing_files = sum(1 for row in missing.values() if not row["is_dir"])

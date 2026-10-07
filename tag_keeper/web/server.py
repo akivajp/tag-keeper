@@ -24,6 +24,7 @@ import os
 import re
 import sqlite3
 from dataclasses import asdict
+from datetime import datetime
 from pathlib import Path
 from socketserver import ThreadingMixIn
 from typing import Any
@@ -31,18 +32,31 @@ from wsgiref.simple_server import WSGIRequestHandler, WSGIServer, make_server
 
 import bottle
 
-from tag_keeper import __version__, rules
-from tag_keeper.catalog import connect, ensure_root, last_scan
-from tag_keeper.config import Config, ConfigError, RootConfig, default_config_path, load_config
+from tag_keeper import __version__, history, organize, rules
+from tag_keeper.catalog import connect, ensure_root, last_scan, utcnow
+from tag_keeper.config import (
+    Config,
+    ConfigError,
+    RootConfig,
+    default_config_path,
+    load_config,
+)
 from tag_keeper.hashing import hash_root
+from tag_keeper.history import HistoryError
 from tag_keeper.jobs import JobBusyError, JobManager, JobReporter
+from tag_keeper.organize import OllamaError
 from tag_keeper.plan import (
+    ACTION_MOVE,
+    CAT_MOVE,
+    Plan,
     PlanError,
+    PlanOp,
     Snapper,
     SnapshotError,
     apply_plan,
     build_plan,
     check_op,
+    fingerprint,
     force_resume_sync,
     journal_path,
     list_plans,
@@ -58,7 +72,21 @@ from tag_keeper.plan import (
 from tag_keeper.report import build_report
 from tag_keeper.scan import RootUnavailableError, scan_root
 from tag_keeper.syncguard import SyncError, SyncGuard, make_guard
-from tag_keeper.web.auth import Credentials, host_allowed, is_loopback, is_same_origin, parse_basic_header
+from tag_keeper.tags import TagError, TagStore
+from tag_keeper.web.auth import (
+    Credentials,
+    host_allowed,
+    is_loopback,
+    is_same_origin,
+    parse_basic_header,
+)
+from tag_keeper.web.files import (
+    PathError,
+    clean_relpath,
+    list_live,
+    resolve_within,
+    serve_kind,
+)
 
 log = logging.getLogger(__name__)
 
@@ -79,9 +107,18 @@ class Settings:
         self.journal_dir = data_dir / "journal"
         self.job_log_dir = data_dir / "logs" / "jobs"
 
+        self._tag_stores: dict[Path, TagStore] = {}
+
     def config(self) -> Config:
         """設定を読み直す（編集をサーバーの再起動なしで反映するため、リクエストのたびに読む）。"""
         return load_config(self.config_path)
+
+    def tags(self, config: Config | None = None) -> TagStore:
+        """タグ（ログの置き場所ごとに1つを使い回す）。"""
+        tags_dir = (config or self.config()).tags.dir
+        if tags_dir not in self._tag_stores:
+            self._tag_stores[tags_dir] = TagStore(tags_dir)
+        return self._tag_stores[tags_dir]
 
 
 # 同期クライアントとの連携の窓口は、設定の組ごとに使い回す（onedrive の設定の読み出しに 0.5 秒ほどかかるため）
@@ -138,7 +175,8 @@ def create_app(
 
     @app.hook("after_request")
     def security_headers() -> None:
-        bottle.response.set_header("Content-Security-Policy", "default-src 'self'; frame-ancestors 'none'")
+        # 同じオリジンの中でだけ枠に入れられる（PDF のプレビューのため。他のサイトからは入れられない）
+        bottle.response.set_header("Content-Security-Policy", "default-src 'self'; frame-ancestors 'self'")
         bottle.response.set_header("X-Content-Type-Options", "nosniff")
         bottle.response.set_header("Referrer-Policy", "no-referrer")
         bottle.response.set_header("Cache-Control", "no-store")
@@ -296,6 +334,9 @@ def create_app(
                 out: dict[str, Any] = {}
                 if action in ("scan", "refresh"):
                     out["scan"] = _run_scan(conn, root_id, rc, config, rep)
+                    # ツールの外での移動・改名に、タグを追従させる（P4）
+                    moved = settings.tags(config).follow_moves(rc.name, out["scan"].pop("moves"))
+                    out["scan"]["tag_moves"] = moved
                 if action in ("hash", "refresh"):
                     out["hash"] = _run_hash(conn, root_id, rc, rep)
                 return out
@@ -390,6 +431,7 @@ def create_app(
                     snapshot=Snapper(config.plan.snapper_config) if config.plan.snapper_config else None,
                     sync=_guard(rc),
                     reporter=rep,
+                    tags=settings.tags(config),
                 )
             finally:
                 conn.close()
@@ -411,6 +453,7 @@ def create_app(
                     journal_dir=settings.journal_dir,
                     snapshot=Snapper(config.plan.snapper_config) if config.plan.snapper_config else None,
                     reporter=rep,
+                    tags=settings.tags(config),
                 )
             finally:
                 conn.close()
@@ -438,12 +481,346 @@ def create_app(
         title = "削除の反映の再試行" if action == "retry" else "常駐の同期の再開"
         return start("sync", f"{title}: {plan.id}", run, target=plan.id)
 
+    # --- ファイルブラウザ・版の履歴 ---
+
+    def root_id_of(conn: sqlite3.Connection, rc: RootConfig) -> int:
+        row = conn.execute("SELECT id FROM roots WHERE name = ?", (rc.name,)).fetchone()
+        if row is None:
+            raise fail(409, f"まだ走査していません: {rc.name}")
+        return int(row["id"])
+
+    @app.route("/api/browse")
+    def api_browse() -> dict[str, Any]:
+        q = bottle.request.query
+        config = settings.config()
+        rc = root_config(config, q.getunicode("root", ""))
+        rel = clean_relpath(q.getunicode("path", ""))
+        snapshot = q.getunicode("snapshot", "")
+        if snapshot:
+            entries = history.list_directory_at(rc.path, rel, snapshot)
+            entries.sort(key=lambda e: (not e["is_dir"], e["name"].casefold()))
+        else:
+            path = resolve_within(rc.path, rel)
+            if not path.is_dir():
+                raise fail(404, f"フォルダがありません: {rel}")
+            entries = list_live(path)
+        store = settings.tags(config)
+        tagged = store.tagged_under(rc.name, rel)
+        for e in entries:
+            child = f"{rel}/{e['name']}" if rel else e["name"]
+            e["tags"] = tagged.get(child, [])
+            e["inbox"] = e["is_dir"] and organize.is_inbox_name(e["name"], config.organize.inbox_patterns)
+        crumbs = [{"name": rc.name, "path": ""}]
+        acc = ""
+        for part in rel.split("/") if rel else []:
+            acc = f"{acc}/{part}" if acc else part
+            crumbs.append({"name": part, "path": acc})
+        return {
+            "root": rc.name,
+            "path": rel,
+            "snapshot": snapshot or None,
+            "crumbs": crumbs,
+            "tags": store.tags_of(rc.name, rel),
+            "entries": entries,
+        }
+
+    @app.route("/api/file")
+    def api_file() -> Any:
+        q = bottle.request.query
+        rc = root_config(settings.config(), q.getunicode("root", ""))
+        rel = clean_relpath(q.getunicode("path", ""))
+        snapshot = q.getunicode("snapshot", "")
+        if snapshot:
+            base = history.snapshot_path(rc.path, "", snapshot)
+            path = resolve_within(base, rel)
+        else:
+            path = resolve_within(rc.path, rel)
+        if not path.is_file():
+            raise fail(404, f"ファイルがありません: {rel}")
+        mime, inline = serve_kind(path)
+        download = bool(q.get("download")) or not inline
+        res = bottle.static_file(path.name, root=str(path.parent), mimetype=mime, download=path.name if download else False)
+        if mime == "text/plain":
+            res.set_header("Content-Type", "text/plain; charset=utf-8")
+        return res
+
+    @app.route("/api/info")
+    def api_info() -> dict[str, Any]:
+        """ファイル・フォルダ1件の詳細（タグ・カタログの記録）。"""
+        q = bottle.request.query
+        config = settings.config()
+        rc = root_config(config, q.getunicode("root", ""))
+        rel = clean_relpath(q.getunicode("path", ""))
+        path = resolve_within(rc.path, rel)
+        mime, inline = serve_kind(path)
+        conn = open_db()
+        try:
+            row = conn.execute(
+                "SELECT e.sha256, e.first_seen FROM entries e JOIN roots r ON r.id = e.root_id"
+                " WHERE r.name = ? AND e.relpath = ? AND e.gone_at IS NULL",
+                (rc.name, rel),
+            ).fetchone()
+            same: list[str] = []
+            if row is not None and row["sha256"]:
+                same = [
+                    r["relpath"]
+                    for r in conn.execute(
+                        "SELECT e.relpath FROM entries e JOIN roots r ON r.id = e.root_id"
+                        " WHERE r.name = ? AND e.sha256 = ? AND e.gone_at IS NULL AND e.relpath != ? LIMIT 20",
+                        (rc.name, row["sha256"], rel),
+                    )
+                ]
+        finally:
+            conn.close()
+        return {
+            "root": rc.name,
+            "path": rel,
+            "is_dir": path.is_dir(),
+            "mime": mime,
+            "inline": inline,
+            "sha256": row["sha256"] if row is not None else None,
+            "first_seen": row["first_seen"] if row is not None else None,
+            "same_content": same,
+            "tags": settings.tags(config).tags_of(rc.name, rel),
+        }
+
+    @app.route("/api/history")
+    def api_history() -> dict[str, Any]:
+        q = bottle.request.query
+        rc = root_config(settings.config(), q.getunicode("root", ""))
+        rel = clean_relpath(q.getunicode("path", ""))
+        conn = open_db()
+        try:
+            versions = history.versions(conn, root_id_of(conn, rc), rc.path, rel)
+        finally:
+            conn.close()
+        return {"root": rc.name, "path": rel, "versions": versions}
+
+    @app.route("/api/snapshots")
+    def api_snapshots() -> dict[str, Any]:
+        rc = root_config(settings.config(), bottle.request.query.getunicode("root", ""))
+        return {"snapshots": history.snapshot_summaries(rc.path)}
+
+    @app.post("/api/restore")
+    def api_restore() -> dict[str, Any]:
+        data = body()
+        rc = root_config(settings.config(), str(data.get("root", "")))
+        rel = clean_relpath(str(data.get("path", "")))
+        version_rel = clean_relpath(str(data.get("version_path") or rel))
+        dest = history.restore_beside(rc.path, rel, version_rel, str(data.get("snapshot", "")))
+        restored = dest.relative_to(rc.path).as_posix()
+        log.info("過去の版を復元しました: %s → %s（スナップショット %s）", version_rel, restored, data.get("snapshot"))
+        return {"restored": restored}
+
+    # --- タグ ---
+
+    @app.route("/api/tags")
+    def api_tags() -> dict[str, Any]:
+        store = settings.tags()
+        return {"tags": [{"tag": t, "count": n} for t, n in sorted(store.all_tags().items())]}
+
+    @app.route("/api/tags/items")
+    def api_tag_items() -> dict[str, Any]:
+        config = settings.config()
+        tag = bottle.request.query.getunicode("tag", "")
+        items = []
+        for root, rel in settings.tags(config).items_with(tag):
+            rc = config.find_root(root)
+            path = (rc.path / rel) if rc is not None else None
+            items.append(
+                {
+                    "root": root,
+                    "path": rel,
+                    "exists": bool(path and path.exists()),
+                    "is_dir": bool(path and path.is_dir()),
+                }
+            )
+        return {"tag": tag, "items": items}
+
+    @app.post("/api/tags")
+    def api_tags_edit() -> dict[str, Any]:
+        data = body()
+        config = settings.config()
+        rc = root_config(config, str(data.get("root", "")))
+        paths = [clean_relpath(str(p)) for p in data.get("paths") or []]
+        for rel in paths:
+            if not resolve_within(rc.path, rel).exists():
+                raise fail(404, f"ありません: {rel}")
+        store = settings.tags(config)
+        if data.get("op") == "remove":
+            n = store.remove(rc.name, paths, str(data.get("tag", "")))
+        else:
+            n = store.add(rc.name, paths, str(data.get("tag", "")))
+        return {"changed": n}
+
+    # --- 受け皿の整理の提案 ---
+
+    def excluded_dirs(conn: sqlite3.Connection, root_id: int, rc: RootConfig, config: Config) -> list[str]:
+        """提案の対象と移動先から外すフォルダ（アプリのデータ・作り直せる生成物）。"""
+        report = build_report(conn, root_id, rc.name, config.hygiene)
+        return [f.relpath for f in report.findings if f.is_dir and f.category in (rules.CAT_APP_DATA, rules.CAT_REGENERABLE)]
+
+    @app.route("/api/organize/<root>")
+    def api_organize(root: str) -> dict[str, Any]:
+        config = settings.config()
+        rc = root_config(config, root)
+        conn = open_db()
+        try:
+            root_id = root_id_of(conn, rc)
+            excluded = excluded_dirs(conn, root_id, rc, config)
+            inbox, files = organize.find_inbox(conn, root_id, config.organize.inbox_patterns, excluded)
+            cached = organize.cached_suggestions(conn, files, config.organize.model)
+            # 同じ内容のファイルが受け皿の外にあれば示す（その場合は移動より隔離が向く）
+            dups: dict[str, list[str]] = {}
+            shas = [f.sha256 for f in files if f.sha256]
+            for i in range(0, len(shas), 500):
+                chunk = shas[i : i + 500]
+                marks = ",".join("?" * len(chunk))
+                for r in conn.execute(
+                    f"SELECT relpath, sha256 FROM entries WHERE root_id = ? AND gone_at IS NULL AND is_dir = 0"
+                    f" AND size > 0 AND sha256 IN ({marks})",
+                    (root_id, *chunk),
+                ):
+                    if not any(r["relpath"] == d or r["relpath"].startswith(d + "/") for d in inbox):
+                        dups.setdefault(r["sha256"], []).append(r["relpath"])
+        finally:
+            conn.close()
+        return {
+            "root": rc.name,
+            "inbox": inbox,
+            "model": config.organize.model,
+            "patterns": config.organize.inbox_patterns,
+            "files": [
+                {
+                    "path": f.relpath,
+                    "size": f.size,
+                    "mtime": f.mtime_ns // 1_000_000_000,
+                    "suggestion": cached[f.relpath].to_dict() if f.relpath in cached else None,
+                    "duplicates": dups.get(f.sha256 or "", []),
+                }
+                for f in files
+            ],
+        }
+
+    @app.post("/api/organize/<root>/suggest")
+    def api_organize_suggest(root: str) -> dict[str, Any]:
+        data = body()
+        config = settings.config()
+        rc = root_config(config, root)
+        only = [clean_relpath(str(p)) for p in data["paths"]] if data.get("paths") else None
+        force = bool(data.get("force", False))
+        oc = config.organize
+
+        def run(rep: JobReporter) -> dict[str, Any]:
+            conn = open_db()
+            try:
+                root_id = root_id_of(conn, rc)
+                rep.phase("対象の確認")
+                excluded = excluded_dirs(conn, root_id, rc, config)
+                rep.note(f"モデル: {oc.model} ／ 受け皿のパターン: {', '.join(oc.inbox_patterns)} ／ 画像: {'使う' if oc.use_images else '使わない'}")
+                done = {"ok": 0, "cached": 0, "error": 0}
+
+                def on_start(n: int) -> None:
+                    rep.phase("内容の読み取りと提案", total=n)
+
+                def on_done(sug: organize.Suggestion) -> None:
+                    key = "error" if sug.error else ("cached" if sug.cached else "ok")
+                    done[key] += 1
+                    name = sug.relpath.rsplit("/", 1)[-1]
+                    if sug.error:
+                        rep.note(f"失敗: {name}: {sug.error}")
+                    elif not sug.cached:
+                        rep.note(f"{name} → {sug.new_name}")
+                    rep.advance()
+
+                organize.run_suggestions(
+                    conn, root_id, rc.path, oc, excluded, only=only, force=force, on_start=on_start, on_done=on_done
+                )
+                return {"root": rc.name, **done}
+            finally:
+                conn.close()
+
+        return start("suggest", f"整理の提案: {rc.name}", run, target=rc.name)
+
+    @app.route("/api/folders")
+    def api_folders() -> dict[str, Any]:
+        """移動先に選べるフォルダ（名前の一部で絞り込む）。"""
+        q = bottle.request.query
+        rc = root_config(settings.config(), q.getunicode("root", ""))
+        word = q.getunicode("q", "").strip()
+        conn = open_db()
+        try:
+            rows = conn.execute(
+                "SELECT e.relpath FROM entries e JOIN roots r ON r.id = e.root_id"
+                " WHERE r.name = ? AND e.gone_at IS NULL AND e.is_dir = 1 AND instr(lower(e.relpath), lower(?)) > 0"
+                " ORDER BY length(e.relpath) LIMIT 50",
+                (rc.name, word),
+            ).fetchall()
+        finally:
+            conn.close()
+        return {"folders": [r["relpath"] for r in rows if not any(p.startswith(".") for p in r["relpath"].split("/"))]}
+
+    @app.post("/api/organize/<root>/plan")
+    def api_organize_plan(root: str) -> dict[str, Any]:
+        """採用した提案（移動・改名）から整理プランを作る。"""
+        data = body()
+        config = settings.config()
+        rc = root_config(config, root)
+        items = data.get("items") or []
+        if not items:
+            raise fail(400, "採用した提案がありません")
+        plan = Plan(
+            id=f"{datetime.now():%Y%m%d-%H%M%S}-{rc.name}-organize",
+            root=rc.name,
+            root_path=rc.path,
+            created_at=utcnow(),
+        )
+        dests: set[str] = set()
+        for it in items:
+            src = clean_relpath(str(it.get("path", "")))
+            dest = clean_relpath(str(it.get("dest", "")))
+            if not src or not dest or src == dest:
+                continue
+            problem = rules.cloud_name_problem(dest)
+            if problem:
+                raise fail(400, f"{dest}: {problem}")
+            if dest in dests or (rc.path / dest).exists():
+                raise fail(409, f"移動先に同じ名前のものがあります: {dest}")
+            dests.add(dest)
+            fp = fingerprint(resolve_within(rc.path, src))
+            if fp is None:
+                raise fail(404, f"ありません: {src}")
+            plan.ops.append(
+                PlanOp(
+                    action=ACTION_MOVE,
+                    path=src,
+                    dest=dest,
+                    is_dir=False,
+                    files=fp.files,
+                    size=fp.size,
+                    inode=fp.inode,
+                    mtime_ns=fp.mtime_ns,
+                    category=CAT_MOVE,
+                    reason=str(it.get("reason", ""))[:200],
+                )
+            )
+        if not plan.ops:
+            raise fail(400, "動かすものがありません（名前も場所も変わらない）")
+        write_plan(plan, settings.plans_dir / f"{plan.id}.toml")
+        return {"plan_id": plan.id, "ops": len(plan.ops)}
+
     # 予期できる失敗は 400 番台の JSON にして、画面にそのまま表示できるようにする
     def json_errors(callback: Any) -> Any:
         def wrapper(*args: Any, **kwargs: Any) -> Any:
             try:
                 return callback(*args, **kwargs)
-            except (PlanError, ConfigError, SnapshotError, SyncError, RootUnavailableError) as e:
+            except (PlanError, ConfigError, SnapshotError, SyncError, RootUnavailableError, TagError, PathError, OllamaError) as e:
+                return fail(400, str(e))
+            except HistoryError as e:
+                return fail(409, str(e))
+            except FileNotFoundError as e:
+                return fail(404, str(e))
+            except (NotADirectoryError, PermissionError) as e:
                 return fail(400, str(e))
 
         return wrapper

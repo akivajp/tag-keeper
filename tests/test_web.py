@@ -76,7 +76,7 @@ def test_scan_report_plan_apply_undo(env: dict) -> None:
 
     applied = run_job(env, f"/api/plans/{plan_id}/apply")
     assert applied["result"]["done"] == 1
-    assert "隔離" in [p["name"] for p in applied["phases"]]
+    assert "実行（隔離・移動）" in [p["name"] for p in applied["phases"]]
     assert not (root / "Documents" / "DMMGames").exists() and (root / "docs" / "Thumbs.db").exists()
     plan = app.get(f"/api/plans/{plan_id}").json
     assert plan["info"]["state"] == "applied" and plan["restorable"] == 1
@@ -130,3 +130,61 @@ def test_basic_auth(tmp_path: Path, env: dict) -> None:
 def test_unknown_plan_and_bad_ids(env: dict) -> None:
     env["app"].get("/api/plans/nope", status=404)
     env["app"].get("/api/plans/..%2Fetc", status=(400, 404))
+
+
+def test_browse_and_file_serving(env: dict) -> None:
+    app, root = env["app"], env["root"]
+    write(root / "docs" / "page.html", "<script>alert(1)</script>")
+    write(root / "docs" / "photo.jpg", b"\xff\xd8\xff")
+    data = app.get("/api/browse", {"root": "data", "path": "docs"}).json
+    assert [e["name"] for e in data["entries"]] == ["page.html", "photo.jpg", "report.pdf", "Thumbs.db"]
+    assert [c["path"] for c in data["crumbs"]] == ["", "docs"]
+    # 画像は画面の中で開く。HTML はスクリプトを動かさないよう text/plain にする
+    assert app.get("/api/file", {"root": "data", "path": "docs/photo.jpg"}).headers["Content-Type"].startswith("image/jpeg")
+    html = app.get("/api/file", {"root": "data", "path": "docs/page.html"})
+    assert html.headers["Content-Type"].startswith("text/plain")
+    dl = app.get("/api/file", {"root": "data", "path": "docs/report.pdf", "download": "1"})
+    assert "attachment" in dl.headers["Content-Disposition"]
+    # ルートの外は見せない
+    app.get("/api/file", {"root": "data", "path": "../config.toml"}, status=400)
+    app.get("/api/browse", {"root": "data", "path": "docs/../.."}, status=400)
+
+
+def test_symlink_out_of_root_is_refused(env: dict, tmp_path: Path) -> None:
+    secret = write(tmp_path / "secret.txt", "secret")
+    (env["root"] / "link.txt").symlink_to(secret)
+    env["app"].get("/api/file", {"root": "data", "path": "link.txt"}, status=400)
+
+
+def test_tags_api(env: dict, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+    app = env["app"]
+    origin = {"Origin": f"http://{HOST}"}
+    app.post_json("/api/tags", {"root": "data", "paths": ["docs"], "tag": "種別:書類"}, headers=origin)
+    app.post_json("/api/tags", {"root": "data", "paths": ["docs/report.pdf"], "tag": "相手:A社"}, headers=origin)
+    app.post_json("/api/tags", {"root": "data", "paths": ["nope.pdf"], "tag": "x"}, headers=origin, status=404)
+    data = app.get("/api/browse", {"root": "data", "path": "docs"}).json
+    assert data["tags"]["direct"][0]["tag"] == "種別:書類"
+    assert next(e for e in data["entries"] if e["name"] == "report.pdf")["tags"] == ["相手:A社"]
+    assert {t["tag"] for t in app.get("/api/tags").json["tags"]} == {"種別:書類", "相手:A社"}
+    items = app.get("/api/tags/items", {"tag": "種別:書類"}).json["items"]
+    assert items == [{"root": "data", "path": "docs", "exists": True, "is_dir": True}]
+    app.post_json("/api/tags", {"root": "data", "paths": ["docs"], "tag": "種別:書類", "op": "remove"}, headers=origin)
+    assert app.get("/api/browse", {"root": "data", "path": "docs"}).json["tags"]["direct"] == []
+
+
+def test_organize_plan_from_accepted_suggestions(env: dict) -> None:
+    app, root = env["app"], env["root"]
+    write(root / "99_Inbox" / "tmp" / "downloadfile.pdf", "statement")
+    run_job(env, "/api/roots/data/scan")
+    data = app.get("/api/organize/data").json
+    assert data["inbox"] == ["99_Inbox"] and data["files"][0]["path"] == "99_Inbox/tmp/downloadfile.pdf"
+    origin = {"Origin": f"http://{HOST}"}
+    items = [{"path": "99_Inbox/tmp/downloadfile.pdf", "dest": "docs/20250414_明細書.pdf", "reason": "明細書"}]
+    app.post_json("/api/organize/data/plan", {"items": [{"path": "99_Inbox/tmp/downloadfile.pdf", "dest": "docs/a?.pdf"}]}, headers=origin, status=400)
+    app.post_json("/api/organize/data/plan", {"items": [{"path": "99_Inbox/tmp/downloadfile.pdf", "dest": "docs/report.pdf"}]}, headers=origin, status=409)
+    plan_id = app.post_json("/api/organize/data/plan", {"items": items}, headers=origin).json["plan_id"]
+    plan = app.get(f"/api/plans/{plan_id}").json
+    assert plan["ops"][0]["action"] == "move" and plan["ops"][0]["dest"] == "docs/20250414_明細書.pdf"
+    run_job(env, f"/api/plans/{plan_id}/apply")
+    assert (root / "docs" / "20250414_明細書.pdf").read_text() == "statement"

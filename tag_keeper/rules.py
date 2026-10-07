@@ -191,3 +191,28 @@ def is_in_vcs_dir(relpath: str) -> bool:
 def has_no_extension(name: str) -> bool:
     """拡張子の無い名前かを返す（隠しファイルの先頭の . は拡張子とみなさない）。"""
     return split_ext(name)[1] == ""
+
+
+# クラウド（OneDrive）で使えない名前（要件 F-PL-6）
+_CLOUD_BAD_CHARS = re.compile(r'["*:<>?/\\|\x00-\x1f]')
+_CLOUD_RESERVED = re.compile(r"^(con|prn|aux|nul|com\d|lpt\d|\.lock|desktop\.ini|_vti_.*)(\..*)?$", re.IGNORECASE)
+# OneDrive のパスの長さの上限（文字数）
+CLOUD_MAX_PATH = 400
+
+
+def cloud_name_problem(relpath: str) -> str | None:
+    """移動先・新しい名前が、クラウドの制約を満たすかを確かめる。問題があれば理由を返す。"""
+    if len(relpath) > CLOUD_MAX_PATH:
+        return f"パスが長すぎる（{len(relpath)} 文字。上限 {CLOUD_MAX_PATH}）"
+    for part in relpath.split("/"):
+        if not part or part in (".", ".."):
+            return "空の名前や . / .. は使えない"
+        if _CLOUD_BAD_CHARS.search(part):
+            return f"使えない文字を含む: {part}"
+        if part != part.strip() or part.endswith("."):
+            return f"前後の空白や末尾の . は使えない: {part!r}"
+        if _CLOUD_RESERVED.match(part):
+            return f"予約された名前: {part}"
+        if part.startswith("~$"):
+            return f"~$ で始まる名前は同期されない: {part}"
+    return None

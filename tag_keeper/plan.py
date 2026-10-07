@@ -28,15 +28,20 @@ from typing import Any, Protocol
 import tomllib
 
 from tag_keeper import rules
-from tag_keeper.catalog import utcnow
+from tag_keeper.catalog import record_move, utcnow
 from tag_keeper.report import Report
 from tag_keeper.scan import check_root_available, walk_tree
 from tag_keeper.syncguard import SyncError, SyncGuard, count_children
+from tag_keeper.tags import TagStore
 
 log = logging.getLogger(__name__)
 
-# 操作の種類。今は隔離フォルダへの移動だけ
+# 操作の種類。隔離フォルダへの移動と、ツリーの中での移動・改名
 ACTION_QUARANTINE = "quarantine"
+ACTION_MOVE = "move"
+ACTIONS = (ACTION_QUARANTINE, ACTION_MOVE)
+# 移動・改名の操作のカテゴリ（プランの見出し）
+CAT_MOVE = "整理（移動・改名）"
 
 
 class PlanError(RuntimeError):
@@ -66,6 +71,8 @@ class PlanOp:
     reason: str = ""
     # 実行しない（利用者が外した）。行を消すのと同じ意味で、Web の画面からはこちらを使う
     skip: bool = False
+    # 移動・改名（action = "move"）の移動先。ルートからの相対パス（新しい名前を含む）
+    dest: str = ""
 
 
 @dataclass
@@ -220,6 +227,7 @@ def write_plan(plan: Plan, path: Path) -> None:
         for op in ops:
             lines.append(
                 f"  {{ {'skip = true, ' if op.skip else ''}action = {_toml_str(op.action)}, path = {_toml_str(op.path)},"
+                f"{' dest = ' + _toml_str(op.dest) + ',' if op.action == ACTION_MOVE else ''}"
                 f" category = {_toml_str(op.category)}, reason = {_toml_str(op.reason)},"
                 f" is_dir = {'true' if op.is_dir else 'false'}, files = {op.files}, size = {op.size},"
                 f" inode = {op.inode}, mtime_ns = {op.mtime_ns} }},"
@@ -244,7 +252,7 @@ def load_plan(path: Path) -> Plan:
             created_at=str(data["created_at"]),
         )
         for i, item in enumerate(data.get("ops", [])):
-            if item["action"] != ACTION_QUARANTINE:
+            if item["action"] not in ACTIONS:
                 raise PlanError(f"{path}: ops[{i}] の action が不明です: {item['action']}")
             plan.ops.append(
                 PlanOp(
@@ -258,6 +266,7 @@ def load_plan(path: Path) -> Plan:
                     category=str(item.get("category", "")),
                     reason=str(item.get("reason", "")),
                     skip=bool(item.get("skip", False)),
+                    dest=str(item.get("dest", "")),
                 )
             )
     except KeyError as e:
@@ -265,9 +274,16 @@ def load_plan(path: Path) -> Plan:
     if not re.fullmatch(r"[\w.-]+", plan.id):
         raise PlanError(f"{path}: プラン ID に使えない文字があります: {plan.id}")
     for op in plan.ops:
-        parts = op.path.split("/")
-        if op.path.startswith("/") or any(p in ("", ".", "..") for p in parts):
-            raise PlanError(f"{path}: ルートの外を指すパスは扱えません: {op.path}")
+        for target in [op.path] + ([op.dest] if op.action == ACTION_MOVE else []):
+            parts = target.split("/")
+            if target.startswith("/") or any(p in ("", ".", "..") for p in parts):
+                raise PlanError(f"{path}: ルートの外を指すパスは扱えません: {target!r}")
+        if op.action == ACTION_MOVE:
+            problem = rules.cloud_name_problem(op.dest)
+            if problem:
+                raise PlanError(f"{path}: 移動先 {op.dest} は使えません（{problem}）")
+            if op.dest == op.path or op.dest.startswith(op.path + "/"):
+                raise PlanError(f"{path}: 移動先が自身か配下です: {op.path} → {op.dest}")
     # 親を子より先に処理する（子を先に動かすと、親の隔離先にフォルダができて親を動かせなくなる）
     plan.ops.sort(key=lambda o: _path_key(o.path))
     return plan
@@ -282,6 +298,8 @@ def check_op(plan: Plan, op: PlanOp) -> str | None:
         return "別のものに置き換わった"
     if (fp.files, fp.size, fp.mtime_ns) != (op.files, op.size, op.mtime_ns):
         return "プランの作成後に変更された"
+    if op.action == ACTION_MOVE and os.path.lexists(plan.root_path / op.dest):
+        return "移動先に同じ名前のものがある"
     return None
 
 
@@ -518,8 +536,9 @@ def apply_plan(
     snapshot: SnapshotTaker | None,
     sync: SyncGuard | None = None,
     reporter: Reporter | None = None,
+    tags: TagStore | None = None,
 ) -> RunResult:
-    """プランを実行し、対象を隔離フォルダへ移す。skip の付いた操作は行わない。
+    """プランを実行する（隔離フォルダへ移す・ツリーの中で移動・改名する）。skip の付いた操作は行わない。
 
     同期クライアントとの連携（sync）があり、大量削除とみなされる操作を含むなら、
     常駐の同期を止めてから移し、削除をクラウドに反映してから再開する（syncguard を参照）。
@@ -532,6 +551,7 @@ def apply_plan(
         snapshot: 前後のスナップショットを撮るもの。None なら撮らない。
         sync: 同期クライアントとの連携の窓口。None なら連携しない。
         reporter: 進捗の通知先。
+        tags: タグ。移動・改名したアイテムのタグを追従させる。
 
     Raises:
         PlanError: ルートが見えない・隔離先が別のファイルシステム、など。何も動かしていない。
@@ -553,7 +573,7 @@ def apply_plan(
     use_sync = False
     max_children = 0
     if sync is not None and ops:
-        dirs = [op for op in ops if op.is_dir]
+        dirs = [op for op in ops if op.is_dir and op.action == ACTION_QUARANTINE]
         rep.phase("大量削除の確認", total=len(dirs))
         children: list[int] = []
         for op in dirs:
@@ -587,17 +607,21 @@ def apply_plan(
             raise
         _append(journal, {"event": "sync-pause", "client": sync.name, "max_children": max_children})
 
-    rep.phase("隔離", total=len(ops))
+    rep.phase("実行（隔離・移動）", total=len(ops))
     try:
         for op in ops:
-            outcome = _quarantine_one(conn, plan, op, root_id, dest_root, journal, gone_at)
+            if op.action == ACTION_MOVE:
+                outcome = _move_one(conn, plan, op, root_id, journal, tags)
+            else:
+                outcome = _quarantine_one(conn, plan, op, root_id, dest_root, journal, gone_at)
             result.outcomes.append(outcome)
             rep.advance()
     finally:
         # 途中で例外が起きても、止めた同期は必ず反映・再開を試みる
         if use_sync:
             assert sync is not None
-            paths = [sync.relpath(plan.root_path / o.path) for o in result.done]
+            quarantined = {op.path for op in ops if op.action == ACTION_QUARANTINE}
+            paths = [sync.relpath(plan.root_path / o.path) for o in result.done if o.path in quarantined]
             result.sync_error = _flush_and_resume(sync, journal, paths, max_children, rep)
 
     rep.phase("実行後のスナップショット")
@@ -612,6 +636,70 @@ def apply_plan(
         },
     )
     return result
+
+
+def _move_one(
+    conn: sqlite3.Connection,
+    plan: Plan,
+    op: PlanOp,
+    root_id: int,
+    journal: Path,
+    tags: TagStore | None,
+) -> OpOutcome:
+    """1操作を確かめてからツリーの中で移動・改名し、実行記録・カタログ・タグを更新する。"""
+    src = plan.root_path / op.path
+    dst = plan.root_path / op.dest
+    problem = check_op(plan, op)
+    outcome = OpOutcome(op.path, op.is_dir, op.files, op.size, problem is None, problem or "")
+    if problem is None:
+        try:
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            os.rename(src, dst)
+        except OSError as e:
+            outcome.done, outcome.detail = False, f"移動できなかった（{e.strerror}）"
+    if not outcome.done:
+        log.warning("飛ばしました: %s（%s）", op.path, outcome.detail)
+        _append(journal, {"event": "skip", "path": op.path, "detail": outcome.detail})
+        return outcome
+    _append(
+        journal,
+        {
+            "event": "move",
+            "path": op.path,
+            "dest": op.dest,
+            "is_dir": op.is_dir,
+            "files": op.files,
+            "size": op.size,
+            "src": str(src),
+            "dst": str(dst),
+        },
+    )
+    _relocate_in_catalog(conn, root_id, op.path, op.dest, op.is_dir, "plan")
+    if tags is not None:
+        tags.follow_moves(plan.root, [(op.path, op.dest)])
+    return outcome
+
+
+def _relocate_in_catalog(conn: sqlite3.Connection, root_id: int, old: str, new: str, is_dir: bool, source: str) -> None:
+    """ツール自身が動かしたものの行を、新しいパスへ確実に移す（F-PL-5）。移動の履歴も残す。"""
+    now = utcnow()
+    with conn:
+        # 移動先に残っている「存在中」の行は古い記録（移動先が空いていたことを確かめてから動かしている）
+        where_new, args_new = _subtree_sql(new)
+        conn.execute(
+            f"UPDATE entries SET gone_at = ? WHERE root_id = ? AND gone_at IS NULL AND {where_new}",
+            (now, root_id, *args_new),
+        )
+        row = conn.execute(
+            "SELECT id FROM entries WHERE root_id = ? AND gone_at IS NULL AND relpath = ?", (root_id, old)
+        ).fetchone()
+        where, args = _subtree_sql(old)
+        conn.execute(
+            f"UPDATE entries SET relpath = ? || substr(relpath, ?) WHERE root_id = ? AND gone_at IS NULL AND {where}",
+            (new, len(old) + 1, root_id, *args),
+        )
+        if row is not None:
+            record_move(conn, root_id, int(row["id"]), old, new, is_dir, source, now)
 
 
 def _quarantine_one(
@@ -676,6 +764,8 @@ class Restorable:
     dst: Path
     gone_at: str
     quarantine: Path  # このプランの隔離先（<quarantine_dir>/<プラン ID>）
+    kind: str = ACTION_QUARANTINE  # quarantine（隔離から戻す） / move（移動・改名を戻す）
+    dest: str = ""  # 移動・改名の移動先（ルートからの相対パス）
 
 
 def pending_restores(journal: Path) -> list[Restorable]:
@@ -702,6 +792,20 @@ def pending_restores(journal: Path) -> list[Restorable]:
                 gone_at=rec["gone_at"],
                 quarantine=quarantine,
             )
+        elif event == "move":
+            moved[rec["path"]] = Restorable(
+                root=root,
+                path=rec["path"],
+                is_dir=rec["is_dir"],
+                files=rec["files"],
+                size=rec["size"],
+                src=Path(rec["src"]),
+                dst=Path(rec["dst"]),
+                gone_at="",
+                quarantine=quarantine,
+                kind=ACTION_MOVE,
+                dest=rec["dest"],
+            )
         elif event == "restore":
             moved.pop(rec["path"], None)
     return list(reversed(moved.values()))
@@ -725,8 +829,9 @@ def undo_plan(
     journal_dir: Path,
     snapshot: SnapshotTaker | None,
     reporter: Reporter | None = None,
+    tags: TagStore | None = None,
 ) -> RunResult:
-    """実行記録をもとに、隔離したものを元の場所へ戻す（F-PL-4）。
+    """実行記録をもとに、隔離・移動したものを元の場所へ戻す（F-PL-4）。
 
     元の場所に既に別のものがあれば、上書きせずに飛ばす。
     戻したものは常駐の同期がそのままアップロードするので、同期クライアントとの連携は要らない。
@@ -750,7 +855,7 @@ def undo_plan(
     for it in items:
         outcome = OpOutcome(it.path, it.is_dir, it.files, it.size, True)
         if not os.path.lexists(it.dst):
-            outcome.done, outcome.detail = False, "隔離先に見つからない"
+            outcome.done, outcome.detail = False, "移動先に見つからない" if it.kind == ACTION_MOVE else "隔離先に見つからない"
         elif os.path.lexists(it.src):
             outcome.done, outcome.detail = False, "元の場所に別のものがある"
         else:
@@ -759,7 +864,12 @@ def undo_plan(
                 os.rename(it.dst, it.src)
             except OSError as e:
                 outcome.done, outcome.detail = False, f"移動できなかった（{e.strerror}）"
-        if outcome.done:
+        if outcome.done and it.kind == ACTION_MOVE:
+            _append(journal, {"event": "restore", "path": it.path})
+            _relocate_in_catalog(conn, root_id, it.dest, it.path, it.is_dir, "plan-undo")
+            if tags is not None:
+                tags.follow_moves(it.root, [(it.dest, it.path)])
+        elif outcome.done:
             _remove_empty_parents(it.dst.parent, it.quarantine)
             _append(journal, {"event": "restore", "path": it.path})
             where, args = _subtree_sql(it.path)
