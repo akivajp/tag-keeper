@@ -6,6 +6,9 @@
     name = "onedrive"
     path = "~/CloudSync/OneDrive"
     exclude = ["*.partial"]          # 走査しないパス（ルートからの相対パスに対する glob）
+    sync_client = "onedrive"         # 同期クライアント（大量に隔離するとき、同期を止めずに削除を反映する）
+    sync_service = "onedrive.service"  # 常駐の同期の systemd --user ユニット
+    sync_guard = "auto"              # auto: 大量削除になるときだけ連携する / always: 実行のたびに連携する
 
     [hygiene]
     allow = ["archive/**"]           # 報告しないパス（「残す」と判断したもの）
@@ -59,6 +62,12 @@ class RootConfig:
     path: Path
     # 走査しないパス。ルートからの相対パス（区切りは /）に対する glob
     exclude: list[str] = field(default_factory=list)
+    # ルートを同期している同期クライアント。"onedrive"（Linux 版 onedrive クライアント）か ""（連携しない）
+    sync_client: str = ""
+    # 常駐の同期を動かしている systemd --user のユニット名
+    sync_service: str = "onedrive.service"
+    # 同期クライアントと連携する条件。"auto": 大量削除とみなされるときだけ / "always": 実行のたびに
+    sync_guard: str = "auto"
 
 
 @dataclass
@@ -135,11 +144,20 @@ def load_config(path: Path | None = None) -> Config:
     for i, item in enumerate(data.get("roots", [])):
         if "name" not in item or "path" not in item:
             raise ConfigError(f"{path}: roots[{i}] には name と path が必要です")
+        sync_client = str(item.get("sync_client", ""))
+        if sync_client not in ("", "onedrive"):
+            raise ConfigError(f"{path}: roots[{i}] の sync_client は \"onedrive\" か空にしてください: {sync_client}")
+        sync_guard = str(item.get("sync_guard", "auto"))
+        if sync_guard not in ("auto", "always"):
+            raise ConfigError(f"{path}: roots[{i}] の sync_guard は \"auto\" か \"always\" にしてください: {sync_guard}")
         roots.append(
             RootConfig(
                 name=str(item["name"]),
                 path=_expand(str(item["path"])),
                 exclude=[str(p) for p in item.get("exclude", [])],
+                sync_client=sync_client,
+                sync_service=str(item.get("sync_service", "onedrive.service")),
+                sync_guard=sync_guard,
             )
         )
     names = [r.name for r in roots]

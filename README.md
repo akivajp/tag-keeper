@@ -5,8 +5,8 @@ Tag, search and tidy your existing file trees from the outside — without movin
 [日本語版 README はこちら](README.ja.md)
 
 > **Status: pre-alpha.** What works today is the inventory (scanning, content hashing, a
-> hygiene report) and cleaning up with plans you approve, with undo. Tagging and search
-> come next. See [Roadmap](#roadmap).
+> hygiene report) and cleaning up with plans you approve, with undo — from the command line
+> or a web UI. Tagging and search come next. See [Roadmap](#roadmap).
 
 ## Why
 
@@ -87,6 +87,45 @@ $ tag-keeper undo <plan-id> --yes           # put everything back
 - Items leave the cloud when the sync client notices they are gone, but they stay on this
   disk until you empty the quarantine folder yourself.
 
+### Big deletions without stopping your sync client
+
+The [OneDrive client for Linux](https://github.com/abraunegg/onedrive) treats the local
+removal of a folder with many children (`classify_as_big_delete`, 1000 by default) as an
+accident: it refuses to sync and exits. Run under systemd, it keeps exiting on every
+restart, so syncing silently stops. When *you* approve a big deletion, tag-keeper
+coordinates with the client instead (set `sync_client = "onedrive"` on the root):
+
+1. stop the resident sync (`systemctl --user stop onedrive.service`),
+2. quarantine the items,
+3. run one `onedrive --sync` with the threshold raised just above the largest folder in this
+   plan — not `--force`, which would also let unrelated accidents through,
+4. start the resident sync again.
+
+If step 3 fails, the resident sync is left stopped (restarting it would only exit again),
+the failure is journaled, and the web UI and `tag-keeper sync <plan-id> --retry` offer to
+try again. Small plans are left to the running client as usual.
+
+## Web UI
+
+```console
+$ tag-keeper serve                  # http://127.0.0.1:8090/
+```
+
+Everything above can be done in the browser: refresh a root (scan and hash), read the
+report, create a plan, untick what you want to keep, check it, run it and undo it. Long
+operations run in the background, and a panel at the bottom shows each step, a progress
+bar, speed, time remaining and the latest log lines. It works on a phone too.
+
+- Only loopback is served by default. To listen elsewhere (for example on a Tailscale
+  address), give credentials for HTTP Basic auth with `--auth-file` (one line,
+  `user:password`) or `TAG_KEEPER_AUTH`; without them a non-loopback address is refused
+  unless you pass `--allow-no-auth`. Basic auth is not encrypted: use it over a VPN such as
+  Tailscale, or behind TLS.
+- Writes require a same-origin request, and without auth the `Host` header must name the
+  bound address (against DNS rebinding).
+- One job runs at a time. Each job also writes its own log under
+  `~/.local/share/tag-keeper/logs/jobs/`.
+
 ## Install
 
 Requires Python 3.11+ and Linux.
@@ -119,6 +158,17 @@ mass_missing_min = 100
 [plan]
 quarantine_dir = "~/.local/share/tag-keeper/quarantine"  # must be on the root's filesystem
 snapper_config = "home"              # snapper config for pre/post snapshots ("" = none)
+```
+
+Per root, for coordinating with a sync client:
+
+```toml
+[[roots]]
+name = "onedrive"
+path = "~/CloudSync/OneDrive"
+sync_client = "onedrive"             # "" (default) = no coordination
+sync_service = "onedrive.service"    # the systemd --user unit running `onedrive --monitor`
+sync_guard = "auto"                  # "auto": only for big deletions / "always": every run
 ```
 
 With roots configured, `tag-keeper scan` (no arguments) scans all of them.

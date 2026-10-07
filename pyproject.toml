@@ -25,14 +25,17 @@ classifiers = [
     "Topic :: System :: Filesystems",
     "Topic :: Utilities",
 ]
-# 進捗表示と表の描画に rich を使う。それ以外は標準ライブラリだけで動かす
+# 進捗表示と表の描画に rich、Web の画面に bottle（依存の無い1ファイルのライブラリ）を使う。
+# それ以外は標準ライブラリだけで動かす
 dependencies = [
+    "bottle>=0.12",
     "rich>=13",
 ]
 
 [project.optional-dependencies]
 dev = [
     "pytest>=7.0",
+    "webtest>=3.0",
 ]
 
 [project.urls]
@@ -61,3 +64,5 @@ include = [
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# webtest が使う webob の、Python 3.13 で消える cgi モジュールへの警告（こちらでは直せない）
+filterwarnings = ["ignore::DeprecationWarning:webob.*"]

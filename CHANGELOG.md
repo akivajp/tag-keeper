@@ -22,6 +22,18 @@
   journaled, and `undo` puts items back without overwriting anything new. The catalog is
   updated as items move, so a large quarantine is not mistaken for a mass disappearance.
 
+- Big deletions without stopping the sync client: with `sync_client = "onedrive"` on a
+  root, a plan that removes a folder above the OneDrive client's `classify_as_big_delete`
+  threshold stops the resident sync, quarantines, reflects the deletions with one
+  `onedrive --sync` whose threshold is raised just enough (never `--force`), and starts the
+  sync again. A failed reflection leaves the sync stopped, is journaled, and can be retried
+  (`tag-keeper sync <plan-id> --retry`) or abandoned (`--resume`).
+- `serve`: a web UI for everything above — roots, report, plan editing (untick to skip),
+  check, apply and undo — with background jobs and a progress panel (steps, bar, speed,
+  time remaining, latest log lines). Loopback by default; other addresses require HTTP
+  Basic auth. Writes must be same-origin.
+- Plans accept `skip = true` on an item, so items can be left out without deleting lines.
+
 ### Changed
 
 - `report`: conflict copies are reported only when the original is next to them (a lone

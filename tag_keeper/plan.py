@@ -19,7 +19,7 @@ import os
 import re
 import sqlite3
 import subprocess
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Iterator, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -31,6 +31,7 @@ from tag_keeper import rules
 from tag_keeper.catalog import utcnow
 from tag_keeper.report import Report
 from tag_keeper.scan import check_root_available, walk_tree
+from tag_keeper.syncguard import SyncError, SyncGuard, count_children
 
 log = logging.getLogger(__name__)
 
@@ -63,6 +64,8 @@ class PlanOp:
     mtime_ns: int
     category: str = ""
     reason: str = ""
+    # 実行しない（利用者が外した）。行を消すのと同じ意味で、Web の画面からはこちらを使う
+    skip: bool = False
 
 
 @dataclass
@@ -194,7 +197,8 @@ def write_plan(plan: Plan, path: Path) -> None:
     """プランを TOML で書き出す。1操作を1行にし、カテゴリごとに見出しのコメントを付ける。"""
     lines = [
         "# tag-keeper の整理プラン。",
-        "# 残したいものは、その行を消してください。各行の inode 以降は、変わっていないかの確認用です。",
+        "# 残したいものは、その行を消すか、先頭に skip = true を足してください。",
+        "# 各行の inode 以降は、変わっていないかの確認用です。",
         f"# 確認: tag-keeper apply {path}",
         f"# 実行: tag-keeper apply {path} --yes",
         f"id = {_toml_str(plan.id)}",
@@ -215,7 +219,7 @@ def write_plan(plan: Plan, path: Path) -> None:
         lines.append(f"  # {cat}（{len(ops):,} 件、{_human_size(sum(o.size for o in ops))}）")
         for op in ops:
             lines.append(
-                f"  {{ action = {_toml_str(op.action)}, path = {_toml_str(op.path)},"
+                f"  {{ {'skip = true, ' if op.skip else ''}action = {_toml_str(op.action)}, path = {_toml_str(op.path)},"
                 f" category = {_toml_str(op.category)}, reason = {_toml_str(op.reason)},"
                 f" is_dir = {'true' if op.is_dir else 'false'}, files = {op.files}, size = {op.size},"
                 f" inode = {op.inode}, mtime_ns = {op.mtime_ns} }},"
@@ -253,6 +257,7 @@ def load_plan(path: Path) -> Plan:
                     mtime_ns=int(item["mtime_ns"]),
                     category=str(item.get("category", "")),
                     reason=str(item.get("reason", "")),
+                    skip=bool(item.get("skip", False)),
                 )
             )
     except KeyError as e:
@@ -356,6 +361,22 @@ def read_journal(journal: Path) -> Iterator[dict[str, Any]]:
                 yield json.loads(line)
 
 
+# --- 進捗の通知 ---
+
+
+class Reporter:
+    """長い処理の進み具合を受け取るもの。既定の実装は何もしない（CLI と Web がそれぞれ上書きする）。"""
+
+    def phase(self, name: str, total: int | None = None, unit: str = "件") -> None:
+        """新しい段階に入ったことを知らせる。total は段階内の作業量（分からなければ None）。"""
+
+    def advance(self, n: int = 1) -> None:
+        """段階内の作業が n だけ進んだことを知らせる。"""
+
+    def note(self, line: str) -> None:
+        """表示用のログを1行知らせる（同期クライアントの出力など）。"""
+
+
 # --- 実行と取り消し ---
 
 
@@ -379,6 +400,9 @@ class RunResult:
     outcomes: list[OpOutcome] = field(default_factory=list)
     pre_snapshot: int | None = None
     post_snapshot: int | None = None
+    # 同期クライアントと連携したか、連携に失敗したときの理由
+    synced: bool = False
+    sync_error: str | None = None
 
     @property
     def done(self) -> list[OpOutcome]:
@@ -440,6 +464,51 @@ def _take_post(snapshot: SnapshotTaker | None, pre: int | None, description: str
     return number
 
 
+def _flush_and_resume(
+    sync: SyncGuard,
+    journal: Path,
+    paths: Sequence[str],
+    max_children: int,
+    rep: Reporter,
+) -> str | None:
+    """止めておいた同期で削除をクラウドに反映し、常駐の同期を再開する。
+
+    反映に失敗したら再開せず（再開しても大量削除で終了を繰り返すため）、理由を実行記録に残して返す。
+
+    Args:
+        sync: 同期クライアントとの連携の窓口。
+        journal: 実行記録。
+        paths: クラウドから消えるはずのパス（同期フォルダからの相対パス）。進捗の表示に使う。
+        max_children: 消したパスの子の数の最大値。
+        rep: 進捗の通知先。
+    """
+    expected = set(paths)
+    seen: set[str] = set()
+
+    def on_deleted(path: str) -> None:
+        if path in expected and path not in seen:
+            seen.add(path)
+            rep.advance()
+
+    rep.phase("削除をクラウドに反映", total=len(expected))
+    try:
+        sync.flush(max_children, on_deleted=on_deleted, on_line=rep.note)
+    except SyncError as e:
+        log.error("削除をクラウドに反映できませんでした。常駐の同期は止めたままです: %s", e)
+        _append(journal, {"event": "sync-error", "detail": str(e)})
+        return str(e)
+    _append(journal, {"event": "sync-flush", "deleted": len(seen), "expected": len(expected)})
+    rep.phase("常駐の同期を再開")
+    try:
+        sync.resume()
+    except SyncError as e:
+        log.error("常駐の同期を再開できませんでした: %s", e)
+        _append(journal, {"event": "sync-error", "detail": str(e)})
+        return str(e)
+    _append(journal, {"event": "sync-resume"})
+    return None
+
+
 def apply_plan(
     conn: sqlite3.Connection,
     plan: Plan,
@@ -447,9 +516,13 @@ def apply_plan(
     quarantine_dir: Path,
     journal_dir: Path,
     snapshot: SnapshotTaker | None,
-    on_op: Callable[[OpOutcome], None] | None = None,
+    sync: SyncGuard | None = None,
+    reporter: Reporter | None = None,
 ) -> RunResult:
-    """プランを実行し、対象を隔離フォルダへ移す。
+    """プランを実行し、対象を隔離フォルダへ移す。skip の付いた操作は行わない。
+
+    同期クライアントとの連携（sync）があり、大量削除とみなされる操作を含むなら、
+    常駐の同期を止めてから移し、削除をクラウドに反映してから再開する（syncguard を参照）。
 
     Args:
         conn: カタログへの接続。
@@ -457,12 +530,15 @@ def apply_plan(
         quarantine_dir: 隔離先の親フォルダ。<quarantine_dir>/<プラン ID>/<相対パス> へ移す。
         journal_dir: 実行記録を置くフォルダ。
         snapshot: 前後のスナップショットを撮るもの。None なら撮らない。
-        on_op: 操作を1つ終えるたびに呼ぶ関数。
+        sync: 同期クライアントとの連携の窓口。None なら連携しない。
+        reporter: 進捗の通知先。
 
     Raises:
         PlanError: ルートが見えない・隔離先が別のファイルシステム、など。何も動かしていない。
         SnapshotError: 実行前のスナップショットを撮れなかった。何も動かしていない。
+        SyncError: 常駐の同期を止められなかった。何も動かしていない。
     """
+    rep = reporter or Reporter()
     try:
         check_root_available(plan.root_path)
     except RuntimeError as e:
@@ -471,8 +547,23 @@ def apply_plan(
     dest_root = quarantine_dir / plan.id
     _check_same_filesystem(plan.root_path, quarantine_dir)
     journal = journal_path(journal_dir, plan.id)
+    ops = [op for op in plan.ops if not op.skip]
 
-    result = RunResult(plan.id)
+    # 同期クライアントと連携するか（大量削除とみなされるフォルダがあるか）を先に決める
+    use_sync = False
+    max_children = 0
+    if sync is not None and ops:
+        dirs = [op for op in ops if op.is_dir]
+        rep.phase("大量削除の確認", total=len(dirs))
+        children: list[int] = []
+        for op in dirs:
+            children.append(count_children(plan.root_path / op.path))
+            rep.advance()
+        max_children = max(children, default=0)
+        use_sync = sync.needs_pause(children)
+
+    result = RunResult(plan.id, synced=use_sync)
+    rep.phase("実行前のスナップショット")
     result.pre_snapshot = _take_pre(snapshot, f"tag-keeper apply {plan.id}")
     # この実行で消えたことにした行には同じ日時を記録し、取り消しのときの目印にする
     gone_at = utcnow()
@@ -486,48 +577,30 @@ def apply_plan(
             "pre_snapshot": result.pre_snapshot,
         },
     )
+    if use_sync:
+        assert sync is not None
+        rep.phase("常駐の同期を一時停止")
+        try:
+            sync.pause()
+        except SyncError as e:
+            _append(journal, {"event": "abort", "detail": str(e)})
+            raise
+        _append(journal, {"event": "sync-pause", "client": sync.name, "max_children": max_children})
 
-    for op in plan.ops:
-        src = plan.root_path / op.path
-        dst = dest_root / op.path
-        problem = check_op(plan, op)
-        if problem is None and os.path.lexists(dst):
-            problem = "隔離先に同じ名前のものがある"
-        outcome = OpOutcome(op.path, op.is_dir, op.files, op.size, problem is None, problem or "")
-        if problem is None:
-            try:
-                dst.parent.mkdir(parents=True, exist_ok=True)
-                os.rename(src, dst)
-            except OSError as e:
-                outcome.done = False
-                outcome.detail = f"移動できなかった（{e.strerror}）"
-        if outcome.done:
-            _append(
-                journal,
-                {
-                    "event": "quarantine",
-                    "path": op.path,
-                    "is_dir": op.is_dir,
-                    "files": op.files,
-                    "size": op.size,
-                    "src": str(src),
-                    "dst": str(dst),
-                    "gone_at": gone_at,
-                },
-            )
-            where, args = _subtree_sql(op.path)
-            with conn:
-                conn.execute(
-                    f"UPDATE entries SET gone_at = ? WHERE root_id = ? AND gone_at IS NULL AND {where}",
-                    (gone_at, root_id, *args),
-                )
-        else:
-            log.warning("飛ばしました: %s（%s）", op.path, outcome.detail)
-            _append(journal, {"event": "skip", "path": op.path, "detail": outcome.detail})
-        result.outcomes.append(outcome)
-        if on_op is not None:
-            on_op(outcome)
+    rep.phase("隔離", total=len(ops))
+    try:
+        for op in ops:
+            outcome = _quarantine_one(conn, plan, op, root_id, dest_root, journal, gone_at)
+            result.outcomes.append(outcome)
+            rep.advance()
+    finally:
+        # 途中で例外が起きても、止めた同期は必ず反映・再開を試みる
+        if use_sync:
+            assert sync is not None
+            paths = [sync.relpath(plan.root_path / o.path) for o in result.done]
+            result.sync_error = _flush_and_resume(sync, journal, paths, max_children, rep)
 
+    rep.phase("実行後のスナップショット")
     result.post_snapshot = _take_post(snapshot, result.pre_snapshot, f"tag-keeper apply {plan.id}")
     _append(
         journal,
@@ -539,6 +612,55 @@ def apply_plan(
         },
     )
     return result
+
+
+def _quarantine_one(
+    conn: sqlite3.Connection,
+    plan: Plan,
+    op: PlanOp,
+    root_id: int,
+    dest_root: Path,
+    journal: Path,
+    gone_at: str,
+) -> OpOutcome:
+    """1操作を確かめてから隔離フォルダへ移し、実行記録とカタログを更新する。"""
+    src = plan.root_path / op.path
+    dst = dest_root / op.path
+    problem = check_op(plan, op)
+    if problem is None and os.path.lexists(dst):
+        problem = "隔離先に同じ名前のものがある"
+    outcome = OpOutcome(op.path, op.is_dir, op.files, op.size, problem is None, problem or "")
+    if problem is None:
+        try:
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            os.rename(src, dst)
+        except OSError as e:
+            outcome.done = False
+            outcome.detail = f"移動できなかった（{e.strerror}）"
+    if not outcome.done:
+        log.warning("飛ばしました: %s（%s）", op.path, outcome.detail)
+        _append(journal, {"event": "skip", "path": op.path, "detail": outcome.detail})
+        return outcome
+    _append(
+        journal,
+        {
+            "event": "quarantine",
+            "path": op.path,
+            "is_dir": op.is_dir,
+            "files": op.files,
+            "size": op.size,
+            "src": str(src),
+            "dst": str(dst),
+            "gone_at": gone_at,
+        },
+    )
+    where, args = _subtree_sql(op.path)
+    with conn:
+        conn.execute(
+            f"UPDATE entries SET gone_at = ? WHERE root_id = ? AND gone_at IS NULL AND {where}",
+            (gone_at, root_id, *args),
+        )
+    return outcome
 
 
 @dataclass
@@ -602,16 +724,18 @@ def undo_plan(
     *,
     journal_dir: Path,
     snapshot: SnapshotTaker | None,
-    on_op: Callable[[OpOutcome], None] | None = None,
+    reporter: Reporter | None = None,
 ) -> RunResult:
     """実行記録をもとに、隔離したものを元の場所へ戻す（F-PL-4）。
 
     元の場所に既に別のものがあれば、上書きせずに飛ばす。
+    戻したものは常駐の同期がそのままアップロードするので、同期クライアントとの連携は要らない。
 
     Raises:
         PlanError: 実行記録が無い・戻すものが無い。
         SnapshotError: 実行前のスナップショットを撮れなかった。何も動かしていない。
     """
+    rep = reporter or Reporter()
     journal = journal_path(journal_dir, plan_id)
     items = pending_restores(journal)
     if not items:
@@ -619,8 +743,10 @@ def undo_plan(
     root_id = _root_id(conn, items[0].root)
 
     result = RunResult(plan_id)
+    rep.phase("実行前のスナップショット")
     result.pre_snapshot = _take_pre(snapshot, f"tag-keeper undo {plan_id}")
     _append(journal, {"event": "undo", "pre_snapshot": result.pre_snapshot})
+    rep.phase("元に戻す", total=len(items))
     for it in items:
         outcome = OpOutcome(it.path, it.is_dir, it.files, it.size, True)
         if not os.path.lexists(it.dst):
@@ -654,9 +780,9 @@ def undo_plan(
             log.warning("戻せませんでした: %s（%s）", it.path, outcome.detail)
             _append(journal, {"event": "restore-skip", "path": it.path, "detail": outcome.detail})
         result.outcomes.append(outcome)
-        if on_op is not None:
-            on_op(outcome)
+        rep.advance()
 
+    rep.phase("実行後のスナップショット")
     result.post_snapshot = _take_post(snapshot, result.pre_snapshot, f"tag-keeper undo {plan_id}")
     _append(
         journal,
@@ -668,3 +794,147 @@ def undo_plan(
         },
     )
     return result
+
+
+# --- 同期が止まったままのときの復旧 ---
+
+
+def sync_paused(journal: Path) -> str | None:
+    """実行記録から、常駐の同期を止めたまま再開できていないかを調べる。
+
+    Returns:
+        止めたままなら最後のエラーの内容（無ければ空文字列）、再開済みか連携していなければ None。
+    """
+    if not journal.exists():
+        return None
+    paused: str | None = None
+    for rec in read_journal(journal):
+        event = rec.get("event")
+        if event == "sync-pause":
+            paused = ""
+        elif event == "sync-error" and paused is not None:
+            paused = str(rec.get("detail", ""))
+        elif event == "sync-resume":
+            paused = None
+    return paused
+
+
+def retry_sync(
+    plan_id: str,
+    *,
+    journal_dir: Path,
+    sync: SyncGuard,
+    reporter: Reporter | None = None,
+) -> str | None:
+    """反映に失敗して止まったままの同期を、もう一度反映してから再開する。
+
+    Returns:
+        失敗したら理由、成功したら None。
+    """
+    journal = journal_path(journal_dir, plan_id)
+    if sync_paused(journal) is None:
+        raise PlanError(f"同期を止めたままのプランではありません: {plan_id}")
+    max_children = 0
+    paths: list[str] = []
+    for rec in read_journal(journal):
+        if rec.get("event") == "sync-pause":
+            max_children = int(rec.get("max_children", 0))
+        elif rec.get("event") == "quarantine":
+            paths.append(sync.relpath(Path(rec["src"])))
+    return _flush_and_resume(sync, journal, paths, max_children, reporter or Reporter())
+
+
+def force_resume_sync(plan_id: str, *, journal_dir: Path, sync: SyncGuard) -> None:
+    """反映をあきらめて、常駐の同期だけを再開する（利用者が状況を確かめた上で選ぶ）。"""
+    journal = journal_path(journal_dir, plan_id)
+    sync.resume()
+    _append(journal, {"event": "sync-resume", "forced": True})
+
+
+# --- プランの一覧と状態 ---
+
+
+@dataclass
+class PlanInfo:
+    """プランの概要（一覧の表示用）。"""
+
+    id: str
+    file: Path
+    root: str
+    created_at: str
+    ops: int
+    files: int
+    size: int
+    skipped: int
+    # draft: 未実行 / applied: 実行済み / partially-undone: 一部を取り消し済み / undone: 取り消し済み
+    # interrupted: 実行が途中で止まった
+    state: str
+    sync_paused: str | None = None
+    quarantined: int = 0
+    quarantined_size: int = 0
+
+
+def plan_state(journal: Path) -> tuple[str, int, int]:
+    """実行記録から、プランの状態と、隔離中の件数・容量を求める。"""
+    if not journal.exists():
+        return "draft", 0, 0
+    applied = finished = restored = False
+    for rec in read_journal(journal):
+        event = rec.get("event")
+        if event == "apply":
+            applied, finished = True, False
+        elif event == "finish":
+            finished = True
+        elif event == "restore":
+            restored = True
+    pending = pending_restores(journal)
+    n, size = len(pending), sum(r.size for r in pending)
+    if not applied:
+        return "draft", n, size
+    if not finished:
+        return "interrupted", n, size
+    if restored:
+        return ("partially-undone" if pending else "undone"), n, size
+    return "applied", n, size
+
+
+def plan_info(plan_file: Path, journal_dir: Path) -> PlanInfo:
+    """プランのファイルと実行記録から概要を作る。"""
+    plan = load_plan(plan_file)
+    journal = journal_path(journal_dir, plan.id)
+    state, n, size = plan_state(journal)
+    active = [op for op in plan.ops if not op.skip]
+    return PlanInfo(
+        id=plan.id,
+        file=plan_file,
+        root=plan.root,
+        created_at=plan.created_at,
+        ops=len(active),
+        files=sum(op.files for op in active),
+        size=sum(op.size for op in active),
+        skipped=len(plan.ops) - len(active),
+        state=state,
+        sync_paused=sync_paused(journal),
+        quarantined=n,
+        quarantined_size=size,
+    )
+
+
+def list_plans(plans_dir: Path, journal_dir: Path) -> list[PlanInfo]:
+    """プランの一覧を新しい順に返す。読めないファイルは警告して飛ばす。"""
+    out: list[PlanInfo] = []
+    for f in sorted(plans_dir.glob("*.toml"), reverse=True):
+        try:
+            out.append(plan_info(f, journal_dir))
+        except PlanError as e:
+            log.warning("%s", e)
+    return out
+
+
+def set_skips(plan_file: Path, skip_paths: set[str]) -> Plan:
+    """プランの各操作の skip を、skip_paths に含まれるかどうかに合わせて書き直す。"""
+    plan = load_plan(plan_file)
+    for op in plan.ops:
+        op.skip = op.path in skip_paths
+    write_plan(plan, plan_file)
+    return plan

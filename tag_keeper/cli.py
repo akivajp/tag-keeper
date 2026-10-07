@@ -7,6 +7,8 @@
     tag-keeper plan ROOT             整理候補を隔離するプラン（TOML）を書き出す
     tag-keeper apply PLAN [--yes]    プランを確認する。--yes で実行する（隔離フォルダへ移す）
     tag-keeper undo PLAN_ID [--yes]  実行したプランを取り消す
+    tag-keeper sync PLAN_ID          止めたままの同期を再試行・再開する
+    tag-keeper serve                 Web の画面を開く
 
 ROOT には、設定ファイルのルート名か、フォルダのパスを指定する。省略すると設定済みの全ルート。
 """
@@ -17,7 +19,7 @@ import argparse
 import json
 import logging
 import sys
-from collections.abc import Callable, Sequence
+from collections.abc import Sequence
 from pathlib import Path
 
 from rich.console import Console
@@ -30,6 +32,7 @@ from rich.progress import (
     SpinnerColumn,
     TextColumn,
     TimeElapsedColumn,
+    TaskID,
     TimeRemainingColumn,
     TransferSpeedColumn,
 )
@@ -50,20 +53,26 @@ from tag_keeper.plan import (
     OpOutcome,
     Plan,
     PlanError,
+    Reporter,
     RunResult,
     Snapper,
     SnapshotError,
     apply_plan,
     build_plan,
     check_op,
+    force_resume_sync,
     journal_path,
     load_plan,
     pending_restores,
+    read_journal,
+    retry_sync,
+    sync_paused,
     undo_plan,
     write_plan,
 )
 from tag_keeper.report import Report, build_report
 from tag_keeper.scan import RootUnavailableError, scan_root
+from tag_keeper.syncguard import SyncError, SyncGuard, make_guard
 
 log = logging.getLogger("tag_keeper")
 
@@ -409,18 +418,61 @@ def _summary(result: RunResult, verb: str) -> str:
     )
 
 
-def _run_with_progress(total: int, description: str, run: Callable[[Callable[[OpOutcome], None]], RunResult]) -> RunResult:
-    """操作の件数で進捗バーを出しながら実行する。"""
-    with Progress(
+class RichReporter(Reporter):
+    """進捗を rich の進捗バーで表示する（段階が変わるたびに、バーを作り直す）。"""
+
+    def __init__(self, progress: Progress) -> None:
+        self.progress = progress
+        self.task: TaskID | None = None
+
+    def phase(self, name: str, total: int | None = None, unit: str = "件") -> None:
+        """段階の名前と作業量でバーを作り直す。"""
+        if self.task is not None:
+            self.progress.update(self.task, visible=False)
+        log.info("段階: %s", name)
+        self.task = self.progress.add_task(name, total=total)
+
+    def advance(self, n: int = 1) -> None:
+        """バーを進める。"""
+        if self.task is not None:
+            self.progress.advance(self.task, n)
+
+    def note(self, line: str) -> None:
+        """同期クライアントの出力などは、詳しいログ（-v）にだけ出す。"""
+        log.debug("%s", line)
+
+
+def _rich_progress() -> Progress:
+    """段階ごとの進捗バー。"""
+    return Progress(
         TextColumn("{task.description}"),
         BarColumn(),
         MofNCompleteColumn(),
         TimeElapsedColumn(),
         TimeRemainingColumn(),
         console=err_console,
-    ) as progress:
-        task = progress.add_task(description, total=total)
-        return run(lambda _o: progress.advance(task))
+    )
+
+
+def _sync_guard(config: Config, root_name: str) -> SyncGuard | None:
+    """ルートの設定から、同期クライアントとの連携の窓口を作る。"""
+    rc = config.find_root(root_name)
+    if rc is None:
+        return None
+    return make_guard(rc.sync_client, rc.sync_service, rc.sync_guard)
+
+
+def _log_sync_error(result: RunResult) -> None:
+    """同期クライアントとの連携に失敗したことと、復旧の方法を知らせる。"""
+    if result.sync_error:
+        log.error(
+            "削除をクラウドに反映できず、常駐の同期を止めたままです: %s\n"
+            "  再試行: tag-keeper sync %s --retry\n"
+            "  反映をあきらめて再開: tag-keeper sync %s --resume",
+            result.sync_error,
+            result.plan_id,
+            result.plan_id,
+        )
 
 
 def cmd_apply(args: argparse.Namespace, config: Config) -> int:
@@ -430,7 +482,7 @@ def cmd_apply(args: argparse.Namespace, config: Config) -> int:
     if not args.yes:
         checks = []
         for op in plan.ops:
-            problem = check_op(plan, op)
+            problem = "プランで除外" if op.skip else check_op(plan, op)
             checks.append(OpOutcome(op.path, op.is_dir, op.files, op.size, problem is None, problem or ""))
         render_outcomes(f"確認: {plan.id}（{plan.root_path}）", checks, args.limit)
         ok = [c for c in checks if c.done]
@@ -441,18 +493,16 @@ def cmd_apply(args: argparse.Namespace, config: Config) -> int:
         )
         out_console.print("[bold]確認だけで、何も動かしていません。[/bold]実行するには --yes を付けてください。")
         return 0
-    result = _run_with_progress(
-        len(plan.ops),
-        f"隔離中: {plan.id}",
-        lambda on_op: apply_plan(
+    with _rich_progress() as progress:
+        result = apply_plan(
             conn,
             plan,
             quarantine_dir=config.plan.quarantine_dir,
             journal_dir=_journal_dir(args),
             snapshot=_snapper(args, config),
-            on_op=on_op,
-        ),
-    )
+            sync=_sync_guard(config, plan.root),
+            reporter=RichReporter(progress),
+        )
     render_outcomes(f"実行結果: {plan.id}", result.outcomes, args.limit)
     log.info("%s", _summary(result, "隔離した"))
     log.info(
@@ -461,6 +511,9 @@ def cmd_apply(args: argparse.Namespace, config: Config) -> int:
         result.post_snapshot if result.post_snapshot is not None else "なし",
         plan.id,
     )
+    _log_sync_error(result)
+    if result.sync_error:
+        return 2
     return 1 if result.skipped else 0
 
 
@@ -485,17 +538,59 @@ def cmd_undo(args: argparse.Namespace, config: Config) -> int:
         )
         out_console.print("[bold]確認だけで、何も動かしていません。[/bold]元に戻すには --yes を付けてください。")
         return 0
-    total = len(pending_restores(journal_path(_journal_dir(args), plan_id)))
-    result = _run_with_progress(
-        total,
-        f"復元中: {plan_id}",
-        lambda on_op: undo_plan(
-            conn, plan_id, journal_dir=_journal_dir(args), snapshot=_snapper(args, config), on_op=on_op
-        ),
-    )
+    with _rich_progress() as progress:
+        result = undo_plan(
+            conn,
+            plan_id,
+            journal_dir=_journal_dir(args),
+            snapshot=_snapper(args, config),
+            reporter=RichReporter(progress),
+        )
     render_outcomes(f"取り消しの結果: {plan_id}", result.outcomes, args.limit)
     log.info("%s", _summary(result, "元に戻した"))
     return 1 if result.skipped else 0
+
+
+def cmd_sync(args: argparse.Namespace, config: Config) -> int:
+    """削除の反映に失敗して止まったままの同期を、再試行するか再開する。"""
+    plan_id = _plan_id_of(args.plan)
+    journal = journal_path(_journal_dir(args), plan_id)
+    paused = sync_paused(journal)
+    if paused is None:
+        log.info("このプランで止めたままの同期はありません: %s", plan_id)
+        return 0
+    root = next((r["root"] for r in read_journal(journal) if r.get("event") == "apply"), "")
+    guard = _sync_guard(config, root)
+    if guard is None:
+        raise ConfigError(f"ルート {root} に同期クライアント（sync_client）が設定されていません")
+    if args.resume:
+        force_resume_sync(plan_id, journal_dir=_journal_dir(args), sync=guard)
+        log.info("常駐の同期を再開しました（削除の反映は確かめていません）")
+        return 0
+    if not args.retry:
+        log.info("同期を止めたままです（%s）。--retry で再試行、--resume で再開します", paused or "理由の記録なし")
+        return 1
+    with _rich_progress() as progress:
+        error = retry_sync(plan_id, journal_dir=_journal_dir(args), sync=guard, reporter=RichReporter(progress))
+    if error:
+        log.error("まだ反映できません: %s", error)
+        return 2
+    log.info("削除を反映し、常駐の同期を再開しました")
+    return 0
+
+
+def cmd_serve(args: argparse.Namespace, config: Config) -> int:
+    """Web の画面を開く。"""
+    from tag_keeper.web.server import serve
+
+    return serve(
+        host=args.host,
+        port=args.port,
+        config_path=args.config,
+        db_path=args.db,
+        auth_file=args.auth_file,
+        allow_no_auth=args.allow_no_auth,
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -567,6 +662,29 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-snapshot", action="store_true", help="設定があっても、前後のスナップショットを撮らない")
     p.add_argument("--limit", type=int, default=30, help="表に載せる件数")
     p.set_defaults(func=cmd_undo)
+
+    p = sub.add_parser("sync", help="削除の反映に失敗して止まったままの同期を、再試行するか再開する")
+    p.add_argument("plan", metavar="PLAN", help="プラン ID か、プランのファイル")
+    g = p.add_mutually_exclusive_group()
+    g.add_argument("--retry", action="store_true", help="削除の反映をやり直し、成功したら常駐の同期を再開する")
+    g.add_argument("--resume", action="store_true", help="反映をあきらめて、常駐の同期だけを再開する")
+    p.set_defaults(func=cmd_sync)
+
+    p = sub.add_parser("serve", help="Web の画面を開く（既定は http://127.0.0.1:8090/）")
+    p.add_argument("--host", default="127.0.0.1", help="待ち受けるアドレス（既定: 127.0.0.1）")
+    p.add_argument("--port", type=int, default=8090, help="待ち受けるポート（既定: 8090）")
+    p.add_argument(
+        "--auth-file",
+        type=Path,
+        default=None,
+        help="BASIC 認証の資格情報（user:password の1行）を書いたファイル。環境変数 TAG_KEEPER_AUTH でも指定できる",
+    )
+    p.add_argument(
+        "--allow-no-auth",
+        action="store_true",
+        help="ループバック以外で待ち受けるときも、認証なしを許す（信頼できるネットワークに限ること）",
+    )
+    p.set_defaults(func=cmd_serve)
     return parser
 
 
@@ -579,7 +697,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         config = load_config(args.config)
         return int(args.func(args, config))
-    except (ConfigError, PlanError, SnapshotError) as e:
+    except (ConfigError, PlanError, SnapshotError, SyncError) as e:
         log.error("%s", e)
         return 2
 
