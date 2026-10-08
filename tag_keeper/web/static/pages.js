@@ -333,6 +333,8 @@ async function pageBrowse(main, root, path, params) {
 async function runFileOp(root, op, items) {
   try {
     const r = await api('/api/fileops', { root, op, items });
+    // 名前を変えた・削除したものは、採用リストに残っていても実行できないので外す
+    for (const it of items) cart.remove(root, it.path);
     app.job = r.job;
     app.jobDismissed = null;
     renderJob();
@@ -834,7 +836,9 @@ async function pageOrganize(main, root) {
     setChildren(side,
       h('h2', { class: 'path' }, name), h('div', { class: 'muted mono' }, path),
       h('div', { class: 'buttons' }, h('a', { class: 'button small', href: fileUrl(root, path), target: '_blank', rel: 'noopener' }, '新しいタブで開く'),
-        h('a', { class: 'button small', href: browseHref(root, path.split('/').slice(0, -1).join('/')) }, 'フォルダを開く')),
+        h('a', { class: 'button small', href: browseHref(root, path.split('/').slice(0, -1).join('/')) }, 'フォルダを開く'),
+        h('button', { class: 'small', onclick: () => renameDialog(root, path, false) }, '名前を変える…'),
+        h('button', { class: 'small danger-outline', title: t('Delete キーでも削除できます'), onclick: () => deleteCurrent() }, '削除…')),
       // 提案を先に、プレビューを後に置く（PDF のプレビューで提案が画面の外に押し出されないように）
       suggestionPanel(root, path, { auto: opts.auto, onAccept: () => { bar.render(); move(1); } }),
       h('h3', {}, 'プレビュー'),
@@ -845,6 +849,12 @@ async function pageOrganize(main, root) {
       const next = list.slice(i + 1, i + 3).filter((f) => !f.suggestion).map((f) => f.path);
       requestSuggestions(root, next, { prefetch: true });
     }
+  }
+
+  /** 選んでいるファイルを削除する（隔離フォルダへ移す。取り消しはプランの画面から）。 */
+  function deleteCurrent() {
+    const f = files.find((x) => x.path === current);
+    if (f) deleteDialog(root, [{ path: f.path, is_dir: false, size: f.size }]);
   }
 
   function move(delta) {
@@ -872,6 +882,7 @@ async function pageOrganize(main, root) {
     if (['INPUT', 'TEXTAREA', 'SELECT'].includes(document.activeElement?.tagName)) return;
     if (e.key === 'ArrowDown' || e.key === 'j') { e.preventDefault(); move(1); }
     if (e.key === 'ArrowUp' || e.key === 'k') { e.preventDefault(); move(-1); }
+    if (e.key === 'Delete' && current) { e.preventDefault(); deleteCurrent(); }
   };
   document.addEventListener('keydown', keyHandler);
 

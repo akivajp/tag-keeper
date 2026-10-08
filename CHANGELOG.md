@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.2] - 2026-10-08
+
+### Fixed
+
+- **Rename and delete on the inbox page.** The file picked in the flat inbox list had no
+  rename or delete buttons; it now has both, and the Delete key opens the delete dialog.
+  Items renamed or deleted this way are dropped from the accept list.
+
 ## [0.4.1] - 2026-10-08
 
 ### Fixed
@@ -111,7 +119,8 @@ First release. The web UI and messages are in Japanese.
 - **Decision log.** Accepted suggestions, tag accept and reject, and undone plans are
   appended per machine; the closest past decisions are given to the model as examples.
 
-[Unreleased]: https://github.com/akivajp/tag-keeper/compare/v0.4.1...HEAD
+[Unreleased]: https://github.com/akivajp/tag-keeper/compare/v0.4.2...HEAD
+[0.4.2]: https://github.com/akivajp/tag-keeper/compare/v0.4.1...v0.4.2
 [0.4.1]: https://github.com/akivajp/tag-keeper/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/akivajp/tag-keeper/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/akivajp/tag-keeper/compare/v0.2.0...v0.3.0

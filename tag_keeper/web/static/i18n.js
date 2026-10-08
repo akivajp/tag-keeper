@@ -63,7 +63,7 @@ const I18N_EN = {
   '名前で絞り込む': 'Filter by name', '過去の時点を表示中（読み取りのみ）': 'Showing a past snapshot (read-only)',
   'このフォルダのタグ:': 'Tags on this folder:', 'タグなし': 'No tags', 'このフォルダにタグを付ける（配下に継承）': 'Tag this folder (inherited by its contents)',
   '選んだものに付けるタグ（例: 種別:請求書）': 'Tag for the selection (e.g. type:invoice)', '選んだものに付ける': 'Tag selection',
-  '名前を変える…': 'Rename…', '削除…': 'Delete…', '受け皿': 'Inbox', '今は無い': 'Gone now',
+  '名前を変える…': 'Rename…', '削除…': 'Delete…', 'Delete キーでも削除できます': 'The Delete key also deletes', '受け皿': 'Inbox', '今は無い': 'Gone now',
   'タグを付ける': 'Add a tag', 'タグを外す': 'Remove tag', '同じ内容のファイル': 'Identical files', '版の履歴': 'Version history',
   '整理の提案': 'Suggestion', '隣に復元…': 'Restore beside…', '過去の版を復元しますか？': 'Restore this version?', '復元する': 'Restore',
   'この種類はプレビューできません。': 'No preview for this type.', 'タグの名前を入れてください': 'Enter a tag name',
