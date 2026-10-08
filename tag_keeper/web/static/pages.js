@@ -116,7 +116,9 @@ async function pageBrowse(main, root, path, params) {
     const parts = [h('h2', {}, name), h('div', { class: 'muted mono' }, rel)];
     parts.push(h('div', { class: 'buttons' },
       h('a', { class: 'button', href: url, target: '_blank', rel: 'noopener' }, '新しいタブで開く'),
-      h('a', { class: 'button', href: fileUrl(root, rel, at, true) }, 'ダウンロード')));
+      h('a', { class: 'button', href: fileUrl(root, rel, at, true) }, 'ダウンロード'),
+      live ? h('button', { onclick: () => renameDialog(root, rel, false) }, '名前を変える…') : null,
+      live ? h('button', { class: 'danger-outline', onclick: () => deleteDialog(root, [{ path: rel, is_dir: false, size: entry.size }]) }, '削除…') : null));
     parts.push(preview(url, name, entry.size));
     if (live) {
       try {
@@ -196,6 +198,18 @@ async function pageBrowse(main, root, path, params) {
       tagInput,
       h('button', { onclick: async () => { if (!selected.size) { toast('ファイルかフォルダを選んでください', 'warn'); return; } if (await editTags(root, [...selected], tagInput.value, 'add')) app.render(); } }, '選んだものに付ける'),
       h('button', { onclick: async () => { if (!selected.size) { toast('ファイルかフォルダを選んでください', 'warn'); return; } if (await editTags(root, [...selected], tagInput.value, 'remove')) app.render(); } }, '外す'),
+      h('button', { onclick: () => {
+        if (selected.size !== 1) { toast('名前を変えるものを1つだけ選んでください', 'warn'); return; }
+        const rel = [...selected][0];
+        renameDialog(root, rel, !!data.entries.find((e) => joinPath(path, e.name) === rel)?.is_dir);
+      } }, '名前を変える…'),
+      h('button', { class: 'danger-outline', onclick: () => {
+        if (!selected.size) { toast('削除するものを選んでください', 'warn'); return; }
+        deleteDialog(root, [...selected].map((rel) => {
+          const e = data.entries.find((x) => joinPath(path, x.name) === rel);
+          return { path: rel, is_dir: !!e?.is_dir, size: e?.size };
+        }));
+      } }, '削除…'),
       selInfo) : null,
     h('div', { class: 'browse' },
       h('div', { class: 'card table-wrap' }, h('table', {},
@@ -203,6 +217,78 @@ async function pageBrowse(main, root, path, params) {
         tableBody)),
       detail));
   renderRows();
+}
+
+// ---------- 名前の変更・削除（ファイルブラウザから） ----------
+
+/** 名前の変更・削除の API を呼び、実行のジョブの進み具合を表示する。取り消しはプランの画面から。 */
+async function runFileOp(root, op, items) {
+  try {
+    const r = await api('/api/fileops', { root, op, items });
+    app.job = r.job;
+    app.jobDismissed = null;
+    renderJob();
+    pollJob();
+    const link = h('a', { href: `#/plans/${r.plan_id}` }, 'プランの画面');
+    const holder = document.getElementById('alerts');
+    // お知らせは最新の1つだけ残す（続けて操作しても積み重ならないように）
+    holder.querySelectorAll('.fileop-note').forEach((n) => n.remove());
+    const note = h('div', { class: 'alert info fileop-note' }, op === 'rename' ? '名前を変えています。' : '隔離フォルダへ移しています。', '取り消すには ', link, ' から。');
+    holder.prepend(note);
+    setTimeout(() => note.remove(), 15000);
+    return true;
+  } catch (e) { toast(e.message, 'danger'); return false; }
+}
+
+/** 名前の変更のダイアログ（好きな名前を付けられる。提案の名前を使うこともできる）。 */
+async function renameDialog(root, rel, isDir) {
+  const name = rel.split('/').pop();
+  const input = h('input', { class: 'name-input', value: name });
+  // Enter で「実行する」にする（フォームの既定は最初のボタン＝「やめる」になるため）
+  input.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); document.getElementById('confirm').close('ok'); } });
+  const useSuggestion = isDir ? null : h('button', {
+    type: 'button',
+    onclick: async () => {
+      try {
+        const q = new URLSearchParams({ root, path: rel, model: models.current() });
+        const { suggestion } = await api(`/api/suggestion?${q}`);
+        if (suggestion) input.value = suggestion.new_name;
+        else toast('まだ提案がありません（詳細の欄の「整理の提案を出す」で作れます）', 'warn');
+      } catch (e) { toast(e.message, 'danger'); }
+    },
+  }, '提案の名前を使う');
+  const body = [
+    h('p', { class: 'muted path' }, rel),
+    input,
+    h('div', { class: 'buttons', style: 'margin-top:.5rem' }, useSuggestion),
+    h('p', { class: 'muted small' }, isDir
+      ? 'フォルダの中のタグとカタログの記録も新しい名前に追従します。'
+      : '拡張子も含めて入力してください。'),
+    h('p', { class: 'muted small' }, '実行の前後にスナップショットを撮り、プランの画面から取り消せます。'),
+  ];
+  setTimeout(() => {
+    input.focus();
+    // 拡張子の前までを選んでおく（題名だけを打ち直しやすいように）
+    const dot = isDir ? -1 : name.lastIndexOf('.');
+    input.setSelectionRange(0, dot > 0 ? dot : name.length);
+  }, 50);
+  if (!await confirmDialog(isDir ? 'フォルダの名前を変える' : 'ファイルの名前を変える', body, '名前を変える')) return;
+  const newName = input.value.trim();
+  if (!newName || newName === name) return;
+  await runFileOp(root, 'rename', [{ path: rel, new_name: newName }]);
+}
+
+/** 削除のダイアログ（完全には消さず、隔離フォルダへ移す）。 */
+async function deleteDialog(root, items) {
+  const dirs = items.filter((it) => it.is_dir).length;
+  const body = [
+    h('ul', { class: 'small' }, items.slice(0, 20).map((it) => h('li', { class: 'path' }, it.is_dir ? '📁 ' : '', it.path, it.is_dir ? '/（中身ごと）' : ''))),
+    items.length > 20 ? h('p', { class: 'muted' }, `ほか ${items.length - 20} 件`) : null,
+    h('p', {}, '完全には消さず、隔離フォルダへ移します。同期しているクラウドからは消えますが、このマシンには隔離フォルダを空にするまで残り、プランの画面から元に戻せます。'),
+    dirs ? h('p', { class: 'muted small' }, '中身の多いフォルダは、同期クライアントの大量削除の安全装置で同期が止まらないよう、同期を一時停止してから反映します。') : null,
+  ];
+  if (!await confirmDialog(`${items.length} 件を削除しますか？`, body, '削除する', true)) return;
+  await runFileOp(root, 'delete', items.map((it) => ({ path: it.path })));
 }
 
 function fileIcon(name) {

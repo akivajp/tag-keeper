@@ -133,6 +133,9 @@ bar, speed, time remaining and the latest log lines. It works on a phone too.
   page, and download anything. Only types that cannot run scripts open in the page; HTML
   and SVG are shown as plain text, everything else downloads. Paths never leave the root,
   symlinks included.
+- **Rename and delete** any file or folder from the browser. Type any name or take the
+  suggested one; deleting moves items to the quarantine folder. Both run as one-off plans,
+  with snapshots and undo, and a renamed folder keeps its tags.
 - **Tag** files and folders from the browser. A folder's tags are inherited by everything
   under it. Tags live in append-only JSONL logs, one file per machine
   (`~/.local/share/tag-keeper/tags/<host>.jsonl`), so they stay readable without the tool

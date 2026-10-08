@@ -216,3 +216,4 @@ table.flat tr.selected td { background: var(--ok-bg); }
 .tag-new { color: var(--warn); font-weight: 600; font-size: .75rem; }
 .chip-x.ok { color: var(--ok); font-weight: 700; }
 .waiting .bar { margin: .75rem 0 .35rem; }
+button.danger-outline { border-color: var(--danger); color: var(--danger); }

@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Rename and delete from the file browser**, for any file or folder, not only inbox
+  files. A rename takes any name you type, or the suggested one. A delete moves items to
+  the quarantine folder. Both run as one-off plans, so they get the pre-move check,
+  snapshots, journal and undo; renaming a folder carries its tags along, and file renames
+  are added to the decision log as naming examples.
+
 ## [0.1.0] - 2026-10-08
 
 First release. The web UI and messages are in Japanese.
@@ -46,4 +56,5 @@ First release. The web UI and messages are in Japanese.
 - **Decision log.** Accepted suggestions, tag accept and reject, and undone plans are
   appended per machine; the closest past decisions are given to the model as examples.
 
+[Unreleased]: https://github.com/akivajp/tag-keeper/compare/v0.1.0...HEAD
 [0.1.0]: https://github.com/akivajp/tag-keeper/releases/tag/v0.1.0

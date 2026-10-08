@@ -250,3 +250,45 @@ def test_models_endpoint(env: dict, monkeypatch: pytest.MonkeyPatch) -> None:
     data = env["app"].get("/api/models").json
     assert data["default"] == "gemma3:12b"
     assert [(m["name"], m["cloud"]) for m in data["models"]] == [("gemma3:12b", False), ("x:cloud", True)]
+
+
+def test_rename_and_delete_from_the_browser(env: dict) -> None:
+    """ファイル・フォルダの名前の変更と削除は、1件ずつのプランとして実行し、取り消せる。"""
+    import json as _json
+
+    app, root = env["app"], env["root"]
+    origin = {"Origin": f"http://{HOST}"}
+    write(root / "projects" / "old" / "memo.txt", "memo")
+    run_job(env, "/api/roots/data/scan")
+    app.post_json("/api/tags", {"root": "data", "paths": ["projects/old/memo.txt"], "tag": "種別:メモ"}, headers=origin)
+
+    # ファイルの名前を変える（好きな名前）
+    r = app.post_json("/api/fileops", {"root": "data", "op": "rename", "items": [{"path": "docs/report.pdf", "new_name": "20250101_報告書.pdf"}]}, headers=origin).json
+    env["jobs"].wait()
+    assert (root / "docs" / "20250101_報告書.pdf").read_text() == "keep" and not (root / "docs" / "report.pdf").exists()
+    log_dir = env["settings"].decision_log.log_dir
+    events = [_json.loads(l) for f in log_dir.glob("*.jsonl") for l in f.read_text(encoding="utf-8").splitlines()]
+    assert events[-1]["source"] == "browser" and events[-1]["final"]["name"] == "20250101_報告書.pdf"
+    run_job(env, f"/api/plans/{r['plan_id']}/undo")
+    assert (root / "docs" / "report.pdf").exists()
+
+    # フォルダの名前を変えると、中のタグも追従する
+    app.post_json("/api/fileops", {"root": "data", "op": "rename", "items": [{"path": "projects/old", "new_name": "2025_案件"}]}, headers=origin)
+    env["jobs"].wait()
+    assert (root / "projects" / "2025_案件" / "memo.txt").exists()
+    data = app.get("/api/browse", {"root": "data", "path": "projects/2025_案件"}).json
+    assert data["entries"][0]["tags"] == ["種別:メモ"]
+
+    # 断るもの: 同じ名前が既にある・使えない名前・ルートそのもの
+    app.post_json("/api/fileops", {"root": "data", "op": "rename", "items": [{"path": "docs/report.pdf", "new_name": "Thumbs.db"}]}, headers=origin, status=409)
+    app.post_json("/api/fileops", {"root": "data", "op": "rename", "items": [{"path": "docs/report.pdf", "new_name": "a?.pdf"}]}, headers=origin, status=400)
+    app.post_json("/api/fileops", {"root": "data", "op": "rename", "items": [{"path": "docs/report.pdf", "new_name": "x/y.pdf"}]}, headers=origin, status=400)
+    app.post_json("/api/fileops", {"root": "data", "op": "delete", "items": [{"path": ""}]}, headers=origin, status=400)
+
+    # 削除は隔離フォルダへ移すだけで、取り消せば戻る
+    r = app.post_json("/api/fileops", {"root": "data", "op": "delete", "items": [{"path": "projects"}, {"path": "docs/Thumbs.db"}]}, headers=origin).json
+    env["jobs"].wait()
+    assert not (root / "projects").exists() and not (root / "docs" / "Thumbs.db").exists()
+    assert app.get(f"/api/plans/{r['plan_id']}").json["restorable"] == 2
+    run_job(env, f"/api/plans/{r['plan_id']}/undo")
+    assert (root / "projects" / "2025_案件" / "memo.txt").exists() and (root / "docs" / "Thumbs.db").exists()

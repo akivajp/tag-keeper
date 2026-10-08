@@ -52,6 +52,7 @@ from tag_keeper.jobs import JobBusyError, JobManager, JobReporter
 from tag_keeper.organize import OllamaError
 from tag_keeper.plan import (
     ACTION_MOVE,
+    ACTION_QUARANTINE,
     CAT_MOVE,
     Plan,
     PlanError,
@@ -98,6 +99,8 @@ log = logging.getLogger(__name__)
 
 STATIC_DIR = Path(__file__).parent / "static"
 _PLAN_ID = re.compile(r"[\w.-]+")
+# ファイルブラウザから削除したもののプランのカテゴリ
+CAT_DELETE = "削除（隔離フォルダへ）"
 # レポートで画面に送る重複の組の数（多すぎると画面が重くなる）
 DUPLICATE_LIMIT = 300
 
@@ -931,6 +934,67 @@ def create_app(
         settings.decision_log.tag(rc.name, rel, item.sha256 if item else None, tag, decision, str(data.get("model", "")))
         return {"tag": tag, "decision": decision}
 
+    # --- ファイルブラウザからの名前の変更・削除 ---
+
+    @app.post("/api/fileops")
+    def api_fileops() -> dict[str, Any]:
+        """ファイル・フォルダの名前の変更（rename）か削除（delete）を、1件ずつのプランにしてすぐ実行する。
+
+        どちらも整理プランの仕組みに乗せる（実行直前の確認・前後のスナップショット・実行記録・取り消し）。
+        削除は完全には消さず、隔離フォルダへ移す（F-PL-3）。
+        """
+        data = body()
+        config = settings.config()
+        rc = root_config(config, str(data.get("root", "")))
+        op_kind = str(data.get("op", ""))
+        if op_kind not in ("rename", "delete"):
+            raise fail(400, f"操作が不明です: {op_kind}")
+        items = data.get("items") or []
+        if not items:
+            raise fail(400, "対象がありません")
+        plan = Plan(
+            id=f"{datetime.now():%Y%m%d-%H%M%S}-{rc.name}-{op_kind}",
+            root=rc.name,
+            root_path=rc.path,
+            created_at=utcnow(),
+        )
+        dests: set[str] = set()
+        for it in items:
+            src = clean_relpath(str(it.get("path", "")))
+            if not src:
+                raise fail(400, "ルートそのものは扱えません")
+            path = resolve_within(rc.path, src)
+            fp = fingerprint(path)
+            if fp is None or path.is_symlink():
+                raise fail(404, f"ありません: {src}")
+            is_dir = path.is_dir()
+            if op_kind == "rename":
+                name = str(it.get("new_name", "")).strip()
+                if not name or "/" in name or name in (".", ".."):
+                    raise fail(400, f"新しい名前が不正です: {name!r}")
+                dest = f"{src.rpartition('/')[0]}/{name}" if "/" in src else name
+                if dest == src:
+                    continue
+                problem = rules.cloud_name_problem(dest)
+                if problem:
+                    raise fail(400, f"{name}: {problem}")
+                # 大文字・小文字だけの変更は、同じものとして見えるので許す（同じ inode か）
+                target = rc.path / dest
+                if dest in dests or (target.exists() and os.stat(target).st_ino != fp.inode):
+                    raise fail(409, f"同じ名前のものが既にあります: {name}")
+                dests.add(dest)
+                plan.ops.append(PlanOp(ACTION_MOVE, src, is_dir, fp.files, fp.size, fp.inode, fp.mtime_ns, CAT_MOVE, "名前の変更", dest=dest))
+            else:
+                plan.ops.append(
+                    PlanOp(ACTION_QUARANTINE, src, is_dir, fp.files, fp.size, fp.inode, fp.mtime_ns, CAT_DELETE, "ファイルブラウザから削除")
+                )
+        if not plan.ops:
+            raise fail(400, "変えるものがありません（名前が同じ）")
+        write_plan(plan, settings.plans_dir / f"{plan.id}.toml")
+        if op_kind == "rename":
+            _log_accepts(settings, config, rc, plan, items, source="browser")
+        return {"plan_id": plan.id, "ops": len(plan.ops), "job": start_apply(plan)}
+
     # 予期できる失敗は 400 番台の JSON にして、画面にそのまま表示できるようにする
     def json_errors(callback: Any) -> Any:
         def wrapper(*args: Any, **kwargs: Any) -> Any:
@@ -960,8 +1024,13 @@ def _local_models(oc: Any) -> list[str]:
         return []
 
 
-def _log_accepts(settings: Settings, config: Config, rc: RootConfig, plan: Plan, items: list[dict[str, Any]]) -> None:
-    """整理プランにした提案を、判断のログに「採用」として残す（提案と最終的な判断の対）。"""
+def _log_accepts(
+    settings: Settings, config: Config, rc: RootConfig, plan: Plan, items: list[dict[str, Any]], source: str = "organize"
+) -> None:
+    """整理プランにした判断を、判断のログに「採用」として残す（提案があれば、提案と最終的な判断の対）。
+
+    フォルダの移動・改名は、ファイルの名前の手本にならないので残さない。
+    """
     by_path = {str(it.get("path", "")): it for it in items}
     store = settings.tags(config)
     conn = connect(settings.db_path)
@@ -969,6 +1038,8 @@ def _log_accepts(settings: Settings, config: Config, rc: RootConfig, plan: Plan,
     try:
         row = conn.execute("SELECT id FROM roots WHERE name = ?", (rc.name,)).fetchone()
         for op in plan.ops:
+            if op.is_dir or op.action != ACTION_MOVE:
+                continue
             it = by_path.get(op.path, {})
             model = str(it.get("model") or config.organize.model)
             item = organize.catalog_item(conn, int(row["id"]), op.path) if row is not None else None
@@ -990,6 +1061,7 @@ def _log_accepts(settings: Settings, config: Config, rc: RootConfig, plan: Plan,
                     else None,
                     "final": {"name": name, "dest_dir": dest_dir, "tags": [t["tag"] for t in store.tags_of(rc.name, op.path)["direct"]]},
                     "plan_id": plan.id,
+                    "source": source,
                 }
             )
     finally:
