@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-10-08
+
 ### Added
 
 - **Rename and delete from the file browser**, for any file or folder, not only inbox
@@ -56,5 +58,6 @@ First release. The web UI and messages are in Japanese.
 - **Decision log.** Accepted suggestions, tag accept and reject, and undone plans are
   appended per machine; the closest past decisions are given to the model as examples.
 
-[Unreleased]: https://github.com/akivajp/tag-keeper/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/akivajp/tag-keeper/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/akivajp/tag-keeper/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/akivajp/tag-keeper/releases/tag/v0.1.0
