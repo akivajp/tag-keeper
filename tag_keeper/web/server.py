@@ -36,7 +36,7 @@ from wsgiref.simple_server import WSGIRequestHandler, WSGIServer, make_server
 
 import bottle
 
-from tag_keeper import __version__, history, officeview, organize, rules
+from tag_keeper import __version__, history, media, officeview, organize, rules
 from tag_keeper.catalog import connect, ensure_root, last_scan, utcnow
 from tag_keeper.cloudlinks import OneDriveLinks
 from tag_keeper.config import (
@@ -50,6 +50,7 @@ from tag_keeper.decisions import DecisionLog
 from tag_keeper.hashing import hash_root, sha256_file
 from tag_keeper.history import HistoryError
 from tag_keeper.jobs import JobBusyError, JobManager, JobReporter
+from tag_keeper.media import MediaConverter
 from tag_keeper.organize import OllamaError
 from tag_keeper.plan import (
     ACTION_MOVE,
@@ -122,7 +123,18 @@ class Settings:
         self.decision_log = DecisionLog(data_dir / "decisions")
         # LibreOffice で変換した Office 文書の PDF（内容ハッシュをキーに保存）
         self.office_pdf_dir = data_dir / "office-pdf"
+        # ブラウザが直接は再生できない動画を、再生用の MP4 にしたもの（内容ハッシュをキーに保存）
+        self.media = MediaConverter(data_dir / "media-cache")
+        self._sha_cache: dict[tuple[str, int, int], str] = {}
         self._links: dict[tuple[str, str], OneDriveLinks | None] = {}
+
+    def sha256_of(self, path: Path) -> str:
+        """ファイルの内容ハッシュ（大きさと更新日時が同じあいだは、計算し直さない）。"""
+        st = path.stat()
+        key = (str(path), st.st_size, st.st_mtime_ns)
+        if key not in self._sha_cache:
+            self._sha_cache[key] = sha256_file(path)
+        return self._sha_cache[key]
 
     def cloud_links(self, rc: RootConfig) -> OneDriveLinks | None:
         """ルートの同期クライアントから、クラウドの Web 画面で開くリンクを作る部品（今は OneDrive だけ）。"""
@@ -281,6 +293,7 @@ def create_app(
             "job": job.to_dict() if job else None,
             "categories": [{"key": k, "label": v} for k, v in rules.CATEGORY_KEYS.items()],
             "office_pdf": officeview.soffice() is not None,
+            "media": media.available(),
         }
 
     @app.route("/api/report/<root>")
@@ -1000,6 +1013,34 @@ def create_app(
         except officeview.OfficeError as e:
             raise fail(400, str(e)) from e
         return bottle.static_file(pdf.name, root=str(pdf.parent), mimetype="application/pdf")
+
+    # --- ブラウザが直接は再生できない動画（flv・mkv・avi など） ---
+
+    def media_file(q: Any) -> tuple[Path, str]:
+        rc = root_config(settings.config(), q.getunicode("root", ""))
+        path = file_at(rc, clean_relpath(q.getunicode("path", "")), q.getunicode("snapshot", ""))
+        # mp4 などでも、中が HEVC などブラウザで再生できない形式なら変換する（画面が再生に失敗したとき）
+        if path.suffix.lower() not in media.CONVERT_VIDEO | media.NATIVE_VIDEO:
+            raise fail(400, f"この種類は変換しません: {path.suffix}")
+        if not media.available():
+            raise fail(400, "ffmpeg が入っていません")
+        return path, settings.sha256_of(path)
+
+    @app.route("/api/media/status")
+    def api_media_status() -> dict[str, Any]:
+        """再生用の MP4 の状態（まだなら裏で作り始める）。"""
+        q = bottle.request.query
+        path, sha = media_file(q)
+        return settings.media.status(path, sha, retry=bool(q.get("retry"))).to_dict()
+
+    @app.route("/api/media")
+    def api_media() -> Any:
+        """再生用の MP4（できていれば）。範囲の指定に応じるので、シークもできる。"""
+        path, sha = media_file(bottle.request.query)
+        out = settings.media.output_path(sha)
+        if not out.exists():
+            raise fail(409, "まだ変換していません")
+        return bottle.static_file(out.name, root=str(out.parent), mimetype="video/mp4")
 
     # --- ファイルブラウザからの名前の変更・削除 ---
 

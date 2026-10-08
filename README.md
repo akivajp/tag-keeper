@@ -145,6 +145,9 @@ and the theme (system, light or dark).
 - **Office documents** preview without extra tools: Excel as tables with sheet tabs, Word
   as headings, paragraphs, tables and images, PowerPoint as slides. With LibreOffice
   installed they can also be shown as laid out, converted to PDF.
+- **Videos the browser cannot play** (FLV, MKV, AVI, WMV, MPEG-TS, HEVC in MP4 and so on)
+  are turned into an MP4 for playback with ffmpeg — only the container changes when the
+  video is already H.264 — and cached, so seeking works.
 - **Open in the cloud.** For a root synced by the OneDrive client for Linux, files and
   folders link to OneDrive on the web, and Office documents to Office for the web. Only types that cannot run scripts open in the page; HTML
   and SVG are shown as plain text, everything else downloads. Paths never leave the root,
@@ -213,6 +216,7 @@ Optional tools, each used only by the feature that needs it:
 | btrfs and snapper | version history, and snapshots around plans |
 | OneDrive client for Linux | coordinating big deletions with the sync, links to OneDrive on the web |
 | LibreOffice | Office previews as laid out (PDF) |
+| ffmpeg | playing FLV, MKV, AVI and other videos the browser cannot play |
 
 From source:
 

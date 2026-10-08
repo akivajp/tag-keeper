@@ -410,6 +410,49 @@ function cloudLinks(links) {
   }, l.kind === 'office' ? '✎ ' : '☁ ', t(l.label))));
 }
 
+// ---------- ブラウザが直接は再生できない動画のプレビュー ----------
+
+const CONVERT_VIDEO_EXTS = ['flv', 'f4v', 'mkv', 'avi', 'wmv', 'asf', 'mpg', 'mpeg', 'ts', 'm2ts', 'mts', '3gp', 'vob', 'divx'];
+
+/**
+ * flv・mkv・avi などは、サーバーが ffmpeg で再生用の MP4 にしてから再生する。
+ * 入れ物だけを替えられるものは数秒で、作り直すものは進み具合（%）を出しながら待つ。
+ */
+function mediaPreview(ctx, name) {
+  const holder = h('div', { class: 'media-view' }, h('p', { class: 'muted' }, t('読み込み中…')));
+  const q = new URLSearchParams({ root: ctx.root, path: ctx.path });
+  if (ctx.snapshot) q.set('snapshot', ctx.snapshot);
+  let timer = null;
+
+  async function poll(retry = false) {
+    clearTimeout(timer);
+    if (!holder.isConnected && holder.dataset.started) return; // 別のファイルを選んだら問い合わせをやめる
+    holder.dataset.started = '1';
+    let st;
+    try { st = await api(`/api/media/status?${q}${retry ? '&retry=1' : ''}`); }
+    catch (e) { setChildren(holder, h('p', { class: 'muted' }, t('この種類はプレビューできません。'), ' ', e.message)); return; }
+    if (st.state === 'done') {
+      setChildren(holder, h('video', { class: 'preview', src: `/api/media?${q}`, controls: true, preload: 'metadata' }),
+        h('p', { class: 'muted small' }, t('再生用に MP4 にしたものを再生しています（元のファイルはそのまま）')));
+      return;
+    }
+    if (st.state === 'error') {
+      setChildren(holder, h('div', { class: 'alert warn' }, t('再生用に変換できませんでした: {error}', { error: st.error })),
+        h('button', { class: 'small', onclick: () => poll(true) }, t('もう一度')));
+      return;
+    }
+    const pct = Math.round(st.progress * 100);
+    setChildren(holder,
+      h('p', { class: 'muted' }, st.mode === 'transcode'
+        ? t('再生用に作り直しています（{pct}%）…', { pct })
+        : t('再生用に MP4 にしています…')),
+      h('div', { class: 'bar' }, h('div', { style: `width:${pct}%` })));
+    timer = setTimeout(() => poll(), 1000);
+  }
+  poll();
+  return holder;
+}
+
 // ---------- Office 文書のプレビュー ----------
 
 const OFFICE_EXTS = ['docx', 'docm', 'xlsx', 'xlsm', 'pptx', 'pptm'];
@@ -493,7 +536,7 @@ function fileIcon(name) {
   const ext = name.split('.').pop().toLowerCase();
   if (['pdf'].includes(ext)) return '📕';
   if (['jpg', 'jpeg', 'png', 'gif', 'webp', 'bmp', 'heic'].includes(ext)) return '🖼';
-  if (['mp4', 'mov', 'mkv', 'webm', 'm4a', 'mp3', 'wav'].includes(ext)) return '🎞';
+  if (['mp4', 'mov', 'mkv', 'webm', 'flv', 'avi', 'wmv', 'mpg', 'ts', 'm4a', 'mp3', 'wav'].includes(ext)) return '🎞';
   if (['xlsx', 'xls', 'csv'].includes(ext)) return '📊';
   if (['docx', 'doc', 'txt', 'md'].includes(ext)) return '📄';
   if (['zip', '7z', 'rar', 'tar', 'gz'].includes(ext)) return '🗜';
@@ -504,9 +547,17 @@ function fileIcon(name) {
 function preview(url, name, bytes, ctx = null) {
   const ext = name.split('.').pop().toLowerCase();
   if (ctx && OFFICE_EXTS.includes(ext)) return officePreview(ctx, name);
+  if (ctx && CONVERT_VIDEO_EXTS.includes(ext)) return mediaPreview(ctx, name);
   if (['jpg', 'jpeg', 'png', 'gif', 'webp', 'bmp'].includes(ext)) return h('img', { class: 'preview', src: url, alt: name });
   if (ext === 'pdf') return h('iframe', { class: 'preview pdf', src: url, title: name });
-  if (['mp4', 'webm', 'mov'].includes(ext)) return h('video', { class: 'preview', src: url, controls: true, preload: 'metadata' });
+  if (['mp4', 'webm', 'mov', 'm4v'].includes(ext)) {
+    // 中が HEVC などでブラウザが再生できなければ、変換して再生に切り替える
+    // 詳細の欄が組み上がる前にエラーになることもあるので、入れ物の中身を替える（要素そのものは差し替えない）
+    const video = h('video', { class: 'preview', src: url, controls: true, preload: 'metadata' });
+    const box = h('div', {}, video);
+    if (ctx) video.addEventListener('error', () => setChildren(box, mediaPreview(ctx, name)), { once: true });
+    return box;
+  }
   if (['m4a', 'mp3', 'wav', 'ogg'].includes(ext)) return h('audio', { src: url, controls: true, preload: 'metadata' });
   if (['txt', 'md', 'csv', 'tsv', 'log', 'json', 'xml', 'html', 'htm', 'yaml', 'yml', 'toml', 'ini', 'py', 'sh', 'rdp', 'set', 'mq4'].includes(ext) && (bytes ?? 0) < 512 * 1024) {
     const pre = h('pre', { class: 'preview text' }, '読み込み中…');

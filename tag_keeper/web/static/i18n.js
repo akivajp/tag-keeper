@@ -119,6 +119,9 @@ const I18N_EN = {
   'PDF に変換しています（初回は少しかかります）…': 'Converting to PDF (the first time takes a moment)…',
   'レイアウトどおり（PDF）': 'As laid out (PDF)', '文字と表だけ（速い）': 'Text and tables only (fast)',
   '表示しきれない部分は省いています': 'Some content is left out',
+  '再生用に MP4 にしたものを再生しています（元のファイルはそのまま）': 'Playing a copy converted to MP4 (the original is untouched)',
+  '再生用に変換できませんでした: {error}': 'Could not convert for playback: {error}',
+  '再生用に作り直しています（{pct}%）…': 'Re-encoding for playback ({pct}%)…', '再生用に MP4 にしています…': 'Converting to MP4 for playback…',
 
   // --- 変数を含む文（t() で使う） ---
   '{h}時間{m}分': '{h} h {m} min', '{m}分{s}秒': '{m} min {s} s', '{s}秒': '{s} s',

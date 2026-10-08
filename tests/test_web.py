@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import shutil
 import time
 from pathlib import Path
 from typing import Any
@@ -305,3 +306,25 @@ def test_office_preview_api(env: dict) -> None:
     env["app"].get("/api/office", {"root": "data", "path": "docs/report.pdf"}, status=400)
     env["app"].get("/api/office", {"root": "data", "path": "../x.docx"}, status=400)
     assert env["app"].get("/api/state").json["office_pdf"] in (True, False)
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg が無い")
+def test_media_api(env: dict) -> None:
+    import subprocess
+
+    root = env["root"]
+    subprocess.run(
+        ["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "testsrc=duration=1:size=64x48:rate=10", "-c:v", "libx264", "-pix_fmt", "yuv420p", str(root / "docs" / "clip.flv")],
+        check=True,
+    )
+    q = {"root": "data", "path": "docs/clip.flv"}
+    deadline = time.time() + 30
+    while time.time() < deadline:
+        st = env["app"].get("/api/media/status", q).json
+        if st["state"] != "running":
+            break
+        time.sleep(0.05)
+    assert st["state"] == "done" and st["mode"] == "copy"
+    res = env["app"].get("/api/media", q, headers={"Range": "bytes=0-99"})
+    assert res.status_int == 206 and res.headers["Content-Type"] == "video/mp4"
+    env["app"].get("/api/media/status", {"root": "data", "path": "docs/report.pdf"}, status=400)

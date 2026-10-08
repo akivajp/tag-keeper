@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-10-08
+
+### Added
+
+- **Play FLV, MKV, AVI and other videos the browser cannot play.** With ffmpeg installed,
+  the file is turned into an MP4 for playback: when the video is already H.264 only the
+  container changes (a 55 MB FLV takes about half a second), otherwise it is re-encoded
+  to H.264 and AAC while the page shows the progress. The MP4 is cached by content hash,
+  so seeking works and the next time is instant; the original is untouched. MP4 and MOV
+  files the browser fails to play, such as HEVC, switch to this automatically.
+
 ## [0.4.2] - 2026-10-08
 
 ### Fixed
@@ -119,7 +130,8 @@ First release. The web UI and messages are in Japanese.
 - **Decision log.** Accepted suggestions, tag accept and reject, and undone plans are
   appended per machine; the closest past decisions are given to the model as examples.
 
-[Unreleased]: https://github.com/akivajp/tag-keeper/compare/v0.4.2...HEAD
+[Unreleased]: https://github.com/akivajp/tag-keeper/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/akivajp/tag-keeper/compare/v0.4.2...v0.5.0
 [0.4.2]: https://github.com/akivajp/tag-keeper/compare/v0.4.1...v0.4.2
 [0.4.1]: https://github.com/akivajp/tag-keeper/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/akivajp/tag-keeper/compare/v0.3.0...v0.4.0
