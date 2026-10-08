@@ -52,6 +52,17 @@
 - Plans support a `move` action (rename or move inside the tree) with undo. Destinations
   are checked against OneDrive's naming rules.
 
+- Inbox page rebuilt as a flat list: picking a file queues a suggestion at the front and
+  reads the next two ahead; the suggestion (name, destination with reasons, tags marked as
+  existing or new) appears beside the file and goes to an accept list, which runs as one
+  plan. Files outside inboxes get suggestions on request from the file browser.
+- Decision log: accepted suggestions (suggested versus final name, folder and tags), tag
+  accept and reject, and undone plans are appended per machine. The closest past decisions,
+  and files moved out of inboxes by hand, are given to the model as examples; repeatedly
+  rejected tags are avoided.
+- Model choice on the page and `vision_model`, `model_choices` and `think` in the config.
+  Ollama cloud models work; answers wrapped in code fences are accepted.
+
 ### Changed
 
 - `report`: conflict copies are reported only when the original is next to them (a lone

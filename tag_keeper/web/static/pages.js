@@ -57,7 +57,7 @@ async function pageBrowse(main, root, path, params) {
   const at = params.get('at') || '';
   const q = new URLSearchParams({ root, path });
   if (at) q.set('snapshot', at);
-  const [data, datalist] = await Promise.all([api(`/api/browse?${q}`), tagDatalist()]);
+  const [data, datalist] = await Promise.all([api(`/api/browse?${q}`), tagDatalist(), models.load()]);
   if (!snapshotCache[root]) {
     try { snapshotCache[root] = (await api(`/api/snapshots?root=${enc(root)}`)).snapshots; }
     catch { snapshotCache[root] = []; }
@@ -134,6 +134,15 @@ async function pageBrowse(main, root, path, params) {
         }
       } catch (e) { parts.push(h('div', { class: 'alert danger' }, e.message)); }
     }
+    if (live) {
+      // 既存のデータへの提案は、押したときだけ作る（受け皿の外のファイルを勝手に読ませないため）
+      const sugHolder = h('div', {}, h('button', {
+        onclick: () => setChildren(sugHolder, suggestionPanel(root, rel, {
+          auto: true, onAccept: () => toast('採用リストは「整理」の画面からまとめて実行できます'),
+        })),
+      }, `このファイルの整理の提案を出す（${models.current() || '既定のモデル'}）`));
+      parts.push(h('h3', {}, '整理の提案'), sugHolder);
+    }
     parts.push(h('h3', {}, '版の履歴'), await historyBlock(rel));
     setChildren(detail, parts);
   }
@@ -174,6 +183,7 @@ async function pageBrowse(main, root, path, params) {
 
   setChildren(main,
     datalist,
+    h('datalist', { id: `folders-${enc(root)}` }),
     h('div', { class: 'crumbs' }, data.crumbs.map((c, i) => [i ? ' / ' : '', h('a', { href: browseHref(root, c.path, at) }, c.name)])),
     h('div', { class: 'toolbar' },
       h('label', {}, '時点: ', timeSel),
@@ -244,115 +254,345 @@ async function pageTags(main, tag) {
   setChildren(main, h('h1', {}, 'タグ'), list, items);
 }
 
-// ---------- 画面: 受け皿の整理の提案 ----------
+// ---------- 整理の提案の部品（受け皿の一覧とファイルブラウザで共通） ----------
+
+/** 局所的な保存（使えない環境でも画面は動くように、失敗は無視する）。 */
+function loadLocal(key, fallback) {
+  try { const v = localStorage.getItem(key); return v === null ? fallback : JSON.parse(v); } catch { return fallback; }
+}
+function saveLocal(key, value) {
+  try { localStorage.setItem(key, JSON.stringify(value)); } catch { /* 保存できなくても動く */ }
+}
+
+/** 採用リスト（ルートごと。この端末のブラウザにだけ残す）。 */
+const cart = {
+  items(root) { return loadLocal(`tag-keeper-cart-${root}`, {}); },
+  put(root, item) { const all = this.items(root); all[item.path] = item; saveLocal(`tag-keeper-cart-${root}`, all); },
+  remove(root, path) { const all = this.items(root); delete all[path]; saveLocal(`tag-keeper-cart-${root}`, all); },
+  clear(root) { saveLocal(`tag-keeper-cart-${root}`, {}); },
+};
+
+/** 使うモデル（画面で選んだもの。無ければ設定の既定）。 */
+const models = {
+  list: null,
+  async load() {
+    if (!this.list) { try { this.list = await api('/api/models'); } catch { this.list = { default: '', models: [] }; } }
+    return this.list;
+  },
+  current() { return loadLocal('tag-keeper-model', '') || (this.list && this.list.default) || ''; },
+  set(name) { saveLocal('tag-keeper-model', name); },
+};
+
+async function modelSelect(onchange) {
+  const m = await models.load();
+  const cur = models.current();
+  return h('select', { title: 'モデル（☁ はクラウドのモデル。ファイルの内容がクラウドに送られる）', onchange: (e) => { models.set(e.target.value); onchange(); } },
+    m.models.map((x) => h('option', { value: x.name, selected: x.name === cur }, `${x.cloud ? '☁ ' : ''}${x.name}${x.vision ? '' : '（画像なし）'}${x.name === m.default ? '（既定）' : ''}`)));
+}
+
+/** 提案の待ち行列の様子を見張り、変わったら知らせる。 */
+const suggestWatch = {
+  root: null,
+  byPath: {},
+  listeners: new Set(),
+  timer: null,
+  async poll() {
+    clearTimeout(this.timer);
+    if (!this.root) return;
+    let pending = false;
+    try {
+      const { requests } = await api(`/api/suggest/queue?root=${enc(this.root)}`);
+      const before = this.byPath;
+      this.byPath = {};
+      for (const r of requests) if (r.model === models.current()) this.byPath[r.path] = r;
+      pending = requests.some((r) => r.state === 'queued' || r.state === 'running');
+      for (const fn of this.listeners) fn(before, this.byPath);
+    } catch { /* 次の問い合わせで回復する */ }
+    this.timer = setTimeout(() => this.poll(), pending ? 1000 : 4000);
+  },
+  watch(root) { if (this.root !== root) { this.root = root; this.byPath = {}; } this.poll(); },
+};
+
+async function requestSuggestions(root, paths, { force = false, prefetch = false } = {}) {
+  if (!paths.length) return;
+  try {
+    await api('/api/suggest', { root, paths, model: models.current(), force, prefetch });
+    suggestWatch.watch(root);
+  } catch (e) { toast(e.message, 'danger'); }
+}
+
+/**
+ * 1ファイルの提案（名前・移動先・タグ）を表示・編集する部品。
+ * 提案がまだ無ければ、auto なら待ち行列に入れ、できるまで状態を表示する。
+ */
+function suggestionPanel(root, path, { auto = true, onAccept = null } = {}) {
+  const holder = h('div', { class: 'suggestion' }, h('p', { class: 'muted' }, '提案を読み込み中…'));
+  let loaded = false;
+  let requested = false;
+
+  async function load() {
+    const q = new URLSearchParams({ root, path, model: models.current() });
+    let data;
+    try { data = await api(`/api/suggestion?${q}`); } catch (e) { setChildren(holder, h('div', { class: 'alert danger' }, e.message)); return; }
+    if (!data.suggestion) {
+      const req = suggestWatch.byPath[path];
+      if (!requested && auto && data.known && !req) { requested = true; requestSuggestions(root, [path]); }
+      setChildren(holder, waiting(data, suggestWatch.byPath[path]));
+      return;
+    }
+    loaded = true;
+    render(data);
+  }
+
+  function waiting(data, req) {
+    if (!data.known) return h('div', { class: 'alert warn' }, 'カタログにまだありません。ルートを走査してから選んでください。');
+    if (req && req.state === 'error') {
+      return h('div', {}, h('div', { class: 'alert danger' }, `提案を作れませんでした: ${req.error}`),
+        h('button', { onclick: () => { requestSuggestions(root, [path], { force: true }); } }, 'もう一度'));
+    }
+    if (req && (req.state === 'queued' || req.state === 'running')) {
+      return h('div', { class: 'waiting' }, h('div', { class: 'bar indeterminate' }, h('div')),
+        h('p', { class: 'muted' }, req.state === 'running' ? `${models.current()} が内容を読んでいます…` : `順番待ち（${req.position ?? '?'} 番目）`));
+    }
+    return h('div', {}, h('p', { class: 'muted' }, 'まだ提案がありません。'),
+      h('button', { class: 'primary', onclick: () => { requested = true; requestSuggestions(root, [path]); load(); } }, '提案を出す'));
+  }
+
+  function render(data) {
+    const s = data.suggestion;
+    const name = path.split('/').pop();
+    const dir = path.split('/').slice(0, -1).join('/');
+    const existing = new Set(data.existing_tags);
+    const current = new Set(data.tags.direct.map((t) => t.tag));
+    const nameInput = h('input', { class: 'name-input', value: s.new_name });
+    // 移動先: 提案（過去の例から・新しいフォルダの印つき）＋今の場所＋その他
+    let dest = s.destinations.length ? s.destinations[0].relpath : dir;
+    const other = h('input', { list: `folders-${enc(root)}`, placeholder: 'フォルダのパスを入力（候補が出ます）', hidden: true });
+    other.addEventListener('input', () => { dest = other.value.trim().replace(/^\/+|\/+$/g, ''); folderSuggest(root, other.value); });
+    const group = `dest-${Math.random().toString(36).slice(2)}`;
+    const radio = (value, label, extra, checked) => h('label', { class: 'dest' },
+      h('input', { type: 'radio', name: group, value, checked, onchange: () => { dest = value === '__other__' ? other.value.trim() : value; other.hidden = value !== '__other__'; } }),
+      h('span', {}, h('span', { class: 'path' }, label), extra));
+    const dests = h('div', { class: 'dests' },
+      s.destinations.map((d, i) => radio(d.relpath, d.relpath, [
+        d.from_example ? [' ', h('span', { class: 'badge ok' }, '過去の例')] : null,
+        d.new ? [' ', h('span', { class: 'badge warn' }, '新しいフォルダ')] : null,
+        d.reason ? h('div', { class: 'muted small' }, d.reason) : null], i === 0)),
+      radio(dir, `（今の場所のまま）${dir || '/'}`, null, !s.destinations.length),
+      radio('__other__', 'その他のフォルダ…', null, false), other);
+
+    // タグ: 提案（既存・新規）を付ける・却下する。今のタグも見せる
+    const tagBox = h('div', { class: 'chips' });
+    function renderTags() {
+      setChildren(tagBox,
+        [...current].map((t) => h('span', { class: 'chip' }, '✓ ', t)),
+        s.tags.filter((t) => !current.has(t)).map((t) => h('span', { class: `chip suggested ${existing.has(t) ? '' : 'new'}`, title: existing.has(t) ? '既存のタグ' : '新しいタグ' },
+          existing.has(t) ? '' : h('span', { class: 'tag-new' }, '新規 '), t,
+          h('button', { class: 'chip-x ok', title: '付ける', onclick: () => feedback(t, 'accept') }, '＋'),
+          h('button', { class: 'chip-x', title: '却下（次から提案しにくくなる）', onclick: () => feedback(t, 'reject') }, '×'))),
+        data.tags.inherited.map((t) => h('span', { class: 'chip inherited', title: `${t.from || root} から継承` }, t.tag)));
+    }
+    async function feedback(tag, decision) {
+      try {
+        await api('/api/tags/feedback', { root, path, tag, decision, model: s.model });
+        if (decision === 'accept') current.add(tag);
+        s.tags = s.tags.filter((t) => t !== tag || decision === 'accept');
+        renderTags();
+      } catch (e) { toast(e.message, 'danger'); }
+    }
+    renderTags();
+    const tagInput = h('input', { list: 'tag-options', placeholder: '自分でタグを付ける' });
+
+    function accept() {
+      const newName = nameInput.value.trim();
+      if (!newName) { toast('名前を入れてください', 'warn'); return; }
+      const target = joinPath(dest, newName);
+      if (target === path) { toast('名前も場所も変わりません', 'warn'); return; }
+      cart.put(root, { path, dest: target, model: s.model, name: newName, summary: s.summary });
+      toast(`採用リストに入れました: ${newName}`);
+      if (onAccept) onAccept();
+    }
+    nameInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); accept(); } });
+
+    setChildren(holder,
+      h('div', { class: 'muted small' }, `${s.doc_type || ''}${s.model ? ` ／ ${s.model}` : ''}${s.cached ? '' : ''}`),
+      s.summary ? h('p', {}, s.summary) : null,
+      s.note ? h('p', { class: 'muted small' }, s.note) : null,
+      data.same_content.length ? h('div', { class: 'alert warn' }, '同じ内容のファイルが既にあります: ', data.same_content.slice(0, 3).join(' / ')) : null,
+      h('h3', {}, '新しい名前'), nameInput,
+      s.date_source === 'file_date' ? h('div', { class: 'muted small' }, '日付は更新日から（書類の中に見つからなかった）') : null,
+      h('h3', {}, '移動先'), dests,
+      h('h3', {}, 'タグ'), tagBox,
+      h('form', { class: 'inline', onsubmit: async (ev) => { ev.preventDefault(); if (await editTags(root, [path], tagInput.value, 'add')) { current.add(tagInput.value.trim()); tagInput.value = ''; renderTags(); } } }, tagInput, h('button', {}, '付ける')),
+      s.examples.length ? h('details', {}, h('summary', { class: 'muted small' }, `参考にした過去の判断（${s.examples.length} 件）`), h('ul', { class: 'small' }, s.examples.map((e) => h('li', {}, e)))) : null,
+      h('div', { class: 'buttons', style: 'margin-top:.75rem' },
+        h('button', { class: 'primary', onclick: accept, title: 'Enter でも採用できます' }, '採用リストに入れる'),
+        h('button', { onclick: () => { loaded = false; requestSuggestions(root, [path], { force: true }); setChildren(holder, h('p', { class: 'muted' }, '作り直しています…')); } }, '作り直す')),
+    );
+    nameInput.focus({ preventScroll: true });
+  }
+
+  const listener = (_before, now) => {
+    if (!holder.isConnected) { suggestWatch.listeners.delete(listener); return; }
+    const r = now[path];
+    if (!loaded && r) load();
+  };
+  suggestWatch.listeners.add(listener);
+  suggestWatch.watch(root);
+  load();
+  return holder;
+}
+
+/** 採用リストの帯（件数・中身の確認・実行）。 */
+function cartBar(root, onChange) {
+  const bar = h('div', { class: 'cart' });
+  function render() {
+    const items = Object.values(cart.items(root));
+    setChildren(bar,
+      h('strong', {}, `採用リスト ${num(items.length)} 件`),
+      items.length ? h('details', {}, h('summary', { class: 'muted' }, '中身'),
+        h('ul', { class: 'small' }, items.map((it) => h('li', { class: 'path' }, `${it.path} → ${it.dest} `,
+          h('button', { class: 'chip-x', title: '外す', onclick: () => { cart.remove(root, it.path); render(); if (onChange) onChange(); } }, '×'))))) : null,
+      h('button', { class: 'primary', disabled: !items.length || jobRunning(), onclick: () => run(true) }, '確認して実行…'),
+      h('button', { disabled: !items.length, onclick: () => run(false) }, 'プランとして保存'),
+      items.length ? h('button', { onclick: () => { cart.clear(root); render(); if (onChange) onChange(); } }, '空にする') : null);
+  }
+  async function run(apply) {
+    const items = Object.values(cart.items(root));
+    if (apply) {
+      const ok = await confirmDialog(`${items.length} 件を移動・改名しますか？`, [
+        h('ul', { class: 'small' }, items.slice(0, 30).map((it) => h('li', { class: 'path' }, `${it.path} → ${it.dest}`))),
+        items.length > 30 ? h('p', { class: 'muted' }, `ほか ${items.length - 30} 件`) : null,
+        h('p', {}, '移動先に同じ名前があるもの・選んだ後に変わったものは飛ばします。実行の前後にスナップショットを撮り、プランの画面から取り消せます。'),
+      ], '実行する');
+      if (!ok) return;
+    }
+    try {
+      const r = await api(`/api/organize/${enc(root)}/plan`, { items, apply });
+      cart.clear(root);
+      render();
+      if (onChange) onChange();
+      if (apply) { app.job = r.job; app.jobDismissed = null; renderJob(); pollJob(); toast(`実行を始めました（プラン ${r.plan_id}）`); }
+      else location.hash = `#/plans/${r.plan_id}`;
+    } catch (e) { toast(e.message, 'danger'); }
+  }
+  render();
+  return { el: bar, render };
+}
+
+// ---------- 画面: 受け皿の整理（フラットな一覧と、選んだファイルの提案） ----------
 
 async function pageOrganize(main, root) {
   root = root || await firstRoot();
   if (!root) { setChildren(main, h('p', { class: 'muted' }, 'ルートがありません。')); return; }
   setChildren(main, h('p', { class: 'muted' }, '受け皿のフォルダを調べています…'));
-  const data = await api(`/api/organize/${enc(root)}`);
+  await models.load();
+  const data = await api(`/api/organize/${enc(root)}?model=${enc(models.current())}`);
   const files = data.files;
-  const withSug = files.filter((f) => f.suggestion && !f.suggestion.error);
-  const pending = files.length - withSug.length;
-  // 採用する提案（相対パス → {dest フォルダ, 新しい名前}）
-  const accept = new Map();
-  const countEl = h('span', { class: 'selection' });
-  const busy = jobRunning();
+  const opts = loadLocal('tag-keeper-organize', { auto: true, prefetch: true, hideDone: false });
+  let filter = '';
+  let current = null;
+  const listBody = h('tbody');
+  const side = h('aside', { class: 'detail' }, h('p', { class: 'muted' }, '左の一覧からファイルを選ぶと、プレビューと提案（名前・移動先・タグ）を表示します。↑↓ か j / k で移動、名前の欄で Enter を押すと採用して次へ進みます。'));
+  const bar = cartBar(root, () => renderList());
 
-  function updateCount() { countEl.textContent = `採用 ${num(accept.size)} 件`; }
-
-  function row(f) {
-    const s = f.suggestion;
-    const name = f.path.split('/').pop();
-    const dir = f.path.split('/').slice(0, -1).join('/');
-    const preview = h('a', { href: fileUrl(root, f.path), target: '_blank', rel: 'noopener' }, fileIcon(name), ' ', name);
-    const dup = f.duplicates.length ? h('div', {}, h('span', { class: 'badge warn' }, '同じ内容が既にある'), ' ',
-      h('span', { class: 'muted path' }, f.duplicates.slice(0, 2).join(' / '))) : null;
-    if (!s) {
-      return h('tr', {}, h('td', {}), h('td', { class: 'path' }, preview, dup), h('td', { colspan: 2, class: 'muted' }, 'まだ提案がありません'));
-    }
-    if (s.error) {
-      return h('tr', {}, h('td', {}), h('td', { class: 'path' }, preview, dup), h('td', { colspan: 2 }, h('span', { class: 'badge danger' }, '失敗'), ' ', s.error));
-    }
-    const nameInput = h('input', { class: 'name-input', value: s.new_name });
-    const destSel = h('select', {},
-      s.destinations.map((d) => h('option', { value: d.relpath, title: d.reason }, d.new ? `${d.relpath}（新しいフォルダ）` : d.relpath)),
-      h('option', { value: dir }, `（今の場所のまま）${dir}`),
-      h('option', { value: '__other__' }, 'その他のフォルダ…'));
-    const otherInput = h('input', { list: `folders-${enc(root)}`, placeholder: 'フォルダのパスを入力（候補が出ます）', hidden: true });
-    otherInput.addEventListener('input', () => folderSuggest(root, otherInput.value));
-    const box = h('input', { type: 'checkbox' });
-    const reason = h('div', { class: 'muted small' });
-
-    function sync() {
-      const destDir = destSel.value === '__other__' ? otherInput.value.trim().replace(/^\/+|\/+$/g, '') : destSel.value;
-      otherInput.hidden = destSel.value !== '__other__';
-      const d = s.destinations.find((x) => x.relpath === destSel.value);
-      reason.textContent = d ? `理由: ${d.reason}` : '';
-      if (box.checked) accept.set(f.path, { path: f.path, dest: joinPath(destDir, nameInput.value.trim()), reason: s.summary });
-      else accept.delete(f.path);
-      updateCount();
-    }
-    for (const el of [box, destSel]) el.addEventListener('change', sync);
-    for (const el of [nameInput, otherInput]) el.addEventListener('input', sync);
-    sync();
-
-    const tagButtons = s.tags.length ? h('div', { class: 'chips' }, s.tags.map((t) => h('button', {
-      class: 'chip', title: 'このファイルにタグを付ける',
-      onclick: async (ev) => { if (await editTags(root, [f.path], t, 'add')) ev.target.classList.add('active'); },
-    }, `＋${t}`))) : null;
-
-    return h('tr', {},
-      h('td', {}, box),
-      h('td', { class: 'path' }, preview, h('div', { class: 'muted small' }, `${s.doc_type || ''} ${s.summary || ''}`), dup, tagButtons),
-      h('td', {}, nameInput,
-        s.date_source === 'file_date' ? h('div', { class: 'muted small' }, '日付は更新日から（書類の中に見つからなかった）') : null),
-      h('td', {}, destSel, otherInput, reason));
+  function visible() {
+    const f = filter.toLowerCase();
+    const inCart = cart.items(root);
+    return files.filter((x) => (!f || x.path.toLowerCase().includes(f)) && !(opts.hideDone && inCart[x.path]));
   }
 
-  // 親フォルダごとにまとめる
-  const groups = new Map();
-  for (const f of files) {
-    const dir = f.path.split('/').slice(0, -1).join('/');
-    if (!groups.has(dir)) groups.set(dir, []);
-    groups.get(dir).push(f);
+  function status(f) {
+    if (cart.items(root)[f.path]) return h('span', { class: 'badge ok' }, '採用リスト');
+    const r = suggestWatch.byPath[f.path];
+    if (r && r.state === 'running') return h('span', { class: 'badge' }, '作成中');
+    if (r && r.state === 'queued') return h('span', { class: 'badge' }, `待ち ${r.position ?? ''}`);
+    if (r && r.state === 'error') return h('span', { class: 'badge danger' }, '失敗');
+    if (f.suggestion || (r && r.state === 'done')) return h('span', { class: 'badge ok' }, '提案あり');
+    return '';
   }
 
-  async function makePlan() {
-    if (!accept.size) { toast('採用する提案にチェックを入れてください', 'warn'); return; }
-    try {
-      const r = await api(`/api/organize/${enc(root)}/plan`, { items: [...accept.values()] });
-      toast(`整理プランを作りました（${r.ops} 件）。内容を確かめてから実行してください`);
-      location.hash = `#/plans/${r.plan_id}`;
-    } catch (e) { toast(e.message, 'danger'); }
+  function renderList() {
+    setChildren(listBody, visible().map((f) => {
+      const name = f.path.split('/').pop();
+      const dir = f.path.split('/').slice(0, -1).join('/');
+      return h('tr', { class: f.path === current ? 'selected' : '', onclick: () => select(f.path) },
+        h('td', { class: 'path' }, fileIcon(name), ' ', name, h('div', { class: 'muted small' }, dir),
+          f.suggestion ? h('div', { class: 'small' }, '→ ', f.suggestion.new_name) : null),
+        h('td', { class: 'num hide-narrow' }, size(f.size)),
+        h('td', {}, status(f), f.duplicates.length ? [' ', h('span', { class: 'badge warn', title: f.duplicates.join('\n') }, '重複')] : null));
+    }));
   }
+
+  function select(path) {
+    current = path;
+    renderList();
+    const name = path.split('/').pop();
+    setChildren(side,
+      h('h2', {}, name), h('div', { class: 'muted mono' }, path),
+      h('div', { class: 'buttons' }, h('a', { class: 'button small', href: fileUrl(root, path), target: '_blank', rel: 'noopener' }, '新しいタブで開く'),
+        h('a', { class: 'button small', href: browseHref(root, path.split('/').slice(0, -1).join('/')) }, 'フォルダを開く')),
+      // 提案を先に、プレビューを後に置く（PDF のプレビューで提案が画面の外に押し出されないように）
+      suggestionPanel(root, path, { auto: opts.auto, onAccept: () => { bar.render(); move(1); } }),
+      h('h3', {}, 'プレビュー'),
+      preview(fileUrl(root, path), name, files.find((f) => f.path === path)?.size));
+    if (opts.prefetch) {
+      const list = visible();
+      const i = list.findIndex((f) => f.path === path);
+      const next = list.slice(i + 1, i + 3).filter((f) => !f.suggestion).map((f) => f.path);
+      requestSuggestions(root, next, { prefetch: true });
+    }
+  }
+
+  function move(delta) {
+    const list = visible();
+    if (!list.length) return;
+    const i = list.findIndex((f) => f.path === current);
+    const next = list[Math.min(list.length - 1, Math.max(0, (i < 0 ? -1 : i) + delta))];
+    if (next) {
+      select(next.path);
+      listBody.querySelector('tr.selected')?.scrollIntoView({ block: 'nearest' });
+    }
+  }
+
+  // 一覧の印（待ち・作成中・提案あり）を、待ち行列の様子に合わせて更新する
+  const listener = (_b, now) => {
+    if (!listBody.isConnected) { suggestWatch.listeners.delete(listener); return; }
+    for (const f of files) if (now[f.path] && now[f.path].state === 'done' && !f.suggestion) f.suggestion = { new_name: '…' };
+    renderList();
+  };
+  suggestWatch.listeners.add(listener);
+  suggestWatch.watch(root);
+
+  const keyHandler = (e) => {
+    if (!listBody.isConnected) { document.removeEventListener('keydown', keyHandler); return; }
+    if (['INPUT', 'TEXTAREA', 'SELECT'].includes(document.activeElement?.tagName)) return;
+    if (e.key === 'ArrowDown' || e.key === 'j') { e.preventDefault(); move(1); }
+    if (e.key === 'ArrowUp' || e.key === 'k') { e.preventDefault(); move(-1); }
+  };
+  document.addEventListener('keydown', keyHandler);
+
+  const toggle = (key, label) => h('label', { class: 'small' }, h('input', {
+    type: 'checkbox', checked: opts[key], onchange: (e) => { opts[key] = e.target.checked; saveLocal('tag-keeper-organize', opts); renderList(); },
+  }), ' ', label);
+  const pending = files.filter((f) => !f.suggestion).length;
 
   setChildren(main,
     h('datalist', { id: `folders-${enc(root)}` }),
+    await tagDatalist(),
     h('h1', {}, `整理: ${root}`),
-    h('p', { class: 'muted' }, `受け皿（${data.patterns.join('・')} に一致するフォルダ）のファイルについて、手元のモデル（${data.model}）が内容を読んで、`
-      + '名前（既定は YYYYMMDD_題名。移動先の命名の慣習があれば合わせる）と、既存のフォルダから移動先を提案します。採用したものだけが整理プランになり、確認してから実行します。'),
-    h('div', { class: 'stats' },
-      stat('受け皿のフォルダ', num(data.inbox.length)), stat('ファイル', num(files.length)),
-      stat('提案あり', num(withSug.length)), stat('未作成・失敗', num(pending))),
-    h('div', { class: 'buttons' },
-      h('button', { class: 'primary', disabled: busy || !pending, onclick: () => startJob(`/api/organize/${enc(root)}/suggest`, {}) },
-        `提案を作る（未作成 ${num(pending)} 件。1件あたり十数秒）`),
-      h('button', { disabled: busy || !withSug.length, onclick: async () => {
-        if (await confirmDialog('提案をすべて作り直しますか？', h('p', {}, `${num(files.length)} 件をモデルにもう一度読ませます。時間がかかります。`), '作り直す')) {
-          startJob(`/api/organize/${enc(root)}/suggest`, { force: true });
-        }
-      } }, 'すべて作り直す…')),
-    h('details', { class: 'group' }, h('summary', {}, h('span', { class: 'title' }, '受け皿のフォルダ'), h('span', { class: 'muted' }, `${data.inbox.length} 件`)),
-      h('div', { class: 'body' }, h('ul', {}, data.inbox.map((d) => h('li', { class: 'path' }, h('a', { href: browseHref(root, d) }, d)))))),
-    h('div', { class: 'toolbar' }, countEl, h('button', { class: 'primary', onclick: makePlan }, '採用したもので整理プランを作る')),
-    ...[...groups.entries()].map(([dir, fs]) => h('details', { class: 'group', open: fs.some((f) => f.suggestion) },
-      h('summary', {}, h('span', { class: 'title path' }, dir || '(ルート直下)'), h('span', { class: 'muted' }, `${num(fs.length)} 件`)),
-      h('div', { class: 'body table-wrap' }, h('table', { class: 'organize' },
-        h('thead', {}, h('tr', {}, h('th', {}, '採用'), h('th', {}, 'ファイルと内容'), h('th', {}, '新しい名前'), h('th', {}, '移動先'))),
-        h('tbody', {}, fs.map(row)))))),
-  );
-  updateCount();
+    h('p', { class: 'muted' }, `受け皿（${data.patterns.join('・')} に一致するフォルダ）のファイル ${num(files.length)} 件を、フォルダの階層なしで並べています。`
+      + 'ファイルを選ぶと、モデルが内容を読んで名前・移動先・タグを提案します。採用したものは採用リストにたまり、まとめて実行できます。'),
+    h('div', { class: 'toolbar' },
+      h('input', { type: 'search', placeholder: '名前やフォルダで絞り込む', oninput: (e) => { filter = e.target.value; renderList(); } }),
+      await modelSelect(() => app.render()),
+      toggle('auto', '選んだら提案を出す'), toggle('prefetch', '次の2件を先読み'), toggle('hideDone', '採用したものを隠す'),
+      h('button', { disabled: jobRunning() || !pending, title: '裏でまとめて作る（時間がかかります）', onclick: () => startJob(`/api/organize/${enc(root)}/suggest`, { model: models.current() }) }, `残り ${num(pending)} 件をまとめて提案`)),
+    bar.el,
+    h('div', { class: 'browse' },
+      h('div', { class: 'card table-wrap list' }, h('table', { class: 'flat' }, listBody)),
+      side));
+  renderList();
 }
 
 let folderTimer = null;

@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import time
 from pathlib import Path
+from typing import Any
 
 import pytest
 from webtest import TestApp
@@ -188,3 +189,64 @@ def test_organize_plan_from_accepted_suggestions(env: dict) -> None:
     assert plan["ops"][0]["action"] == "move" and plan["ops"][0]["dest"] == "docs/20250414_明細書.pdf"
     run_job(env, f"/api/plans/{plan_id}/apply")
     assert (root / "docs" / "20250414_明細書.pdf").read_text() == "statement"
+
+
+def test_suggest_queue_feedback_and_decision_log(env: dict, monkeypatch: pytest.MonkeyPatch) -> None:
+    """1件ずつの提案 → タグの採否 → 採用して実行 → 取り消し、が判断のログに残る。"""
+    import json as _json
+
+    from tag_keeper import organize
+
+    def generate(config: Any, prompt: str, image: bytes | None = None, **_: Any) -> dict:
+        if "内容を読み取ってください" in prompt:
+            return {"title": "明細書", "doc_type": "明細書", "summary": "利用明細"}
+        return {"new_name": "20250414_明細書", "date": "20250414", "destinations": [{"index": 1, "reason": "書類の置き場"}], "tags": ["種別:明細書", "相手:A社"]}
+
+    monkeypatch.setattr(organize, "ollama_generate", generate)
+    monkeypatch.setattr(organize, "check_ollama", lambda config: None)
+    app, root = env["app"], env["root"]
+    origin = {"Origin": f"http://{HOST}"}
+    write(root / "99_Inbox" / "downloadfile.pdf", "statement")
+    run_job(env, "/api/roots/data/scan")
+
+    path = "99_Inbox/downloadfile.pdf"
+    app.post_json("/api/suggest", {"root": "data", "paths": [path], "model": "m"}, headers=origin)
+    deadline = time.time() + 10
+    while time.time() < deadline:
+        reqs = app.get("/api/suggest/queue", {"root": "data"}).json["requests"]
+        if reqs and reqs[0]["state"] not in ("queued", "running"):
+            break
+        time.sleep(0.05)
+    assert reqs[0]["state"] == "done", reqs
+    sug = app.get("/api/suggestion", {"root": "data", "path": path, "model": "m"}).json["suggestion"]
+    assert sug["new_name"] == "20250414_明細書.pdf" and sug["tags"] == ["種別:明細書", "相手:A社"]
+
+    app.post_json("/api/tags/feedback", {"root": "data", "path": path, "tag": "種別:明細書", "decision": "accept", "model": "m"}, headers=origin)
+    app.post_json("/api/tags/feedback", {"root": "data", "path": path, "tag": "相手:A社", "decision": "reject", "model": "m"}, headers=origin)
+    tags = app.get("/api/suggestion", {"root": "data", "path": path, "model": "m"}).json["tags"]["direct"]
+    assert tags == [{"tag": "種別:明細書", "source": "suggested"}]
+
+    dest = sug["destinations"][0]["relpath"] + "/20250414_明細書.pdf"
+    res = app.post_json("/api/organize/data/plan", {"items": [{"path": path, "dest": dest, "model": "m"}], "apply": True}, headers=origin).json
+    env["jobs"].wait()
+    assert (root / dest).exists()
+    run_job(env, f"/api/plans/{res['plan_id']}/undo")
+
+    log_dir = env["settings"].decision_log.log_dir
+    events = [_json.loads(l) for f in log_dir.glob("*.jsonl") for l in f.read_text(encoding="utf-8").splitlines()]
+    ops = [e["op"] for e in events]
+    assert ops == ["tag", "tag", "accept", "revert"]
+    acc = events[2]
+    assert acc["suggested"]["name"] == "20250414_明細書.pdf" and acc["final"]["dest_dir"] == sug["destinations"][0]["relpath"]
+    assert acc["final"]["tags"] == ["種別:明細書"] and acc["info"]["title"] == "明細書"
+
+
+def test_models_endpoint(env: dict, monkeypatch: pytest.MonkeyPatch) -> None:
+    from tag_keeper import organize
+    from tag_keeper.web import server
+
+    monkeypatch.setattr(organize, "cached_capabilities", lambda oc, name: ["completion", "vision"] if name != "bad" else ["embedding"])
+    monkeypatch.setattr(server, "_local_models", lambda oc: ["x:cloud", "bad"])
+    data = env["app"].get("/api/models").json
+    assert data["default"] == "gemma3:12b"
+    assert [(m["name"], m["cloud"]) for m in data["models"]] == [("gemma3:12b", False), ("x:cloud", True)]

@@ -196,3 +196,23 @@ table.organize td { vertical-align: top; }
 table.organize select { max-width: 22rem; }
 th { white-space: nowrap; }
 .chip { white-space: nowrap; }
+
+/* 整理の提案 */
+.cart {
+  display: flex; flex-wrap: wrap; align-items: center; gap: .6rem; padding: .6rem .9rem; margin: .5rem 0;
+  background: var(--panel); border: 1px solid var(--accent); border-radius: 10px;
+}
+.cart details { flex: 1 1 100%; }
+.cart details ul { max-height: 12rem; overflow-y: auto; }
+.list { max-height: calc(100vh - 16rem); overflow-y: auto; padding: 0; }
+table.flat tr { cursor: pointer; }
+table.flat tr:hover td { background: var(--bg); }
+table.flat tr.selected td { background: var(--ok-bg); }
+.suggestion h3 { margin: .9rem 0 .3rem; }
+.dests { display: flex; flex-direction: column; gap: .35rem; }
+.dests label.dest { display: flex; gap: .45rem; align-items: flex-start; cursor: pointer; }
+.chip.suggested { border: 1px solid var(--accent); background: transparent; }
+.chip.suggested.new { border-style: dashed; }
+.tag-new { color: var(--warn); font-weight: 600; font-size: .75rem; }
+.chip-x.ok { color: var(--ok); font-weight: 700; }
+.waiting .bar { margin: .75rem 0 .35rem; }

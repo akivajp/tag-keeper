@@ -29,7 +29,9 @@
     [organize]
     inbox_patterns = ["tmp", "temp", "*未整理*", "*inbox*"]  # 受け皿とみなすフォルダ名（大文字・小文字を区別しない glob）
     ollama_url = "http://127.0.0.1:11434"
-    model = "gemma3:12b"             # 名前と移動先の提案に使うモデル（画像を読めるもの）
+    model = "gemma3:12b"             # 名前と移動先の提案に使うモデル（":cloud" などのクラウドのモデルも可。内容がクラウドに送られる）
+    vision_model = ""                # 画像を読むモデル（空なら model）
+    model_choices = ["glm-5.3-flash:cloud", "gemma4:31b-cloud"]  # 画面で選べるモデルの候補
     use_images = true                # 画像と、文字の無いスキャン PDF をモデルに見せる
     max_chars = 4000                 # モデルに渡す本文の上限（文字数）
     candidates = 15                  # モデルに選ばせる移動先の候補の数
@@ -132,14 +134,21 @@ class OrganizeConfig:
     inbox_patterns: list[str] = field(default_factory=lambda: ["tmp", "temp", "*未整理*", "*inbox*"])
     # ollama の API の URL（外部のサービスには送らない。手元のモデルだけを使う）
     ollama_url: str = "http://127.0.0.1:11434"
-    # 名前と移動先の提案に使うモデル。画像を読めるものにする
+    # 名前と移動先の提案に使うモデル（既定は手元のモデル）。
+    # ollama のクラウドのモデル（例: "glm-5.3-flash:cloud"）も使えるが、その場合はファイルの内容が ollama のクラウドに送られる
     model: str = "gemma3:12b"
+    # 画像を読むモデル。空なら model を使う（model が画像を読めなければ、画像は見せずに名前と場所から判断する）
+    vision_model: str = ""
+    # 画面でモデルを選ぶときの候補（ollama の手元のモデルに加えて出す。クラウドのモデルは手元の一覧に出ないため）
+    model_choices: list[str] = field(default_factory=list)
     # 画像と、文字を取り出せないスキャン PDF を、画像としてモデルに見せるか
     use_images: bool = True
     # モデルに渡す本文の上限（文字数）
     max_chars: int = 4000
     # 似ているフォルダから絞り込み、モデルに選ばせる移動先の候補の数
     candidates: int = 15
+    # 思考（thinking）に対応したモデルで考えさせるか。"true" / "false"、空ならモデルに任せる
+    think: str = ""
     # 生成の温度（低いほど毎回同じ提案になる）
     temperature: float = 0.2
     # 1件の問い合わせの待ち時間の上限（秒）
@@ -241,9 +250,13 @@ def load_config(path: Path | None = None) -> Config:
     organize = OrganizeConfig()
     if "inbox_patterns" in og:
         organize.inbox_patterns = [str(x) for x in og["inbox_patterns"]]
+    if "model_choices" in og:
+        organize.model_choices = [str(x) for x in og["model_choices"]]
     for key, conv in (
         ("ollama_url", str),
         ("model", str),
+        ("vision_model", str),
+        ("think", str),
         ("use_images", bool),
         ("max_chars", int),
         ("candidates", int),

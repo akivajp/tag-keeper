@@ -19,10 +19,14 @@ API の一覧:
 
 from __future__ import annotations
 
+import dataclasses
+import json
 import logging
 import os
 import re
 import sqlite3
+import urllib.error
+import urllib.request
 from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
@@ -41,6 +45,7 @@ from tag_keeper.config import (
     default_config_path,
     load_config,
 )
+from tag_keeper.decisions import DecisionLog
 from tag_keeper.hashing import hash_root
 from tag_keeper.history import HistoryError
 from tag_keeper.jobs import JobBusyError, JobManager, JobReporter
@@ -71,8 +76,9 @@ from tag_keeper.plan import (
 )
 from tag_keeper.report import build_report
 from tag_keeper.scan import RootUnavailableError, scan_root
+from tag_keeper.suggest_queue import SuggestQueue
 from tag_keeper.syncguard import SyncError, SyncGuard, make_guard
-from tag_keeper.tags import TagError, TagStore
+from tag_keeper.tags import TagError, TagStore, normalize_tag
 from tag_keeper.web.auth import (
     Credentials,
     host_allowed,
@@ -108,6 +114,8 @@ class Settings:
         self.job_log_dir = data_dir / "logs" / "jobs"
 
         self._tag_stores: dict[Path, TagStore] = {}
+        # 判断のログ（整理の提案に対して利用者が決めたこと。提案の文脈と学習データ）
+        self.decision_log = DecisionLog(data_dir / "decisions")
 
     def config(self) -> Config:
         """設定を読み直す（編集をサーバーの再起動なしで反映するため、リクエストのたびに読む）。"""
@@ -151,6 +159,8 @@ def create_app(
     """
     app = bottle.Bottle()
     jobs = jobs or JobManager(settings.job_log_dir)
+    # 1件ずつの提案の待ち行列（画面でファイルを選ぶたびに提案を出す）
+    queue = SuggestQueue(settings.db_path, settings.config, lambda _c: settings.decision_log, settings.tags)
 
     # --- アクセス制御と共通の応答ヘッダ ---
 
@@ -415,8 +425,10 @@ def create_app(
 
     @app.post("/api/plans/<plan_id>/apply")
     def api_plan_apply(plan_id: str) -> dict[str, Any]:
-        path = plan_file(plan_id)
-        plan = load_plan(path)
+        return start_apply(load_plan(plan_file(plan_id)))
+
+    def start_apply(plan: Plan) -> dict[str, Any]:
+        """プランを実行するジョブを始める。"""
         config = settings.config()
         rc = config.find_root(plan.root)
 
@@ -457,6 +469,8 @@ def create_app(
                 )
             finally:
                 conn.close()
+            if any(op.action == ACTION_MOVE for op in plan.ops):
+                settings.decision_log.revert(plan.id)
             return _run_result(result)
 
         return start("undo", f"取り消し: {plan.id}", run, target=plan.id)
@@ -664,12 +678,13 @@ def create_app(
     def api_organize(root: str) -> dict[str, Any]:
         config = settings.config()
         rc = root_config(config, root)
+        model = bottle.request.query.getunicode("model", "") or config.organize.model
         conn = open_db()
         try:
             root_id = root_id_of(conn, rc)
             excluded = excluded_dirs(conn, root_id, rc, config)
             inbox, files = organize.find_inbox(conn, root_id, config.organize.inbox_patterns, excluded)
-            cached = organize.cached_suggestions(conn, files, config.organize.model)
+            cached = organize.cached_suggestions(conn, files, model)
             # 同じ内容のファイルが受け皿の外にあれば示す（その場合は移動より隔離が向く）
             dups: dict[str, list[str]] = {}
             shas = [f.sha256 for f in files if f.sha256]
@@ -688,7 +703,7 @@ def create_app(
         return {
             "root": rc.name,
             "inbox": inbox,
-            "model": config.organize.model,
+            "model": model,
             "patterns": config.organize.inbox_patterns,
             "files": [
                 {
@@ -709,7 +724,7 @@ def create_app(
         rc = root_config(config, root)
         only = [clean_relpath(str(p)) for p in data["paths"]] if data.get("paths") else None
         force = bool(data.get("force", False))
-        oc = config.organize
+        oc = dataclasses.replace(config.organize, model=str(data.get("model") or config.organize.model))
 
         def run(rep: JobReporter) -> dict[str, Any]:
             conn = open_db()
@@ -734,7 +749,18 @@ def create_app(
                     rep.advance()
 
                 organize.run_suggestions(
-                    conn, root_id, rc.path, oc, excluded, only=only, force=force, on_start=on_start, on_done=on_done
+                    conn,
+                    root_id,
+                    rc.path,
+                    oc,
+                    excluded,
+                    root_name=rc.name,
+                    decisions=settings.decision_log,
+                    tag_counts=settings.tags(config).all_tags(),
+                    only=only,
+                    force=force,
+                    on_start=on_start,
+                    on_done=on_done,
                 )
                 return {"root": rc.name, **done}
             finally:
@@ -807,7 +833,103 @@ def create_app(
         if not plan.ops:
             raise fail(400, "動かすものがありません（名前も場所も変わらない）")
         write_plan(plan, settings.plans_dir / f"{plan.id}.toml")
-        return {"plan_id": plan.id, "ops": len(plan.ops)}
+        _log_accepts(settings, config, rc, plan, items)
+        out: dict[str, Any] = {"plan_id": plan.id, "ops": len(plan.ops)}
+        if data.get("apply"):
+            out["job"] = start_apply(plan)
+        return out
+
+    # --- 1件ずつの提案（待ち行列） ---
+
+    @app.route("/api/models")
+    def api_models() -> dict[str, Any]:
+        """画面で選べるモデル（設定の既定・候補と、ollama の手元のモデル）。"""
+        oc = settings.config().organize
+        names = list(dict.fromkeys([oc.model, *oc.model_choices, *_local_models(oc)]))
+        out = []
+        for name in names:
+            try:
+                caps = organize.cached_capabilities(oc, name)
+            except OllamaError:
+                continue
+            if "completion" in caps:
+                out.append({"name": name, "cloud": organize.is_cloud_model(name), "vision": "vision" in caps})
+        return {"default": oc.model, "models": out}
+
+    @app.post("/api/suggest")
+    def api_suggest() -> dict[str, Any]:
+        data = body()
+        config = settings.config()
+        rc = root_config(config, str(data.get("root", "")))
+        model = str(data.get("model") or config.organize.model)
+        reqs = [
+            queue.enqueue(rc.name, clean_relpath(str(p)), model, force=bool(data.get("force")), prefetch=bool(data.get("prefetch")))
+            for p in data.get("paths") or []
+        ]
+        return {"requests": [r.to_dict() for r in reqs]}
+
+    @app.route("/api/suggest/queue")
+    def api_suggest_queue() -> dict[str, Any]:
+        return {"requests": queue.status(bottle.request.query.getunicode("root") or None)}
+
+    @app.route("/api/suggestion")
+    def api_suggestion() -> dict[str, Any]:
+        """1ファイルの保存済みの提案と、画面に要る周りの情報（同じ内容のファイル・今のタグ・既存のタグ）。"""
+        q = bottle.request.query
+        config = settings.config()
+        rc = root_config(config, q.getunicode("root", ""))
+        rel = clean_relpath(q.getunicode("path", ""))
+        model = q.getunicode("model", "") or config.organize.model
+        conn = open_db()
+        try:
+            root_id = root_id_of(conn, rc)
+            item = organize.catalog_item(conn, root_id, rel)
+            sug = organize.load_cached(conn, item.sha256, model) if item is not None and item.sha256 else None
+            same: list[str] = []
+            if item is not None and item.sha256 and item.size > 0:
+                same = [
+                    r["relpath"]
+                    for r in conn.execute(
+                        "SELECT relpath FROM entries WHERE root_id = ? AND sha256 = ? AND gone_at IS NULL AND relpath != ? LIMIT 10",
+                        (root_id, item.sha256, rel),
+                    )
+                ]
+        finally:
+            conn.close()
+        store = settings.tags(config)
+        if sug is not None:
+            sug.relpath = rel
+        return {
+            "root": rc.name,
+            "path": rel,
+            "model": model,
+            "known": item is not None,
+            "suggestion": sug.to_dict() if sug is not None else None,
+            "same_content": same,
+            "tags": store.tags_of(rc.name, rel),
+            "existing_tags": sorted(store.all_tags()),
+        }
+
+    @app.post("/api/tags/feedback")
+    def api_tag_feedback() -> dict[str, Any]:
+        """提案されたタグを付ける（accept）か、却下する（reject）。どちらも判断のログに残す。"""
+        data = body()
+        config = settings.config()
+        rc = root_config(config, str(data.get("root", "")))
+        rel = clean_relpath(str(data.get("path", "")))
+        tag = normalize_tag(str(data.get("tag", "")))
+        decision = "reject" if data.get("decision") == "reject" else "accept"
+        if not resolve_within(rc.path, rel).exists():
+            raise fail(404, f"ありません: {rel}")
+        conn = open_db()
+        try:
+            item = organize.catalog_item(conn, root_id_of(conn, rc), rel)
+        finally:
+            conn.close()
+        if decision == "accept":
+            settings.tags(config).add(rc.name, [rel], tag, source="suggested")
+        settings.decision_log.tag(rc.name, rel, item.sha256 if item else None, tag, decision, str(data.get("model", "")))
+        return {"tag": tag, "decision": decision}
 
     # 予期できる失敗は 400 番台の JSON にして、画面にそのまま表示できるようにする
     def json_errors(callback: Any) -> Any:
@@ -827,6 +949,52 @@ def create_app(
 
     app.install(json_errors)
     return app
+
+
+def _local_models(oc: Any) -> list[str]:
+    """ollama の手元のモデルの名前（取れなければ空）。"""
+    try:
+        with urllib.request.urlopen(oc.ollama_url.rstrip("/") + "/api/tags", timeout=5) as res:
+            return [m["name"] for m in json.load(res).get("models", [])]
+    except (urllib.error.URLError, TimeoutError, OSError, ValueError):
+        return []
+
+
+def _log_accepts(settings: Settings, config: Config, rc: RootConfig, plan: Plan, items: list[dict[str, Any]]) -> None:
+    """整理プランにした提案を、判断のログに「採用」として残す（提案と最終的な判断の対）。"""
+    by_path = {str(it.get("path", "")): it for it in items}
+    store = settings.tags(config)
+    conn = connect(settings.db_path)
+    events = []
+    try:
+        row = conn.execute("SELECT id FROM roots WHERE name = ?", (rc.name,)).fetchone()
+        for op in plan.ops:
+            it = by_path.get(op.path, {})
+            model = str(it.get("model") or config.organize.model)
+            item = organize.catalog_item(conn, int(row["id"]), op.path) if row is not None else None
+            sug = organize.load_cached(conn, item.sha256, model) if item is not None and item.sha256 else None
+            dest_dir, _, name = op.dest.rpartition("/")
+            events.append(
+                {
+                    "root": rc.name,
+                    "path": op.path,
+                    "sha256": item.sha256 if item else None,
+                    "model": model if sug is not None else "",
+                    "info": sug.info if sug is not None else {},
+                    "suggested": {
+                        "name": sug.new_name,
+                        "destinations": [d["relpath"] for d in sug.destinations],
+                        "tags": sug.tags,
+                    }
+                    if sug is not None
+                    else None,
+                    "final": {"name": name, "dest_dir": dest_dir, "tags": [t["tag"] for t in store.tags_of(rc.name, op.path)["direct"]]},
+                    "plan_id": plan.id,
+                }
+            )
+    finally:
+        conn.close()
+    settings.decision_log.accept(events)
 
 
 def _root_state(conn: sqlite3.Connection, rc: RootConfig) -> dict[str, Any]:

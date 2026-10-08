@@ -147,20 +147,34 @@ bar, speed, time remaining and the latest log lines. It works on a phone too.
 ### Inbox suggestions
 
 Folders whose name matches `inbox_patterns` (by default `tmp`, `temp`, `*未整理*`,
-`*inbox*`) are treated as inboxes. For each file in them, a local model served by
-[ollama](https://ollama.com/) reads the content — text from PDFs and Office files, the image
-itself for photos and scanned PDFs — and suggests:
+`*inbox*`) are treated as inboxes. The **整理** page lists every file in them flat, without
+the folder hierarchy. Pick a file and a model served by [ollama](https://ollama.com/) reads
+it — text from PDFs and Office files, the image itself for photos and scanned PDFs — and
+suggests, usually within seconds:
 
-- a name, by default `YYYYMMDD_title`, following the date style of the destination folder
-  when it has one and keeping a meaningful existing name;
-- up to three destination folders, chosen from folders you already have: candidates are
+- a name, by default `YYYYMMDD_title`, following past decisions and the date style of the
+  destination folder, and keeping a meaningful existing name;
+- up to three destination folders among the folders you already have: candidates are
   narrowed by character-bigram TF-IDF over each folder's path and file names, then the model
   picks. Year and month folders are moved to the document's date;
-- tags, and whether the same content already exists elsewhere.
+- tags, preferring the ones you already use; new ones are marked as such.
 
-Nothing is sent anywhere else. Suggestions are stored by content hash, so a file is read
-once. The ones you accept become a plan of renames and moves, which you check, run and undo
-like any other plan.
+Clicked files jump the queue and the next two are read ahead. Accepted suggestions go to an
+accept list, which you run as one plan of renames and moves — with snapshots and undo — or
+save to review on the plan page. Files outside the inboxes get a suggestion only when you ask
+for one from the file browser.
+
+**Learning from your decisions.** What you accept (suggested versus final name, folder and
+tags), the suggested tags you add or reject, and plans you undo are appended to a log, one
+JSONL file per machine (`~/.local/share/tag-keeper/decisions/`). Files you move out of an
+inbox yourself count too. When suggesting, the closest past decisions are added to the prompt
+as examples and their folders join the candidates; tags you keep rejecting are avoided. The
+log pairs each suggestion with your decision, so it can be exported as training data.
+
+**Models.** The default is a local model. Any ollama model can be chosen on the page or in
+the config, including ollama's cloud models (`…:cloud`, `…-cloud`) — then the file's content
+is sent to ollama's cloud; the page marks those models with ☁. Suggestions are stored by
+content hash and model, so a file is read once per model.
 
 ## Install
 
@@ -216,7 +230,10 @@ dir = "~/.local/share/tag-keeper/tags"   # where the per-machine tag logs live
 [organize]
 inbox_patterns = ["tmp", "temp", "*未整理*", "*inbox*"]  # case-insensitive globs on folder names
 ollama_url = "http://127.0.0.1:11434"
-model = "gemma3:12b"                     # needs image input for photos and scans
+model = "gemma3:12b"                     # e.g. "gemma4:31b-cloud" (content is sent to ollama's cloud)
+vision_model = ""                        # model for images when `model` cannot read them
+model_choices = ["gemma4:31b-cloud"]     # extra models offered on the page
+think = ""                               # "true" / "false" for thinking models; "" = model default
 use_images = true
 max_chars = 4000                         # text passed to the model
 candidates = 15                          # destination folders the model chooses from
