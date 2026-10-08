@@ -178,12 +178,29 @@ content hash and model, so a file is read once per model.
 
 ## Install
 
-Requires Python 3.11+ and Linux.
+Requires Python 3.11+ and Linux. The web UI and messages are in Japanese.
+
+```console
+$ pipx install tag-keeper        # or: uv tool install tag-keeper
+$ tag-keeper --help
+```
+
+Optional tools, each used only by the feature that needs it:
+
+| Tool | Used for |
+|---|---|
+| poppler-utils (`pdftotext`, `pdftoppm`) | reading PDFs for inbox suggestions |
+| [ollama](https://ollama.com/) | inbox suggestions |
+| btrfs and snapper | version history, and snapshots around plans |
+| OneDrive client for Linux | coordinating big deletions with the sync |
+
+From source:
 
 ```console
 $ git clone https://github.com/akivajp/tag-keeper.git
 $ cd tag-keeper
 $ uv run tag-keeper --help
+$ uv run --extra dev pytest
 ```
 
 ## Configuration

@@ -1,70 +1,49 @@
 # Changelog
 
-## Unreleased
+All notable changes to this project will be documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [0.1.0] - 2026-10-08
+
+First release. The web UI and messages are in Japanese.
 
 ### Added
 
-- `scan`: read-only walk of a root into an SQLite catalog kept outside the tree.
-  Renames and moves are tracked by inode. Mass disappearances are held until confirmed by
-  a second scan; missing or empty roots abort the scan; unreadable folders are not treated
-  as gone.
-- `hash`: incremental SHA-256 with a progress bar; files that change while being hashed
-  are skipped.
-- `report`: hygiene report — application data in synced folders, rebuildable artifacts,
-  VM images, installers, temporary files, Office lock files, sync conflict copies, empty
-  files and folders, and exact duplicates confirmed by hash. `--json` for machine output.
-- `roots`: list configured roots and the state of the catalog.
-- TOML configuration (`~/.config/tag-keeper/config.toml`) and `--log-file` on every command.
-- `plan` / `apply` / `undo`: tidy-up plans. `plan` writes the report's candidates to an
-  editable TOML file, one line per item. `apply` previews by default; with `--yes` it moves
-  items to a quarantine folder outside the tree, skipping anything that changed since the
-  plan was written, with snapper pre/post snapshots around the run. Every move is
-  journaled, and `undo` puts items back without overwriting anything new. The catalog is
-  updated as items move, so a large quarantine is not mistaken for a mass disappearance.
+- **Inventory.** `scan` walks a root read-only into an SQLite catalog kept outside the
+  tree, tracking renames and moves by inode. Mass disappearances are held until a second
+  scan confirms them; a missing or empty root aborts the scan. `hash` computes SHA-256
+  incrementally.
+- **Hygiene report.** `report` lists application data in synced folders, rebuildable
+  artifacts, VM images, installers, temporary files, Office lock files, sync conflict copies
+  (only when the original is next to them; differing copies are marked for review), empty
+  files and folders, and duplicates confirmed by hash.
+- **Tidy-up plans.** `plan` writes candidates to an editable TOML file; `apply` previews,
+  then moves items to a quarantine folder outside the tree or renames and moves them inside
+  it, skipping anything that changed since the plan was written, with snapper pre/post
+  snapshots around the run. Every move is journaled and `undo` puts it back without
+  overwriting anything new. Destinations are checked against OneDrive's naming rules.
+- **Big deletions without stopping the sync client.** With `sync_client = "onedrive"`, a
+  plan that removes a folder above the OneDrive client's `classify_as_big_delete` threshold
+  stops the resident sync, reflects the deletions with one `onedrive --sync` whose threshold
+  is raised just enough (never `--force`), and starts it again. A failed reflection leaves
+  the sync stopped, is journaled, and can be retried or abandoned (`tag-keeper sync`).
+- **Web UI** (`serve`): roots, report, plans (untick to skip), check, apply and undo, with
+  background jobs and a progress panel. Loopback by default; other addresses require HTTP
+  Basic auth, and writes must be same-origin.
+- **File browser** with in-page previews for types that cannot run scripts; paths never
+  leave the root.
+- **Tags** on files and folders, inherited from folders, kept in append-only JSONL logs one
+  per machine, and following moves seen by `scan` or made by plans.
+- **Version history** from btrfs snapshots via btrfs-timeline: versions of a file, a folder
+  at any snapshot, restoring an old version beside the current one. Moves are recorded, so
+  history continues across them.
+- **Inbox suggestions.** Files in folders named like `tmp` or `*未整理*` are listed flat;
+  picking one asks an ollama model (local or cloud) for a `YYYYMMDD_title` name, destination
+  folders among existing ones and tags, usually within seconds. Accepted suggestions run as
+  one plan of renames and moves. Files elsewhere get suggestions on request.
+- **Decision log.** Accepted suggestions, tag accept and reject, and undone plans are
+  appended per machine; the closest past decisions are given to the model as examples.
 
-- Big deletions without stopping the sync client: with `sync_client = "onedrive"` on a
-  root, a plan that removes a folder above the OneDrive client's `classify_as_big_delete`
-  threshold stops the resident sync, quarantines, reflects the deletions with one
-  `onedrive --sync` whose threshold is raised just enough (never `--force`), and starts the
-  sync again. A failed reflection leaves the sync stopped, is journaled, and can be retried
-  (`tag-keeper sync <plan-id> --retry`) or abandoned (`--resume`).
-- `serve`: a web UI for everything above — roots, report, plan editing (untick to skip),
-  check, apply and undo — with background jobs and a progress panel (steps, bar, speed,
-  time remaining, latest log lines). Loopback by default; other addresses require HTTP
-  Basic auth. Writes must be same-origin.
-- Plans accept `skip = true` on an item, so items can be left out without deleting lines.
-
-- File browser in the web UI: folders, in-page previews (PDF, images, audio, video, text),
-  downloads. Only types that cannot run scripts open in the page; paths never leave the
-  root, symlinks included.
-- Tags: tag files and folders from the browser; folder tags are inherited. Tags are kept
-  in append-only JSONL logs, one per machine, and follow moves made outside the tool (seen
-  by `scan`) and by plans.
-- Version history from btrfs snapshots via btrfs-timeline: versions of a file, a folder at
-  any snapshot, and restoring an old version beside the current file. Renames and moves are
-  now recorded in the catalog (schema version 2, migrated automatically), so history
-  continues across them.
-- Inbox suggestions: for files in folders named like `tmp` or `*未整理*`, a local ollama
-  model reads the content and suggests a `YYYYMMDD_title` name that respects the
-  destination's conventions, destination folders chosen among existing ones (year and month
-  folders adjusted to the document's date) and tags. Suggestions are cached by content
-  hash; accepted ones become a plan of renames and moves.
-- Plans support a `move` action (rename or move inside the tree) with undo. Destinations
-  are checked against OneDrive's naming rules.
-
-- Inbox page rebuilt as a flat list: picking a file queues a suggestion at the front and
-  reads the next two ahead; the suggestion (name, destination with reasons, tags marked as
-  existing or new) appears beside the file and goes to an accept list, which runs as one
-  plan. Files outside inboxes get suggestions on request from the file browser.
-- Decision log: accepted suggestions (suggested versus final name, folder and tags), tag
-  accept and reject, and undone plans are appended per machine. The closest past decisions,
-  and files moved out of inboxes by hand, are given to the model as examples; repeatedly
-  rejected tags are avoided.
-- Model choice on the page and `vision_model`, `model_choices` and `think` in the config.
-  Ollama cloud models work; answers wrapped in code fences are accepted.
-
-### Changed
-
-- `report`: conflict copies are reported only when the original is next to them (a lone
-  "copy" may be the only version). Copies whose content differs from the original are
-  marked as needing review and stay out of plans unless `--include-review` is given.
+[0.1.0]: https://github.com/akivajp/tag-keeper/releases/tag/v0.1.0

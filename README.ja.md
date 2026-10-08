@@ -148,12 +148,29 @@ $ tag-keeper serve                  # http://127.0.0.1:8090/
 
 ## インストール
 
-Python 3.11 以上と Linux が必要です。
+Python 3.11 以上と Linux が必要です。画面とメッセージは日本語です。
+
+```console
+$ pipx install tag-keeper        # または: uv tool install tag-keeper
+$ tag-keeper --help
+```
+
+次の道具は任意で、それぞれ必要な機能でだけ使います。
+
+| 道具 | 使う機能 |
+|---|---|
+| poppler-utils（`pdftotext`・`pdftoppm`） | 受け皿の整理の提案での PDF の読み取り |
+| [ollama](https://ollama.com/) | 受け皿の整理の提案 |
+| btrfs と snapper | 版の履歴、プランの実行前後のスナップショット |
+| Linux 版 onedrive クライアント | 大量の削除での同期との連携 |
+
+ソースから使う場合:
 
 ```console
 $ git clone https://github.com/akivajp/tag-keeper.git
 $ cd tag-keeper
 $ uv run tag-keeper --help
+$ uv run --extra dev pytest
 ```
 
 ## 設定

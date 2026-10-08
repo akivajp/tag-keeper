@@ -1,0 +1,38 @@
+name: Publish to PyPI
+
+# タグ（v*）を打つと PyPI へ公開する。
+# API トークンを持たずに済むよう Trusted Publishing（OIDC）を使う。
+# 事前に PyPI 側で、このリポジトリ・workflow（publish.yml）・環境（pypi）を Trusted Publisher として登録すること。
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      # Trusted Publishing に必要
+      id-token: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+
+      # タグとパッケージのバージョンが食い違ったまま公開しないように確かめる
+      - name: Check version matches tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          version=$(sed -n 's/^__version__ = "\(.*\)"$/\1/p' tag_keeper/__init__.py)
+          test "v${version}" = "${GITHUB_REF_NAME}" || { echo "tag ${GITHUB_REF_NAME} != version ${version}"; exit 1; }
+
+      - name: Build distributions
+        run: |
+          pip install build
+          python -m build
+
+      - name: Publish
+        uses: pypa/gh-action-pypi-publish@release/v1
