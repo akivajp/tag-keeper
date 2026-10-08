@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import sqlite3
 from pathlib import Path
 
@@ -172,8 +173,10 @@ def test_apply_skips_items_changed_since_the_plan(
     plan, _ = make_plan(conn, root_id, tree, tmp_path)
     # フォルダの中にファイルが増えた / ファイルが別のものに置き換わった
     write(tree / "Documents" / "DMMGames" / "new.sav", "saved game")
-    (tree / "docs" / "Thumbs.db").unlink()
-    write(tree / "docs" / "Thumbs.db", "junk")
+    # 消してから作り直すと、ファイルシステムによっては同じ inode 番号が再利用される（ext4 など）。
+    # 古いファイルがあるうちに別名で作ってから置き換え、必ず別の inode にする
+    write(tree / "docs" / "Thumbs.db.new", "junk")
+    os.replace(tree / "docs" / "Thumbs.db.new", tree / "docs" / "Thumbs.db")
     result = run_apply(conn, plan, tmp_path)
 
     skipped = {o.path: o.detail for o in result.skipped}
