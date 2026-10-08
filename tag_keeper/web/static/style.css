@@ -260,3 +260,27 @@ body.resizing iframe { pointer-events: none; }
 th.sortable { cursor: pointer; user-select: none; }
 th.sortable:hover { color: var(--text); }
 th.sortable .arrow { margin-left: .25rem; color: var(--accent); }
+
+/* クラウドのリンク */
+.cloud-links { margin: .25rem 0; }
+.folder-links .cloud-links { margin: 0 .5rem 0 0; }
+
+/* Office 文書のプレビュー */
+.office-view { margin: .5rem 0; }
+.office-tabs, .sheet-tabs { margin-top: .5rem; }
+.sheet-tabs button.active { border-color: var(--accent); color: var(--accent); }
+.sheet { max-height: 60vh; overflow: auto; border: 1px solid var(--line); border-radius: 7px; margin-top: .4rem; }
+.sheet table { font-size: .82rem; }
+.sheet th { background: var(--bg); position: sticky; top: 0; }
+.sheet tbody th { position: sticky; left: 0; top: auto; text-align: right; color: var(--muted); }
+.sheet td { white-space: pre-wrap; border-left: 1px solid var(--line); }
+.doc { max-height: 60vh; overflow: auto; border: 1px solid var(--line); border-radius: 7px; padding: .75rem 1rem; background: var(--panel); }
+.doc p { margin: .2rem 0; white-space: pre-wrap; }
+.doc p.empty { margin: 0; }
+.doc-table td { border: 1px solid var(--line); white-space: pre-wrap; }
+.slides { max-height: 60vh; overflow: auto; display: flex; flex-direction: column; gap: .5rem; }
+.slide { border: 1px solid var(--line); border-radius: 7px; padding: .5rem .9rem; background: var(--panel); }
+.slide h3 { margin: .2rem 0; }
+.slide ul { margin: .2rem 0; padding-left: 1.2rem; }
+.doc-image { display: block; max-width: 100%; margin: .4rem 0; border-radius: 4px; }
+.sheet td { min-width: 5rem; max-width: 26rem; }

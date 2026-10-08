@@ -133,7 +133,12 @@ and the theme (system, light or dark).
 
 - **Browse** a root folder by folder, preview PDFs, images, audio, video and text in the
   page, and download anything. Columns sort by clicking the header, and the divider between
-  the list and the preview can be dragged; both are remembered in the browser. Only types that cannot run scripts open in the page; HTML
+  the list and the preview can be dragged; both are remembered in the browser.
+- **Office documents** preview without extra tools: Excel as tables with sheet tabs, Word
+  as headings, paragraphs, tables and images, PowerPoint as slides. With LibreOffice
+  installed they can also be shown as laid out, converted to PDF.
+- **Open in the cloud.** For a root synced by the OneDrive client for Linux, files and
+  folders link to OneDrive on the web, and Office documents to Office for the web. Only types that cannot run scripts open in the page; HTML
   and SVG are shown as plain text, everything else downloads. Paths never leave the root,
   symlinks included.
 - **Rename and delete** any file or folder from the browser. Type any name or take the
@@ -198,7 +203,8 @@ Optional tools, each used only by the feature that needs it:
 | poppler-utils (`pdftotext`, `pdftoppm`) | reading PDFs for inbox suggestions |
 | [ollama](https://ollama.com/) | inbox suggestions |
 | btrfs and snapper | version history, and snapshots around plans |
-| OneDrive client for Linux | coordinating big deletions with the sync |
+| OneDrive client for Linux | coordinating big deletions with the sync, links to OneDrive on the web |
+| LibreOffice | Office previews as laid out (PDF) |
 
 From source:
 

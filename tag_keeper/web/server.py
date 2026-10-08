@@ -36,8 +36,9 @@ from wsgiref.simple_server import WSGIRequestHandler, WSGIServer, make_server
 
 import bottle
 
-from tag_keeper import __version__, history, organize, rules
+from tag_keeper import __version__, history, officeview, organize, rules
 from tag_keeper.catalog import connect, ensure_root, last_scan, utcnow
+from tag_keeper.cloudlinks import OneDriveLinks
 from tag_keeper.config import (
     Config,
     ConfigError,
@@ -46,7 +47,7 @@ from tag_keeper.config import (
     load_config,
 )
 from tag_keeper.decisions import DecisionLog
-from tag_keeper.hashing import hash_root
+from tag_keeper.hashing import hash_root, sha256_file
 from tag_keeper.history import HistoryError
 from tag_keeper.jobs import JobBusyError, JobManager, JobReporter
 from tag_keeper.organize import OllamaError
@@ -78,7 +79,7 @@ from tag_keeper.plan import (
 from tag_keeper.report import build_report
 from tag_keeper.scan import RootUnavailableError, scan_root
 from tag_keeper.suggest_queue import SuggestQueue
-from tag_keeper.syncguard import SyncError, SyncGuard, make_guard
+from tag_keeper.syncguard import OneDriveGuard, SyncError, SyncGuard, make_guard
 from tag_keeper.tags import TagError, TagStore, normalize_tag
 from tag_keeper.web.auth import (
     Credentials,
@@ -119,6 +120,23 @@ class Settings:
         self._tag_stores: dict[Path, TagStore] = {}
         # 判断のログ（整理の提案に対して利用者が決めたこと。提案の文脈と学習データ）
         self.decision_log = DecisionLog(data_dir / "decisions")
+        # LibreOffice で変換した Office 文書の PDF（内容ハッシュをキーに保存）
+        self.office_pdf_dir = data_dir / "office-pdf"
+        self._links: dict[tuple[str, str], OneDriveLinks | None] = {}
+
+    def cloud_links(self, rc: RootConfig) -> OneDriveLinks | None:
+        """ルートの同期クライアントから、クラウドの Web 画面で開くリンクを作る部品（今は OneDrive だけ）。"""
+        key = (rc.name, rc.sync_client)
+        if key not in self._links:
+            links = None
+            guard = _guard(rc)
+            if isinstance(guard, OneDriveGuard):
+                try:
+                    links = OneDriveLinks(Path(os.path.expanduser("~/.config/onedrive")), guard.sync_dir())
+                except SyncError as e:
+                    log.warning("OneDrive の同期フォルダを調べられません: %s", e)
+            self._links[key] = links
+        return self._links[key]
 
     def config(self) -> Config:
         """設定を読み直す（編集をサーバーの再起動なしで反映するため、リクエストのたびに読む）。"""
@@ -262,6 +280,7 @@ def create_app(
             "plans": plans,
             "job": job.to_dict() if job else None,
             "categories": [{"key": k, "label": v} for k, v in rules.CATEGORY_KEYS.items()],
+            "office_pdf": officeview.soffice() is not None,
         }
 
     @app.route("/api/report/<root>")
@@ -599,6 +618,7 @@ def create_app(
             "first_seen": row["first_seen"] if row is not None else None,
             "same_content": same,
             "tags": settings.tags(config).tags_of(rc.name, rel),
+            "cloud_links": links.links(path, path.is_dir()) if (links := settings.cloud_links(rc)) is not None else [],
         }
 
     @app.route("/api/history")
@@ -933,6 +953,53 @@ def create_app(
             settings.tags(config).add(rc.name, [rel], tag, source="suggested")
         settings.decision_log.tag(rc.name, rel, item.sha256 if item else None, tag, decision, str(data.get("model", "")))
         return {"tag": tag, "decision": decision}
+
+    # --- Office 文書のプレビュー ---
+
+    def file_at(rc: RootConfig, rel: str, snapshot: str) -> Path:
+        """今の（または過去の時点の）ファイルの実パス。"""
+        base = history.snapshot_path(rc.path, "", snapshot) if snapshot else rc.path
+        path = resolve_within(base, rel)
+        if not path.is_file():
+            raise fail(404, f"ファイルがありません: {rel}")
+        return path
+
+    @app.route("/api/office")
+    def api_office() -> dict[str, Any]:
+        """Office 文書の中身を、画面に出す構造にして返す（レイアウトは再現しない）。"""
+        q = bottle.request.query
+        rc = root_config(settings.config(), q.getunicode("root", ""))
+        path = file_at(rc, clean_relpath(q.getunicode("path", "")), q.getunicode("snapshot", ""))
+        try:
+            return officeview.preview(path)
+        except officeview.OfficeError as e:
+            raise fail(400, str(e)) from e
+
+    @app.route("/api/office/image")
+    def api_office_image() -> Any:
+        """Office 文書に埋め込まれた画像を返す（ブラウザで表示できる種類だけ）。"""
+        q = bottle.request.query
+        rc = root_config(settings.config(), q.getunicode("root", ""))
+        path = file_at(rc, clean_relpath(q.getunicode("path", "")), q.getunicode("snapshot", ""))
+        try:
+            data, mime = officeview.image_part(path, q.getunicode("part", ""))
+        except officeview.OfficeError as e:
+            raise fail(400, str(e)) from e
+        return bottle.HTTPResponse(body=data, headers={"Content-Type": mime})
+
+    @app.route("/api/office/pdf")
+    def api_office_pdf() -> Any:
+        """LibreOffice で PDF に変換して返す（レイアウトどおりのプレビュー）。"""
+        q = bottle.request.query
+        rc = root_config(settings.config(), q.getunicode("root", ""))
+        path = file_at(rc, clean_relpath(q.getunicode("path", "")), q.getunicode("snapshot", ""))
+        if path.suffix.lower() not in officeview.CONVERTIBLE_EXTS:
+            raise fail(400, f"この種類は PDF にできません: {path.suffix}")
+        try:
+            pdf = officeview.to_pdf(path, sha256_file(path), settings.office_pdf_dir)
+        except officeview.OfficeError as e:
+            raise fail(400, str(e)) from e
+        return bottle.static_file(pdf.name, root=str(pdf.parent), mimetype="application/pdf")
 
     # --- ファイルブラウザからの名前の変更・削除 ---
 

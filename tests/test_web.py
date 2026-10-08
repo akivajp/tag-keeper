@@ -292,3 +292,16 @@ def test_rename_and_delete_from_the_browser(env: dict) -> None:
     assert app.get(f"/api/plans/{r['plan_id']}").json["restorable"] == 2
     run_job(env, f"/api/plans/{r['plan_id']}/undo")
     assert (root / "projects" / "2025_案件" / "memo.txt").exists() and (root / "docs" / "Thumbs.db").exists()
+
+
+def test_office_preview_api(env: dict) -> None:
+    import zipfile
+
+    root = env["root"]
+    with zipfile.ZipFile(root / "docs" / "memo.docx", "w") as z:
+        z.writestr("word/document.xml", '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t>本文</w:t></w:r></w:p></w:body></w:document>')
+    data = env["app"].get("/api/office", {"root": "data", "path": "docs/memo.docx"}).json
+    assert data["kind"] == "docx" and data["blocks"][0]["runs"][0]["t"] == "本文"
+    env["app"].get("/api/office", {"root": "data", "path": "docs/report.pdf"}, status=400)
+    env["app"].get("/api/office", {"root": "data", "path": "../x.docx"}, status=400)
+    assert env["app"].get("/api/state").json["office_pdf"] in (True, False)

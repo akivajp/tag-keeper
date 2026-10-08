@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-10-08
+
+### Added
+
+- **Office previews.** Excel workbooks show as tables with sheet tabs (date cells as
+  dates), Word documents as headings, paragraphs, tables and pasted images, PowerPoint
+  decks as slides with their text and pictures — without extra tools. With LibreOffice
+  installed, documents are also converted to PDF for an as-laid-out view (cached by
+  content hash). Untrusted XML with a DTD is refused and part sizes are capped.
+- **Open in OneDrive.** For roots synced by the OneDrive client for Linux, files and
+  folders get an "Open in OneDrive" link, and Office documents an "Open in Office for the
+  web" link, found through the client's own item database.
+
 ## [0.3.0] - 2026-10-08
 
 ### Added
@@ -85,7 +98,8 @@ First release. The web UI and messages are in Japanese.
 - **Decision log.** Accepted suggestions, tag accept and reject, and undone plans are
   appended per machine; the closest past decisions are given to the model as examples.
 
-[Unreleased]: https://github.com/akivajp/tag-keeper/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/akivajp/tag-keeper/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/akivajp/tag-keeper/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/akivajp/tag-keeper/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/akivajp/tag-keeper/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/akivajp/tag-keeper/compare/v0.1.0...v0.1.1

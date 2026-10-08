@@ -114,6 +114,12 @@ const I18N_EN = {
   '大きい順': 'Largest first', '小さい順': 'Smallest first', '提案の無いものから': 'Unsuggested first', '提案のあるものから': 'Suggested first',
   'ファイル数': 'Files',
 
+  // --- クラウド・Office ---
+  'OneDrive で開く': 'Open in OneDrive', 'ブラウザ版の Office で開く': 'Open in Office for the web',
+  'PDF に変換しています（初回は少しかかります）…': 'Converting to PDF (the first time takes a moment)…',
+  'レイアウトどおり（PDF）': 'As laid out (PDF)', '文字と表だけ（速い）': 'Text and tables only (fast)',
+  '表示しきれない部分は省いています': 'Some content is left out',
+
   // --- 変数を含む文（t() で使う） ---
   '{h}時間{m}分': '{h} h {m} min', '{m}分{s}秒': '{m} min {s} s', '{s}秒': '{s} s',
   '同期: {state}': 'Sync: {state}',

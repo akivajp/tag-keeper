@@ -164,6 +164,11 @@ async function pageBrowse(main, root, path, params) {
     data.tags.direct.map((tg) => tagChip(tg.tag, live ? async () => { if (await editTags(root, [path], tg.tag, 'remove')) app.render(); } : null)),
     data.tags.inherited.map((tg) => h('span', { class: 'chip inherited', title: t('{from} から継承', { from: tg.from || root }) }, tg.tag)),
     !data.tags.direct.length && !data.tags.inherited.length ? h('span', { class: 'muted' }, 'タグなし') : null);
+  // 今のフォルダをクラウドの Web 画面で開くリンク（あとから読み込む）
+  const folderLinks = h('span', { class: 'folder-links' });
+  if (live && path) {
+    api(`/api/info?root=${enc(root)}&path=${enc(path)}`).then((info) => setChildren(folderLinks, info.cloud_links.length ? cloudLinks(info.cloud_links) : null)).catch(() => {});
+  }
   const folderTagInput = h('input', { list: 'tag-options', placeholder: 'このフォルダにタグを付ける（配下に継承）', disabled: !live || !path });
 
   // 並べ替え（フォルダは常に先。項目と向きはブラウザに覚える）
@@ -223,10 +228,11 @@ async function pageBrowse(main, root, path, params) {
       h('a', { class: 'button', href: fileUrl(root, rel, at, true) }, 'ダウンロード'),
       live ? h('button', { onclick: () => renameDialog(root, rel, false) }, '名前を変える…') : null,
       live ? h('button', { class: 'danger-outline', onclick: () => deleteDialog(root, [{ path: rel, is_dir: false, size: entry.size }]) }, '削除…') : null));
-    parts.push(preview(url, name, entry.size));
+    parts.push(preview(url, name, entry.size, { root, path: rel, snapshot: at }));
     if (live) {
       try {
         const info = await api(`/api/info?root=${enc(root)}&path=${enc(rel)}`);
+        if (info.cloud_links.length) parts.splice(3, 0, cloudLinks(info.cloud_links));
         const input = h('input', { list: 'tag-options', placeholder: 'タグを付ける' });
         parts.push(h('h3', {}, 'タグ'),
           h('div', { class: 'chips' },
@@ -295,7 +301,7 @@ async function pageBrowse(main, root, path, params) {
       h('label', {}, '時点: ', timeSel),
       at ? h('span', { class: 'badge warn' }, '過去の時点を表示中（読み取りのみ）') : null,
       h('input', { type: 'search', placeholder: '名前で絞り込む', oninput: (e) => { filter = e.target.value; renderRows(); } })),
-    h('div', { class: 'card folder-tags' }, h('strong', {}, 'このフォルダのタグ: '), folderTags,
+    h('div', { class: 'card folder-tags' }, folderLinks, h('strong', {}, 'このフォルダのタグ: '), folderTags,
       live && path ? h('form', { class: 'inline', onsubmit: async (ev) => { ev.preventDefault(); if (await editTags(root, [path], folderTagInput.value, 'add')) app.render(); } },
         folderTagInput, h('button', {}, '付ける')) : null),
     live ? h('form', { class: 'toolbar', onsubmit: (ev) => ev.preventDefault() },
@@ -393,6 +399,94 @@ async function deleteDialog(root, items) {
   await runFileOp(root, 'delete', items.map((it) => ({ path: it.path })));
 }
 
+// ---------- クラウドの Web 画面で開くリンク ----------
+
+/** OneDrive で開く・ブラウザ版の Office で開く、などのリンクの並び。 */
+function cloudLinks(links) {
+  return h('div', { class: 'buttons cloud-links' }, links.map((l) => h('a', {
+    class: `button small ${l.kind}`, href: l.url, target: '_blank', rel: 'noopener noreferrer',
+  }, l.kind === 'office' ? '✎ ' : '☁ ', t(l.label))));
+}
+
+// ---------- Office 文書のプレビュー ----------
+
+const OFFICE_EXTS = ['docx', 'docm', 'xlsx', 'xlsm', 'pptx', 'pptm'];
+
+/**
+ * Office 文書のプレビュー。LibreOffice があれば PDF に変換したもの（レイアウトどおり）を既定にし、
+ * 中身の文字と表だけを出す表示（速い）にも切り替えられる。
+ */
+function officePreview(ctx, name) {
+  const holder = h('div', { class: 'office-view', translate: 'no' }, h('p', { class: 'muted' }, t('読み込み中…')));
+  const q = new URLSearchParams({ root: ctx.root, path: ctx.path });
+  if (ctx.snapshot) q.set('snapshot', ctx.snapshot);
+  const tabs = h('div', { class: 'buttons office-tabs' });
+  const box = h('div', {}, tabs, holder);
+
+  async function showStructure() {
+    setChildren(holder, h('p', { class: 'muted' }, t('読み込み中…')));
+    try { setChildren(holder, renderOffice(await api(`/api/office?${q}`), (part) => `/api/office/image?${q}&part=${enc(part)}`)); }
+    catch (e) { setChildren(holder, h('p', { class: 'muted' }, t('この種類はプレビューできません。'), ' ', e.message)); }
+  }
+  function showPdf() {
+    setChildren(holder, h('p', { class: 'muted small' }, t('PDF に変換しています（初回は少しかかります）…')),
+      h('iframe', { class: 'preview pdf', src: `/api/office/pdf?${q}`, title: name }));
+  }
+  (async () => {
+    const st = app.state || await refreshState().catch(() => null);
+    if (st && st.office_pdf) {
+      setChildren(tabs,
+        h('button', { class: 'small', onclick: showPdf }, t('レイアウトどおり（PDF）')),
+        h('button', { class: 'small', onclick: showStructure }, t('文字と表だけ（速い）')));
+      showPdf();
+    } else {
+      showStructure();
+    }
+  })();
+  return box;
+}
+
+/** /api/office の答えを画面の要素にする（文字は textContent で入れるので安全）。 */
+function renderOffice(data, imageUrl) {
+  if (data.kind === 'xlsx') {
+    const view = h('div');
+    const tabs = h('div', { class: 'buttons sheet-tabs' });
+    const show = (i) => {
+      const sh = data.sheets[i];
+      tabs.querySelectorAll('button').forEach((b, j) => b.classList.toggle('active', j === i));
+      const width = Math.max(1, ...sh.rows.map((r) => r.length));
+      const colName = (n) => { let s = ''; for (n += 1; n > 0; n = Math.floor((n - 1) / 26)) s = String.fromCharCode(65 + ((n - 1) % 26)) + s; return s; };
+      setChildren(view, h('div', { class: 'table-wrap sheet' }, h('table', {},
+        h('thead', {}, h('tr', {}, h('th', {}, ''), Array.from({ length: width }, (_, c) => h('th', {}, colName(c))))),
+        h('tbody', {}, sh.rows.map((r, i2) => h('tr', {}, h('th', {}, String(i2 + 1)), Array.from({ length: width }, (_, c) => h('td', {}, r[c] ?? ''))))))),
+      sh.truncated ? h('p', { class: 'muted small' }, t('表示しきれない部分は省いています')) : null);
+    };
+    setChildren(tabs, data.sheets.map((sh, i) => h('button', { class: 'small', onclick: () => show(i) }, sh.name || `#${i + 1}`)));
+    if (data.sheets.length) show(0);
+    return h('div', {}, data.sheets.length > 1 ? tabs : null, view);
+  }
+  if (data.kind === 'docx') {
+    return h('div', { class: 'doc' }, data.blocks.map((b) => {
+      if (b.type === 'more') return h('p', { class: 'muted small' }, t('表示しきれない部分は省いています'));
+      if (b.type === 'image') return h('img', { class: 'doc-image', src: imageUrl(b.part), alt: '', loading: 'lazy' });
+      if (b.type === 'table') {
+        return h('div', { class: 'table-wrap' }, h('table', { class: 'doc-table' }, h('tbody', {}, b.rows.map((r) => h('tr', {}, r.map((c) => h('td', {}, c)))))));
+      }
+      const runs = b.runs.map((r) => (r.b || r.i ? h(r.b ? 'strong' : 'em', {}, r.t) : r.t));
+      if (!runs.length) return h('p', { class: 'empty' }, ' ');
+      return h(b.level ? `h${Math.min(6, b.level + 2)}` : 'p', {}, runs);
+    }));
+  }
+  if (data.kind === 'pptx') {
+    return h('div', { class: 'slides' }, data.slides.map((sl, i) => h('section', { class: 'slide' },
+      h('div', { class: 'muted small' }, `#${i + 1}`),
+      sl.title ? h('h3', {}, sl.title) : null,
+      sl.paragraphs.length ? h('ul', {}, sl.paragraphs.map((x) => h('li', {}, x))) : null,
+      (sl.images || []).map((part) => h('img', { class: 'doc-image', src: imageUrl(part), alt: '', loading: 'lazy' })))));
+  }
+  return h('p', { class: 'muted' }, t('この種類はプレビューできません。'));
+}
+
 function fileIcon(name) {
   const ext = name.split('.').pop().toLowerCase();
   if (['pdf'].includes(ext)) return '📕';
@@ -405,8 +499,9 @@ function fileIcon(name) {
 }
 
 /** ファイルの種類に合わせたプレビュー（PDF・画像・音声・動画・テキスト）。 */
-function preview(url, name, bytes) {
+function preview(url, name, bytes, ctx = null) {
   const ext = name.split('.').pop().toLowerCase();
+  if (ctx && OFFICE_EXTS.includes(ext)) return officePreview(ctx, name);
   if (['jpg', 'jpeg', 'png', 'gif', 'webp', 'bmp'].includes(ext)) return h('img', { class: 'preview', src: url, alt: name });
   if (ext === 'pdf') return h('iframe', { class: 'preview pdf', src: url, title: name });
   if (['mp4', 'webm', 'mov'].includes(ext)) return h('video', { class: 'preview', src: url, controls: true, preload: 'metadata' });
@@ -743,7 +838,7 @@ async function pageOrganize(main, root) {
       // 提案を先に、プレビューを後に置く（PDF のプレビューで提案が画面の外に押し出されないように）
       suggestionPanel(root, path, { auto: opts.auto, onAccept: () => { bar.render(); move(1); } }),
       h('h3', {}, 'プレビュー'),
-      preview(fileUrl(root, path), name, files.find((f) => f.path === path)?.size));
+      preview(fileUrl(root, path), name, files.find((f) => f.path === path)?.size, { root, path }));
     if (opts.prefetch) {
       const list = visible();
       const i = list.findIndex((f) => f.path === path);
