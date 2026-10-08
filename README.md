@@ -9,6 +9,14 @@ Tag, search and tidy your existing file trees from the outside — without movin
 > and version history from btrfs snapshots, and name and folder suggestions for your inbox
 > folders from a local model. Search and the rest of tagging come next. See [Roadmap](#roadmap).
 
+![Inbox: pick a file and a model suggests a name, a folder and tags](https://raw.githubusercontent.com/akivajp/tag-keeper/main/docs/screenshots/inbox.png)
+
+| File browser with Office preview | Dark mode | Hygiene report |
+|---|---|---|
+| ![File browser previewing an Excel workbook](https://raw.githubusercontent.com/akivajp/tag-keeper/main/docs/screenshots/files.png) | ![File browser in dark mode with a PDF preview](https://raw.githubusercontent.com/akivajp/tag-keeper/main/docs/screenshots/files-dark.png) | ![Hygiene report grouped by category](https://raw.githubusercontent.com/akivajp/tag-keeper/main/docs/screenshots/report.png) |
+
+*Screenshots use made-up demo data (`scripts/make_demo.py`).*
+
 ## Why
 
 Most document managers take ownership of your files: they ingest them into their own

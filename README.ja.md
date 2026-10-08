@@ -9,6 +9,14 @@
 > 手元のモデルによる受け皿のファイルの名前と移動先の提案です。検索とタグの残りはこれから作ります。
 > [ロードマップ](#ロードマップ) を参照してください。
 
+![整理の画面: ファイルを選ぶと、モデルが名前・移動先・タグを提案する](https://raw.githubusercontent.com/akivajp/tag-keeper/main/docs/screenshots/inbox.png)
+
+| ファイルブラウザ（Office のプレビュー） | ダークモード | 衛生レポート |
+|---|---|---|
+| ![Excel のブックをプレビューしているファイルブラウザ](https://raw.githubusercontent.com/akivajp/tag-keeper/main/docs/screenshots/files.png) | ![ダークモードで PDF をプレビューしているファイルブラウザ](https://raw.githubusercontent.com/akivajp/tag-keeper/main/docs/screenshots/files-dark.png) | ![カテゴリごとにまとめた衛生レポート](https://raw.githubusercontent.com/akivajp/tag-keeper/main/docs/screenshots/report.png) |
+
+*スクリーンショットは架空の見本のデータ（`scripts/make_demo.py`）で撮っています。画面は英語に切り替えています。*
+
 ## なぜ作るのか
 
 多くの文書管理ソフトは、ファイルを取り込んで自分の保管場所に一律に並べ直します。

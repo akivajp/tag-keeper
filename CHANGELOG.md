@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-10-08
+
+### Fixed
+
+- **Suggestions follow the document's language.** Names, summaries, reasons and tags were
+  pushed toward Japanese by the prompt; they now follow the document (and, for pictures
+  without text, the file name), the destination folder's existing names, and the namespaces
+  of the tags already in use. Stored suggestions are made again.
+
+### Added
+
+- README screenshots, taken from made-up demo data built by `scripts/make_demo.py`.
+
 ## [0.4.0] - 2026-10-08
 
 ### Added
@@ -98,7 +111,8 @@ First release. The web UI and messages are in Japanese.
 - **Decision log.** Accepted suggestions, tag accept and reject, and undone plans are
   appended per machine; the closest past decisions are given to the model as examples.
 
-[Unreleased]: https://github.com/akivajp/tag-keeper/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/akivajp/tag-keeper/compare/v0.4.1...HEAD
+[0.4.1]: https://github.com/akivajp/tag-keeper/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/akivajp/tag-keeper/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/akivajp/tag-keeper/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/akivajp/tag-keeper/compare/v0.1.1...v0.2.0
