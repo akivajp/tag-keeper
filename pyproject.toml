@@ -19,6 +19,7 @@ classifiers = [
     "Framework :: Bottle",
     "Intended Audience :: End Users/Desktop",
     "Intended Audience :: System Administrators",
+    "Natural Language :: English",
     "Natural Language :: Japanese",
     "Operating System :: POSIX :: Linux",
     "Programming Language :: Python :: 3",

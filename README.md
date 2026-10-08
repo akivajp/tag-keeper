@@ -116,6 +116,8 @@ Everything above can be done in the browser: refresh a root (scan and hash), rea
 report, create a plan, untick what you want to keep, check it, run it and undo it. Long
 operations run in the background, and a panel at the bottom shows each step, a progress
 bar, speed, time remaining and the latest log lines. It works on a phone too.
+The top bar switches the language (Japanese or English; the browser's language by default)
+and the theme (system, light or dark).
 
 - Only loopback is served by default. To listen elsewhere (for example on a Tailscale
   address), give credentials for HTTP Basic auth with `--auth-file` (one line,
@@ -181,7 +183,7 @@ content hash and model, so a file is read once per model.
 
 ## Install
 
-Requires Python 3.11+ and Linux. The web UI and messages are in Japanese.
+Requires Python 3.11+ and Linux. The web UI is in Japanese and English (it follows the browser and can be switched in the top bar); command-line messages are in Japanese.
 
 ```console
 $ pipx install tag-keeper        # or: uv tool install tag-keeper

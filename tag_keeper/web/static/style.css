@@ -1,4 +1,4 @@
-/* tag-keeper の画面。明るい配色と暗い配色を、OS の設定に合わせて切り替える */
+/* tag-keeper の画面。明るい配色と暗い配色を、OS の設定か画面上部のボタンで切り替える */
 :root {
   --bg: #f6f7f9;
   --panel: #ffffff;
@@ -16,8 +16,9 @@
   --bar: #e8ecf2;
   --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
 }
+/* 暗い配色: OS がダークで、ライトを選んでいないとき（data-theme なし＝OS に合わせる） */
 @media (prefers-color-scheme: dark) {
-  :root {
+  :root:not([data-theme="light"]) {
     --bg: #14171c;
     --panel: #1c2027;
     --text: #e6e9ef;
@@ -31,8 +32,27 @@
     --warn-bg: #33270f;
     --danger-bg: #3a1a1a;
     --bar: #2a3039;
+    color-scheme: dark;
   }
 }
+/* 暗い配色: 画面上部のボタンでダークを選んだとき */
+:root[data-theme="dark"] {
+  --bg: #14171c;
+  --panel: #1c2027;
+  --text: #e6e9ef;
+  --muted: #98a2b3;
+  --line: #2d333d;
+  --accent: #5b8ff0;
+  --ok: #4cc27f;
+  --warn: #f0a83a;
+  --danger: #f06a6a;
+  --ok-bg: #16301f;
+  --warn-bg: #33270f;
+  --danger-bg: #3a1a1a;
+  --bar: #2a3039;
+  color-scheme: dark;
+}
+:root[data-theme="light"] { color-scheme: light; }
 
 * { box-sizing: border-box; }
 body {
@@ -217,3 +237,8 @@ table.flat tr.selected td { background: var(--ok-bg); }
 .chip-x.ok { color: var(--ok); font-weight: 700; }
 .waiting .bar { margin: .75rem 0 .35rem; }
 button.danger-outline { border-color: var(--danger); color: var(--danger); }
+
+/* 画面上部の言語とテーマの切り替え */
+.topbar-tools { margin-left: auto; display: flex; gap: .5rem; align-items: center; }
+.topbar-tools select { padding: .2rem .4rem; font-size: .85rem; }
+button.icon { padding: .2rem .55rem; font-size: 1rem; line-height: 1.2; }

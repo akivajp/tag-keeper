@@ -16,6 +16,14 @@
       <a href="#/tags" data-nav="tags">タグ</a>
       <a href="#/plans" data-nav="plans">プラン</a>
     </nav>
+    <!-- 表示言語とテーマ（どちらもこの端末のブラウザに覚える） -->
+    <div class="topbar-tools">
+      <select id="lang-select" aria-label="言語" translate="no">
+        <option value="ja">日本語</option>
+        <option value="en">English</option>
+      </select>
+      <button id="theme-button" type="button" class="icon" aria-label="テーマ"></button>
+    </div>
   </header>
   <!-- 同期を止めたままのプランなど、どの画面でも見せる警告 -->
   <div id="alerts"></div>
@@ -32,6 +40,7 @@
       </div>
     </form>
   </dialog>
+  <script src="/static/i18n.js"></script>
   <script src="/static/app.js"></script>
   <script src="/static/pages.js"></script>
 </body>

@@ -41,16 +41,16 @@ function size(n) {
 }
 
 /** 数を3桁区切りにする。 */
-function num(n) { return (n ?? 0).toLocaleString('ja-JP'); }
+function num(n) { return (n ?? 0).toLocaleString(i18n.locale); }
 
 /** 秒数を「1時間2分」「3分4秒」の形にする。 */
 function dur(sec) {
   if (sec === null || sec === undefined || !isFinite(sec)) return '-';
   sec = Math.max(0, Math.round(sec));
   const hh = Math.floor(sec / 3600), mm = Math.floor(sec % 3600 / 60), ss = sec % 60;
-  if (hh) return `${hh}時間${mm}分`;
-  if (mm) return `${mm}分${ss}秒`;
-  return `${ss}秒`;
+  if (hh) return t('{h}時間{m}分', { h: hh, m: mm });
+  if (mm) return t('{m}分{s}秒', { m: mm, s: ss });
+  return t('{s}秒', { s: ss });
 }
 
 /** ISO 8601 の日時を、手元の時刻で読みやすくする。 */
@@ -58,7 +58,7 @@ function when(iso) {
   if (!iso) return '-';
   const d = new Date(iso);
   if (isNaN(d)) return iso;
-  return d.toLocaleString('ja-JP', { dateStyle: 'medium', timeStyle: 'short' });
+  return d.toLocaleString(i18n.locale, { dateStyle: 'medium', timeStyle: 'short' });
 }
 
 /** API を呼ぶ。失敗したらサーバーのメッセージ付きで例外を投げる。 */
@@ -113,7 +113,7 @@ function syncBadge(sync) {
   if (!sync) return null;
   if (sync.error) return h('span', { class: 'badge danger' }, `同期: 状態を読めません`);
   const map = { active: ['同期: 稼働中', 'ok'], inactive: ['同期: 停止中', 'warn'], failed: ['同期: 失敗', 'danger'] };
-  const [label, kind] = map[sync.state] || [`同期: ${sync.state}`, 'warn'];
+  const [label, kind] = map[sync.state] || [t('同期: {state}', { state: sync.state }), 'warn'];
   return h('span', { class: `badge ${kind}` }, label);
 }
 
@@ -141,7 +141,7 @@ function renderAlerts() {
     if (p.sync_paused === null || p.sync_paused === undefined) continue;
     holder.append(h('div', { class: 'alert danger sticky-alert' },
       h('strong', {}, '常駐の同期が止まったままです'),
-      h('p', {}, `プラン ${p.id} の削除をクラウドに反映できていません。`, p.sync_paused ? `理由: ${p.sync_paused}` : ''),
+      h('p', {}, t('プラン {id} の削除をクラウドに反映できていません。', { id: p.id }), ' ', p.sync_paused ? t('理由: {reason}', { reason: p.sync_paused }) : ''),
       h('a', { href: `#/plans/${p.id}` }, 'プランを開いて再試行する')));
   }
 }
@@ -183,8 +183,8 @@ async function pollJob() {
 }
 
 async function onJobFinished(job) {
-  if (job.status === 'failed') toast(`失敗しました: ${job.title}: ${job.error}`, 'danger');
-  else toast(`終わりました: ${job.title}`, 'info');
+  if (job.status === 'failed') toast(t('失敗しました: {title}: {error}', { title: translateString(job.title), error: translateString(job.error || '') }), 'danger');
+  else toast(t('終わりました: {title}', { title: translateString(job.title) }), 'info');
   if (job.kind === 'check' && job.result) app.checks[job.result.plan_id] = job.result.problems;
   await refreshState();
   if (job.kind === 'plan' && job.status === 'done' && job.result) {
@@ -210,22 +210,22 @@ function renderJob() {
   const figures = [];
   if (cur) {
     const isBytes = cur.unit === 'B';
-    const fmt = (v) => (isBytes ? size(v) : `${num(v)} ${cur.unit}`);
+    const fmt = (v) => (isBytes ? size(v) : `${num(v)} ${t(cur.unit)}`);
     if (cur.total) {
       const pct = Math.min(100, (cur.done / cur.total) * 100);
       bar = h('div', { class: 'bar' }, h('div', { style: `width:${pct.toFixed(1)}%` }));
-      figures.push(h('span', {}, `${fmt(cur.done)} / ${fmt(cur.total)}（${pct.toFixed(1)}%）`));
+      figures.push(h('span', {}, t('{done} / {total}（{pct}%）', { done: fmt(cur.done), total: fmt(cur.total), pct: pct.toFixed(1) })));
     } else if (job.status === 'running') {
       bar = h('div', { class: 'bar indeterminate' }, h('div'));
       if (cur.done) figures.push(h('span', {}, fmt(cur.done)));
     }
-    if (cur.rate > 0 && job.status === 'running') figures.push(h('span', {}, `速さ ${isBytes ? size(cur.rate) : num(Math.round(cur.rate)) + ' ' + cur.unit}/秒`));
-    if (cur.eta !== null && cur.eta !== undefined && job.status === 'running') figures.push(h('span', {}, `残り ${dur(cur.eta)}`));
+    if (cur.rate > 0 && job.status === 'running') figures.push(h('span', {}, t('速さ {rate}/秒', { rate: isBytes ? size(cur.rate) : num(Math.round(cur.rate)) + ' ' + t(cur.unit) })));
+    if (cur.eta !== null && cur.eta !== undefined && job.status === 'running') figures.push(h('span', {}, t('残り {eta}', { eta: dur(cur.eta) })));
   }
-  figures.push(h('span', { class: 'muted' }, `経過 ${dur(job.elapsed)}`));
+  figures.push(h('span', { class: 'muted' }, t('経過 {elapsed}', { elapsed: dur(job.elapsed) })));
 
   const lines = h('pre', {}, (job.lines || []).join('\n'));
-  const details = h('details', {}, h('summary', { class: 'muted' }, `ログ（${job.log_file || ''}）`), lines);
+  const details = h('details', {}, h('summary', { class: 'muted' }, t('ログ（{file}）', { file: job.log_file || '' })), lines);
   if (job.status === 'failed') details.open = true;
 
   setChildren(holder, 
@@ -265,8 +265,8 @@ async function pageRoots(main) {
         scan.status === 'held' ? stat('状態', h('span', { class: 'badge warn' }, '消失の確定を保留')) : null,
       ) : h('p', { class: 'muted' }, 'まだ走査していません。'),
       r.sync && !r.sync.error ? h('p', { class: 'muted' },
-        `同期クライアント: ${r.sync.client}（${r.sync.service}）。子が ${num(r.sync.threshold)} 件以上のフォルダを消すときは、`
-        + '同期を一時停止して削除を反映してから再開します。') : null,
+        t('同期クライアント: {client}（{service}）。子が {n} 件以上のフォルダを消すときは、同期を一時停止して削除を反映してから再開します。',
+          { client: r.sync.client, service: r.sync.service, n: num(r.sync.threshold) })) : null,
       h('div', { class: 'buttons' },
         h('button', { class: 'primary', disabled: jobRunning(), onclick: () => startJob(`/api/roots/${enc(r.name)}/refresh`) }, '最新にする（走査＋ハッシュ）'),
         h('button', { disabled: jobRunning(), onclick: () => startJob(`/api/roots/${enc(r.name)}/scan`) }, '走査だけ'),
@@ -276,9 +276,9 @@ async function pageRoots(main) {
   setChildren(main, 
     h('h1', {}, 'ルート'),
     st.roots.length ? null : h('div', { class: 'alert warn' },
-      `設定ファイル（${st.config_path}）に [[roots]] がありません。`),
+      t('設定ファイル（{path}）に [[roots]] がありません。', { path: st.config_path })),
     ...cards,
-    h('p', { class: 'muted' }, `設定: ${st.config_path} ／ 隔離先: ${st.quarantine_dir} ／ スナップショット: ${st.snapper_config || '撮らない'} ／ v${st.version}`),
+    h('p', { class: 'muted' }, t('設定: {config} ／ 隔離先: {quarantine} ／ スナップショット: {snapper} ／ v{version}', { config: st.config_path, quarantine: st.quarantine_dir, snapper: st.snapper_config || t('撮らない'), version: st.version })),
   );
 }
 
@@ -302,14 +302,14 @@ async function pageReport(main, root) {
   const checks = cats.map((c) => {
     const items = byCat[c].filter((f) => !f.needs_review);
     const box = h('input', { type: 'checkbox', checked: true, value: r.category_keys[c] });
-    return { box, label: h('label', {}, box, `${c}（${num(items.length)} 件、${size(sum(items, 'size'))}）`) };
+    return { box, label: h('label', {}, box, t('{cat}（{n} 件、{size}）', { cat: translateString(c), n: num(items.length), size: size(sum(items, 'size')) })) };
   });
   const reviewBox = h('input', { type: 'checkbox' });
   const form = h('section', { class: 'card' },
     h('h2', {}, 'プランを作る'),
     h('p', { class: 'muted' }, '選んだカテゴリの候補を、隔離するプランにまとめます。作った後に1件ずつ外せます。ファイルはまだ動きません。'),
     h('div', { class: 'form-grid' }, checks.map((c) => c.label)),
-    review.length ? h('label', {}, reviewBox, ` 中身の確認が要る候補（${num(review.length)} 件）も含める`) : null,
+    review.length ? h('label', {}, reviewBox, ' ' + t('中身の確認が要る候補（{n} 件）も含める', { n: num(review.length) })) : null,
     h('div', { class: 'buttons', style: 'margin-top:.75rem' },
       h('button', {
         class: 'primary', disabled: jobRunning(), onclick: () => {
@@ -323,13 +323,13 @@ async function pageReport(main, root) {
     const items = [...byCat[c]].sort((a, b) => b.size - a.size);
     return h('details', { class: 'group' },
       h('summary', {}, h('span', { class: 'title' }, c),
-        h('span', { class: 'muted' }, `${num(items.length)} 件・ファイル ${num(sum(items, 'files'))}・${size(sum(items, 'size'))}`)),
+        h('span', { class: 'muted' }, t('{n} 件・ファイル {files}・{size}', { n: num(items.length), files: num(sum(items, 'files')), size: size(sum(items, 'size')) }))),
       h('div', { class: 'body table-wrap' }, findingTable(items)));
   });
 
   const dup = r.duplicates.length ? h('details', { class: 'group' },
     h('summary', {}, h('span', { class: 'title' }, '内容が同じファイル'),
-      h('span', { class: 'muted' }, `${num(r.duplicate_groups)} 組・余分な容量 ${size(r.duplicate_waste)}（上位 ${num(r.duplicates.length)} 組を表示）`)),
+      h('span', { class: 'muted' }, t('{n} 組・余分な容量 {waste}（上位 {top} 組を表示）', { n: num(r.duplicate_groups), waste: size(r.duplicate_waste), top: num(r.duplicates.length) }))),
     h('div', { class: 'body table-wrap' }, h('table', {},
       h('thead', {}, h('tr', {}, h('th', { class: 'num' }, 'サイズ'), h('th', { class: 'num' }, '個数'), h('th', { class: 'num' }, '余分'), h('th', {}, 'パス'))),
       h('tbody', {}, r.duplicates.map((g) => h('tr', {},
@@ -337,11 +337,11 @@ async function pageReport(main, root) {
         h('td', { class: 'num' }, size(g.waste)), h('td', { class: 'path' }, g.paths.map((p) => h('div', {}, p))))))))) : null;
 
   setChildren(main, 
-    h('h1', {}, `レポート: ${root}`),
+    h('h1', {}, t('レポート: {root}', { root })),
     h('div', { class: 'stats' },
       stat('ファイル', num(r.files)), stat('フォルダ', num(r.dirs)), stat('合計', size(r.total_bytes)),
       stat('ハッシュ計算済み', num(r.hashed_files)),
-      stat('候補', `${num(r.findings.length)} 件・${size(sum(r.findings, 'size'))}`)),
+      stat('候補', t('{n} 件・{size}', { n: num(r.findings.length), size: size(sum(r.findings, 'size')) }))),
     form,
     h('h2', {}, '置く価値の薄いものの候補'),
     ...groups,
@@ -355,7 +355,7 @@ function findingTable(items) {
   return h('table', {},
     h('thead', {}, h('tr', {}, h('th', {}, 'パス'), h('th', { class: 'hide-narrow' }, '理由'), h('th', { class: 'num' }, 'ファイル'), h('th', { class: 'num' }, '容量'))),
     h('tbody', {}, items.map((f) => h('tr', {},
-      h('td', { class: 'path' }, f.relpath + (f.is_dir ? '/' : ''), f.needs_review ? [' ', h('span', { class: 'badge warn' }, '要確認')] : null),
+      h('td', { class: 'path' }, f.relpath + (f.is_dir ? '/' : ''), f.needs_review ? [' ', h('span', { class: 'badge warn' }, t('要確認'))] : null),
       h('td', { class: 'hide-narrow muted' }, f.reason),
       h('td', { class: 'num' }, num(f.files)),
       h('td', { class: 'num' }, size(f.size))))));
@@ -371,11 +371,11 @@ async function pagePlans(main) {
     h('td', {}, stateBadge(p.state), p.sync_paused !== null && p.sync_paused !== undefined ? [' ', h('span', { class: 'badge danger' }, '同期停止中')] : null),
     h('td', { class: 'num' }, num(p.ops)),
     h('td', { class: 'num' }, size(p.size)),
-    h('td', { class: 'num hide-narrow' }, p.quarantined ? `${num(p.quarantined)} 件・${size(p.quarantined_size)}` : '-')));
+    h('td', { class: 'num hide-narrow' }, p.quarantined ? t('{n} 件・{size}', { n: num(p.quarantined), size: size(p.quarantined_size) }) : '-')));
   setChildren(main, 
     h('h1', {}, 'プラン'),
     st.plans.length ? h('div', { class: 'card table-wrap' }, h('table', {},
-      h('thead', {}, h('tr', {}, h('th', {}, 'ID'), h('th', {}, 'ルート'), h('th', {}, '状態'), h('th', { class: 'num' }, '件数'), h('th', { class: 'num' }, '容量'), h('th', { class: 'num hide-narrow' }, '隔離中'))),
+      h('thead', {}, h('tr', {}, h('th', {}, 'ID'), h('th', {}, 'ルート名'), h('th', {}, '状態'), h('th', { class: 'num' }, '件数'), h('th', { class: 'num' }, '容量'), h('th', { class: 'num hide-narrow' }, '隔離中'))),
       h('tbody', {}, rows)))
       : h('p', { class: 'muted' }, 'まだプランがありません。ルートの「レポートとプランの作成」から作れます。'));
 }
@@ -411,11 +411,11 @@ async function pagePlan(main, id) {
 
   function updateSummary() {
     const sel = selected();
-    selectionEl.textContent = `選択 ${num(sel.length)} / ${num(data.ops.length)} 件・ファイル ${num(sum(sel, 'files'))}・${size(sum(sel, 'size'))}`;
+    selectionEl.textContent = t('選択 {sel} / {all} 件・ファイル {files}・{size}', { sel: num(sel.length), all: num(data.ops.length), files: num(sum(sel, 'files')), size: size(sum(sel, 'size')) });
     setChildren(syncNote, willSync(sel) ? h('div', { class: 'alert info' },
       h('strong', {}, '大量の削除になります。'),
-      ` 実行すると、${data.sync.client} の常駐の同期（${data.sync.service}）を一時停止し、隔離した後に削除をクラウドへ反映してから再開します。`
-      + `${data.sync.client} の大量削除の安全装置（${num(data.sync.threshold)} 件）で同期が止まることはありません。`) : '');
+      ' ' + t('実行すると、{client} の常駐の同期（{service}）を一時停止し、隔離した後に削除をクラウドへ反映してから再開します。{client} の大量削除の安全装置（{n} 件）で同期が止まることはありません。',
+        { client: data.sync.client, service: data.sync.service, n: num(data.sync.threshold) })) : '');
   }
 
   let saveTimer = null;
@@ -423,7 +423,7 @@ async function pagePlan(main, id) {
     clearTimeout(saveTimer);
     saveTimer = setTimeout(async () => {
       try { await api(`/api/plans/${enc(id)}/skips`, { skip: [...skip] }); }
-      catch (e) { toast(`保存できませんでした: ${e.message}`, 'danger'); }
+      catch (e) { toast(t('保存できませんでした: {error}', { error: e.message }), 'danger'); }
     }, 600);
   }
 
@@ -438,8 +438,8 @@ async function pagePlan(main, id) {
     if (op.outcome) {
       const o = op.outcome;
       const map = {
-        quarantine: ['隔離済み', 'ok'], skip: [`飛ばした: ${o.detail}`, 'warn'],
-        restore: ['元に戻した', ''], 'restore-skip': [`戻せなかった: ${o.detail}`, 'danger'],
+        quarantine: ['隔離済み', 'ok'], skip: [t('飛ばした: {detail}', { detail: translateString(o.detail) }), 'warn'],
+        restore: ['元に戻した', ''], 'restore-skip': [t('戻せなかった: {detail}', { detail: translateString(o.detail) }), 'danger'],
       };
       const [label, kind] = map[o.event] || [o.event, ''];
       return h('span', { class: `badge ${kind}` }, label);
@@ -465,7 +465,7 @@ async function pagePlan(main, id) {
       box.indeterminate = on.length > 0 && on.length < all.length;
       const details = h('details', { class: 'group', 'data-cat': c, open: open.has(c) || !!q },
         h('summary', {}, box, h('span', { class: 'title' }, c),
-          h('span', { class: 'muted' }, `${num(on.length)} / ${num(all.length)} 件・${size(sum(on, 'size'))}`)),
+          h('span', { class: 'muted' }, t('{on} / {all} 件・{size}', { on: num(on.length), all: num(all.length), size: size(sum(on, 'size')) }))),
         h('div', { class: 'body table-wrap' }, h('table', {},
           h('thead', {}, h('tr', {}, h('th', {}, ''), h('th', {}, 'パス'), h('th', { class: 'hide-narrow' }, '理由'), h('th', { class: 'num' }, 'ファイル'), h('th', { class: 'num' }, '容量'), h('th', {}, '状態'))),
           h('tbody', {}, items.map((op) => h('tr', { class: skip.has(op.path) ? 'excluded' : '' },
@@ -486,12 +486,12 @@ async function pagePlan(main, id) {
   async function doApply() {
     const sel = selected();
     const body = [
-      h('p', {}, `${num(sel.length)} 件（ファイル ${num(sum(sel, 'files'))}、${size(sum(sel, 'size'))}）を隔離フォルダへ移します。削除はしません。`),
+      h('p', {}, t('{n} 件（ファイル {files}、{size}）を隔離フォルダへ移します。削除はしません。', { n: num(sel.length), files: num(sum(sel, 'files')), size: size(sum(sel, 'size')) })),
       h('ul', {},
-        h('li', {}, `隔離先: ${app.state?.quarantine_dir || ''}/${id}/`),
-        h('li', {}, app.state?.snapper_config ? `実行の前後にスナップショットを撮ります（snapper: ${app.state.snapper_config}）` : 'スナップショットは撮りません'),
+        h('li', {}, t('隔離先: {path}', { path: `${app.state?.quarantine_dir || ''}/${id}/` })),
+        h('li', {}, app.state?.snapper_config ? t('実行の前後にスナップショットを撮ります（snapper: {config}）', { config: app.state.snapper_config }) : 'スナップショットは撮りません'),
         h('li', {}, '移す直前に、プランの作成時から変わったものは飛ばします'),
-        willSync(sel) ? h('li', {}, `${data.sync.client} の常駐の同期を一時停止し、削除をクラウドへ反映してから再開します`) : null,
+        willSync(sel) ? h('li', {}, t('{client} の常駐の同期を一時停止し、削除をクラウドへ反映してから再開します', { client: data.sync.client })) : null,
         h('li', {}, 'クラウドからは消えますが、隔離フォルダを空にするまでこのマシンには残ります。いつでも取り消せます')),
     ];
     if (await confirmDialog('プランを実行しますか？', body, '実行する')) {
@@ -503,7 +503,7 @@ async function pagePlan(main, id) {
 
   async function doUndo() {
     const ok = await confirmDialog('取り消しますか？',
-      h('p', {}, `隔離した ${num(data.restorable)} 件を元の場所へ戻します。元の場所に新しくできたものは上書きしません。戻したものは同期クライアントが再びアップロードします。`),
+      h('p', {}, t('隔離した {n} 件を元の場所へ戻します。元の場所に新しくできたものは上書きしません。戻したものは同期クライアントが再びアップロードします。', { n: num(data.restorable) })),
       '元に戻す');
     if (ok) startJob(`/api/plans/${enc(id)}/undo`);
   }
@@ -526,10 +526,10 @@ async function pagePlan(main, id) {
   const paused = info.sync_paused !== null && info.sync_paused !== undefined;
   const busy = jobRunning();
   setChildren(main, 
-    h('h1', {}, `プラン ${id}`),
+    h('h1', {}, t('プラン {id}', { id })),
     h('div', { class: 'stats' },
-      stat('状態', stateBadge(info.state)), stat('ルート', info.root), stat('作成', when(info.created_at)),
-      info.quarantined ? stat('隔離中', `${num(info.quarantined)} 件・${size(info.quarantined_size)}`) : null),
+      stat('状態', stateBadge(info.state)), stat('ルート名', info.root), stat('作成', when(info.created_at)),
+      info.quarantined ? stat('隔離中', t('{n} 件・{size}', { n: num(info.quarantined), size: size(info.quarantined_size) })) : null),
     h('div', { class: 'muted mono' }, data.root_path),
     paused ? h('div', { class: 'alert danger' },
       h('strong', {}, '削除をクラウドに反映できず、常駐の同期を止めたままです。'),
@@ -540,7 +540,7 @@ async function pagePlan(main, id) {
     h('div', { class: 'buttons', style: 'margin:.75rem 0' },
       editable ? h('button', { disabled: busy, onclick: () => startJob(`/api/plans/${enc(id)}/check`) }, '変わっていないか確認') : null,
       editable ? h('button', { class: 'primary', disabled: busy, onclick: doApply }, '実行する…') : null,
-      data.restorable ? h('button', { disabled: busy, onclick: doUndo }, `取り消す（${num(data.restorable)} 件）…`) : null,
+      data.restorable ? h('button', { disabled: busy, onclick: doUndo }, t('取り消す（{n} 件）…', { n: num(data.restorable) })) : null,
       editable ? h('button', { class: 'secondary', disabled: busy, onclick: doDelete }, 'プランを削除') : null),
     syncNote,
     h('div', { class: 'toolbar' },
@@ -579,4 +579,34 @@ async function route() {
 }
 
 window.addEventListener('hashchange', route);
-window.addEventListener('DOMContentLoaded', () => { route(); pollJob(); });
+/** 画面上部の言語とテーマの切り替え。 */
+function setupTopbarTools() {
+  const lang = document.getElementById('lang-select');
+  lang.value = i18n.lang;
+  // 選択肢は言語名をそれぞれの言葉で出すので自動では訳さない。説明だけをここで付け直す
+  lang.setAttribute('aria-label', t('言語'));
+  lang.addEventListener('change', () => {
+    i18n.set(lang.value);
+    lang.setAttribute('aria-label', t('言語'));
+    showTheme();
+    // t() で組み立てた文は描き直す（固定の文は i18n.set が訳し直す）
+    if (app.render) app.render();
+    renderJob();
+  });
+  const btn = document.getElementById('theme-button');
+  const icons = { auto: '◐', light: '☀', dark: '☾' };
+  const labels = { auto: 'OS に合わせる', light: 'ライト', dark: 'ダーク' };
+  function showTheme() {
+    const mode = theme.current();
+    btn.textContent = icons[mode];
+    btn.title = `${t('テーマ')}: ${t(labels[mode])}`;
+  }
+  btn.addEventListener('click', () => {
+    const modes = theme.modes;
+    theme.apply(modes[(modes.indexOf(theme.current()) + 1) % modes.length]);
+    showTheme();
+  });
+  showTheme();
+}
+
+window.addEventListener('DOMContentLoaded', () => { setupTopbarTools(); route(); pollJob(); });
