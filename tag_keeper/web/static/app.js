@@ -449,12 +449,16 @@ async function pagePlan(main, id) {
     return '';
   }
 
+  // 並べ替え（既定は容量の大きい順。項目と向きはブラウザに覚える）
+  const planSort = sortState('plan', { field: 'size', dir: 'desc' });
+  const planGetters = { path: (o) => o.path, reason: (o) => o.reason, files: (o) => o.files, size: (o) => o.size };
+
   function renderGroups() {
     const open = new Set([...groupsEl.querySelectorAll('details[open]')].map((d) => d.dataset.cat));
     const q = filter.toLowerCase();
     setChildren(groupsEl, ...cats.map((c) => {
       const all = byCat[c];
-      const items = [...all].filter((o) => !q || o.path.toLowerCase().includes(q)).sort((a, b) => b.size - a.size);
+      const items = sortItems([...all].filter((o) => !q || o.path.toLowerCase().includes(q)), planSort, planGetters, (o) => o.path);
       if (!items.length) return null;
       const on = all.filter((o) => !skip.has(o.path));
       const box = h('input', {
@@ -467,7 +471,12 @@ async function pagePlan(main, id) {
         h('summary', {}, box, h('span', { class: 'title' }, c),
           h('span', { class: 'muted' }, t('{on} / {all} 件・{size}', { on: num(on.length), all: num(all.length), size: size(sum(on, 'size')) }))),
         h('div', { class: 'body table-wrap' }, h('table', {},
-          h('thead', {}, h('tr', {}, h('th', {}, ''), h('th', {}, 'パス'), h('th', { class: 'hide-narrow' }, '理由'), h('th', { class: 'num' }, 'ファイル'), h('th', { class: 'num' }, '容量'), h('th', {}, '状態'))),
+          h('thead', {}, h('tr', {}, h('th', {}, ''),
+            sortHeader(t('パス'), 'path', planSort, renderGroups),
+            sortHeader(t('理由'), 'reason', planSort, renderGroups, 'hide-narrow'),
+            sortHeader(t('ファイル数'), 'files', planSort, renderGroups, 'num'),
+            sortHeader(t('容量'), 'size', planSort, renderGroups, 'num'),
+            h('th', {}, '状態'))),
           h('tbody', {}, items.map((op) => h('tr', { class: skip.has(op.path) ? 'excluded' : '' },
             h('td', {}, h('input', {
               type: 'checkbox', disabled: !editable, checked: !skip.has(op.path),

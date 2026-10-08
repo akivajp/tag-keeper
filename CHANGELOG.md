@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-10-08
+
+### Added
+
+- **Resizable panes.** The file browser and the inbox page have a divider between the list
+  and the details; drag it (or use ←→, double-click to reset) and the width is remembered
+  per page in the browser.
+- **Sorting.** File browser columns (name, tags, size, modified) and plan items sort by
+  clicking the header; the inbox list has a sort menu (folder, name, date, size, status).
+  Names sort naturally ("2" before "10"), folders stay first, and the choice is remembered.
+
+### Changed
+
+- Pages use the full width of the window instead of a centered column.
+
 ## [0.2.0] - 2026-10-08
 
 ### Added
@@ -70,7 +85,8 @@ First release. The web UI and messages are in Japanese.
 - **Decision log.** Accepted suggestions, tag accept and reject, and undone plans are
   appended per machine; the closest past decisions are given to the model as examples.
 
-[Unreleased]: https://github.com/akivajp/tag-keeper/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/akivajp/tag-keeper/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/akivajp/tag-keeper/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/akivajp/tag-keeper/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/akivajp/tag-keeper/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/akivajp/tag-keeper/releases/tag/v0.1.0

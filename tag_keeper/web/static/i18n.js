@@ -108,6 +108,12 @@ const I18N_EN = {
     'Items whose destination already exists, or that changed after you picked them, are skipped. Snapshots are taken before and after, and you can undo from the plan page.',
   'モデル（☁ はクラウドのモデル。ファイルの内容がクラウドに送られる）': 'Model (☁ = cloud model; file contents are sent to the cloud)',
 
+  // --- 配置・並べ替え ---
+  'ドラッグで幅を変える（ダブルクリックで元に戻す）': 'Drag to resize (double-click to reset)', '押すと並べ替え': 'Click to sort',
+  '並べ替え': 'Sort', 'フォルダ順': 'By folder', '名前順': 'By name', '新しい順': 'Newest first', '古い順': 'Oldest first',
+  '大きい順': 'Largest first', '小さい順': 'Smallest first', '提案の無いものから': 'Unsuggested first', '提案のあるものから': 'Suggested first',
+  'ファイル数': 'Files',
+
   // --- 変数を含む文（t() で使う） ---
   '{h}時間{m}分': '{h} h {m} min', '{m}分{s}秒': '{m} min {s} s', '{s}秒': '{s} s',
   '同期: {state}': 'Sync: {state}',

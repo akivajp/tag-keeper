@@ -132,7 +132,8 @@ and the theme (system, light or dark).
 ### Files, tags and history
 
 - **Browse** a root folder by folder, preview PDFs, images, audio, video and text in the
-  page, and download anything. Only types that cannot run scripts open in the page; HTML
+  page, and download anything. Columns sort by clicking the header, and the divider between
+  the list and the preview can be dragged; both are remembered in the browser. Only types that cannot run scripts open in the page; HTML
   and SVG are shown as plain text, everything else downloads. Paths never leave the root,
   symlinks included.
 - **Rename and delete** any file or folder from the browser. Type any name or take the

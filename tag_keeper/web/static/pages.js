@@ -46,6 +46,89 @@ async function editTags(root, paths, tag, op) {
   } catch (e) { toast(e.message, 'danger'); return false; }
 }
 
+// ---------- 左右のペインの境目・並べ替え（ファイルブラウザ・整理・プランで共通） ----------
+
+/** 左右のペイン。境目をドラッグ（または ←→）して幅を変え、画面ごとにブラウザに覚える。 */
+function splitPane(key, left, right, defaultPct = 55) {
+  const storeKey = `tag-keeper-split-${key}`;
+  const clamp = (v) => Math.min(80, Math.max(20, v));
+  let pct = clamp(Number(loadLocal(storeKey, defaultPct)) || defaultPct);
+  const box = h('div', { class: 'browse' });
+  const apply = () => box.style.setProperty('--split', `${pct}%`);
+  const handle = h('div', {
+    class: 'splitter', role: 'separator', tabindex: '0', 'aria-orientation': 'vertical',
+    title: t('ドラッグで幅を変える（ダブルクリックで元に戻す）'),
+  });
+  handle.addEventListener('pointerdown', (e) => {
+    e.preventDefault();
+    handle.setPointerCapture(e.pointerId);
+    handle.classList.add('dragging');
+    document.body.classList.add('resizing');
+    const move = (ev) => {
+      const rect = box.getBoundingClientRect();
+      pct = clamp(((ev.clientX - rect.left) / rect.width) * 100);
+      apply();
+    };
+    const up = () => {
+      handle.removeEventListener('pointermove', move);
+      handle.removeEventListener('pointerup', up);
+      handle.classList.remove('dragging');
+      document.body.classList.remove('resizing');
+      saveLocal(storeKey, Math.round(pct * 10) / 10);
+    };
+    handle.addEventListener('pointermove', move);
+    handle.addEventListener('pointerup', up);
+  });
+  handle.addEventListener('keydown', (e) => {
+    if (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight') return;
+    e.preventDefault();
+    pct = clamp(pct + (e.key === 'ArrowLeft' ? -2 : 2));
+    apply();
+    saveLocal(storeKey, pct);
+  });
+  handle.addEventListener('dblclick', () => { pct = defaultPct; apply(); saveLocal(storeKey, pct); });
+  apply();
+  setChildren(box, left, handle, right);
+  return box;
+}
+
+/** 名前の自然な順（「2」が「10」より前）で比べる。 */
+function naturalCompare(a, b) {
+  return new Intl.Collator(i18n.locale, { numeric: true, sensitivity: 'base' }).compare(a, b);
+}
+
+/** 並べ替えの状態（項目と向き）を、画面ごとにブラウザに覚える。 */
+function sortState(key, def) {
+  const state = loadLocal(`tag-keeper-sort-${key}`, def);
+  return {
+    field: state.field || def.field,
+    dir: state.dir === 'desc' ? 'desc' : state.dir === 'asc' ? 'asc' : def.dir,
+    toggle(field) {
+      if (this.field === field) this.dir = this.dir === 'asc' ? 'desc' : 'asc';
+      else { this.field = field; this.dir = field === 'name' || field === 'path' || field === 'folder' ? 'asc' : 'desc'; }
+      saveLocal(`tag-keeper-sort-${key}`, { field: this.field, dir: this.dir });
+    },
+  };
+}
+
+/** 並べ替えのできる見出し。押すと項目を選び、同じ項目をもう一度押すと向きを変える。 */
+function sortHeader(label, field, state, onChange, cls = '') {
+  const arrow = state.field === field ? (state.dir === 'asc' ? '▲' : '▼') : '';
+  return h('th', { class: `sortable ${cls}`, title: t('押すと並べ替え'), onclick: () => { state.toggle(field); onChange(); } },
+    label, arrow ? h('span', { class: 'arrow' }, arrow) : null);
+}
+
+/** 項目ごとの値の取り出し方で並べ替える（値が同じなら名前の自然な順）。 */
+function sortItems(items, state, getters, nameOf) {
+  const get = getters[state.field] || getters.name;
+  const sign = state.dir === 'asc' ? 1 : -1;
+  return [...items].sort((a, b) => {
+    const va = get(a), vb = get(b);
+    const c = typeof va === 'string' || typeof vb === 'string' ? naturalCompare(String(va ?? ''), String(vb ?? '')) : (va ?? -Infinity) - (vb ?? -Infinity);
+    return c * sign || naturalCompare(nameOf(a), nameOf(b));
+  });
+}
+
 // ---------- 画面: ファイルブラウザ ----------
 
 let snapshotCache = {};
@@ -83,9 +166,30 @@ async function pageBrowse(main, root, path, params) {
     !data.tags.direct.length && !data.tags.inherited.length ? h('span', { class: 'muted' }, 'タグなし') : null);
   const folderTagInput = h('input', { list: 'tag-options', placeholder: 'このフォルダにタグを付ける（配下に継承）', disabled: !live || !path });
 
+  // 並べ替え（フォルダは常に先。項目と向きはブラウザに覚える）
+  const sort = sortState('browse', { field: 'name', dir: 'asc' });
+  const getters = {
+    name: (e) => e.name,
+    tags: (e) => e.tags.length,
+    size: (e) => (e.is_dir ? null : e.size),
+    mtime: (e) => (e.mtime ? Date.parse(e.mtime) : null),
+  };
+  const headRow = h('tr');
+  function renderHead() {
+    setChildren(headRow, h('th', {}, ''),
+      sortHeader(t('名前'), 'name', sort, renderRows),
+      sortHeader(t('タグ'), 'tags', sort, renderRows, 'hide-narrow'),
+      sortHeader(t('サイズ'), 'size', sort, renderRows, 'num'),
+      sortHeader(t('更新日時'), 'mtime', sort, renderRows, 'num hide-narrow'));
+  }
+
   function renderRows() {
+    renderHead();
     const f = filter.toLowerCase();
-    setChildren(tableBody, data.entries.filter((e) => !f || e.name.toLowerCase().includes(f)).map((e) => {
+    const shown = data.entries.filter((e) => !f || e.name.toLowerCase().includes(f));
+    const dirs = sortItems(shown.filter((e) => e.is_dir), sort, getters, (e) => e.name);
+    const files = sortItems(shown.filter((e) => !e.is_dir), sort, getters, (e) => e.name);
+    setChildren(tableBody, [...dirs, ...files].map((e) => {
       const rel = joinPath(path, e.name);
       const box = h('input', {
         type: 'checkbox', disabled: !live, checked: selected.has(rel),
@@ -211,10 +315,8 @@ async function pageBrowse(main, root, path, params) {
         }));
       } }, '削除…'),
       selInfo) : null,
-    h('div', { class: 'browse' },
-      h('div', { class: 'card table-wrap' }, h('table', {},
-        h('thead', {}, h('tr', {}, h('th', {}, ''), h('th', {}, '名前'), h('th', { class: 'hide-narrow' }, 'タグ'), h('th', { class: 'num' }, 'サイズ'), h('th', { class: 'num hide-narrow' }, '更新日時'))),
-        tableBody)),
+    splitPane('browse',
+      h('div', { class: 'card table-wrap' }, h('table', {}, h('thead', {}, headRow), tableBody)),
       detail));
   renderRows();
 }
@@ -583,11 +685,30 @@ async function pageOrganize(main, root) {
   const side = h('aside', { class: 'detail' }, h('p', { class: 'muted' }, '左の一覧からファイルを選ぶと、プレビューと提案（名前・移動先・タグ）を表示します。↑↓ か j / k で移動、名前の欄で Enter を押すと採用して次へ進みます。'));
   const bar = cartBar(root, () => renderList());
 
+  // 並べ替え（項目と向きはブラウザに覚える）
+  const sort = sortState('organize', { field: 'folder', dir: 'asc' });
+  const getters = {
+    name: (x) => x.path.split('/').pop(),
+    folder: (x) => x.path,
+    size: (x) => x.size,
+    mtime: (x) => x.mtime,
+    status: (x) => (cart.items(root)[x.path] ? 2 : x.suggestion ? 1 : 0),
+  };
+
   function visible() {
     const f = filter.toLowerCase();
     const inCart = cart.items(root);
-    return files.filter((x) => (!f || x.path.toLowerCase().includes(f)) && !(opts.hideDone && inCart[x.path]));
+    const shown = files.filter((x) => (!f || x.path.toLowerCase().includes(f)) && !(opts.hideDone && inCart[x.path]));
+    return sortItems(shown, sort, getters, (x) => x.path);
   }
+
+  const sortSelect = h('select', {
+    title: t('並べ替え'),
+    onchange: (e) => { const [field, dir] = e.target.value.split(':'); sort.field = field; sort.dir = dir; saveLocal('tag-keeper-sort-organize', { field, dir }); renderList(); },
+  }, [
+    ['folder:asc', 'フォルダ順'], ['name:asc', '名前順'], ['mtime:desc', '新しい順'], ['mtime:asc', '古い順'],
+    ['size:desc', '大きい順'], ['size:asc', '小さい順'], ['status:asc', '提案の無いものから'], ['status:desc', '提案のあるものから'],
+  ].map(([v, label]) => h('option', { value: v, selected: v === `${sort.field}:${sort.dir}` }, t(label))));
 
   function status(f) {
     if (cart.items(root)[f.path]) return h('span', { class: 'badge ok' }, '採用リスト');
@@ -673,12 +794,13 @@ async function pageOrganize(main, root) {
     h('div', { class: 'toolbar' },
       h('input', { type: 'search', placeholder: '名前やフォルダで絞り込む', oninput: (e) => { filter = e.target.value; renderList(); } }),
       await modelSelect(() => app.render()),
+      sortSelect,
       toggle('auto', '選んだら提案を出す'), toggle('prefetch', '次の2件を先読み'), toggle('hideDone', '採用したものを隠す'),
       h('button', { disabled: jobRunning() || !pending, title: '裏でまとめて作る（時間がかかります）', onclick: () => startJob(`/api/organize/${enc(root)}/suggest`, { model: models.current() }) }, t('残り {n} 件をまとめて提案', { n: num(pending) }))),
     bar.el,
-    h('div', { class: 'browse' },
+    splitPane('organize',
       h('div', { class: 'card table-wrap list' }, h('table', { class: 'flat' }, listBody)),
-      side));
+      side, 45));
   renderList();
 }
 

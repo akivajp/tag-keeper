@@ -79,8 +79,9 @@ h2 { font-size: 1.1rem; margin: 1.5rem 0 .5rem; }
 .topbar nav a { text-decoration: none; color: var(--muted); }
 .topbar nav a.active { color: var(--text); font-weight: 600; }
 
-main { max-width: 1100px; margin: 0 auto; padding: 1rem; }
-#alerts { max-width: 1100px; margin: 0 auto; padding: 0 1rem; }
+/* 幅の上限を設けず、広い画面では一覧とプレビューを大きく使う */
+main { padding: 1rem 1.5rem; }
+#alerts { padding: 0 1.5rem; }
 
 .card {
   background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
@@ -194,7 +195,8 @@ h3 { font-size: 1rem; margin: 1.1rem 0 .4rem; }
 /* ファイルブラウザ（一覧と詳細の2段組み） */
 .crumbs { font-size: 1.05rem; margin: .25rem 0 .5rem; word-break: break-all; }
 .folder-tags { display: flex; flex-wrap: wrap; align-items: center; gap: .4rem; padding: .6rem .9rem; }
-.browse { display: grid; grid-template-columns: minmax(0, 3fr) minmax(0, 2fr); gap: 1rem; align-items: start; }
+/* 左右の幅は、境目（.splitter）をドラッグして変えられる（--split が左の割合） */
+.browse { display: grid; grid-template-columns: minmax(0, var(--split, 55%)) 14px minmax(0, 1fr); align-items: start; }
 .browse > .card { margin: 0; }
 .detail {
   position: sticky; top: 3.5rem; background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
@@ -206,7 +208,8 @@ h3 { font-size: 1rem; margin: 1.1rem 0 .4rem; }
 pre.preview.text { white-space: pre-wrap; word-break: break-all; max-height: 50vh; overflow: auto; padding: .5rem; font-size: .8rem; }
 tr.gone td { color: var(--muted); }
 @media (max-width: 900px) {
-  .browse { grid-template-columns: 1fr; }
+  .browse { grid-template-columns: 1fr; gap: 1rem; }
+  .splitter { display: none; }
   .detail { position: static; max-height: none; }
 }
 
@@ -242,3 +245,18 @@ button.danger-outline { border-color: var(--danger); color: var(--danger); }
 .topbar-tools { margin-left: auto; display: flex; gap: .5rem; align-items: center; }
 .topbar-tools select { padding: .2rem .4rem; font-size: .85rem; }
 button.icon { padding: .2rem .55rem; font-size: 1rem; line-height: 1.2; }
+
+/* 左右のペインの境目 */
+.splitter {
+  align-self: stretch; cursor: col-resize; display: flex; justify-content: center; touch-action: none;
+  min-height: 4rem; outline: none;
+}
+.splitter::before { content: ""; width: 4px; border-radius: 2px; background: var(--line); transition: background .15s; }
+.splitter:hover::before, .splitter:focus-visible::before, .splitter.dragging::before { background: var(--accent); }
+body.resizing { cursor: col-resize; user-select: none; }
+body.resizing iframe { pointer-events: none; }
+
+/* 並べ替えのできる見出し */
+th.sortable { cursor: pointer; user-select: none; }
+th.sortable:hover { color: var(--text); }
+th.sortable .arrow { margin-left: .25rem; color: var(--accent); }
