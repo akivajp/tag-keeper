@@ -76,3 +76,29 @@ def test_broken_line_is_skipped(tmp_path: Path) -> None:
     with (tmp_path / "tags" / "other.jsonl").open("w", encoding="utf-8") as f:
         f.write('{"at": "2099", "op": "add", "root": "r", "path": "b.pdf", "tag": "y"}\n{"at": "20')
     assert TagStore(tmp_path / "tags", host="a").tags_of("r", "b.pdf")["direct"][0]["tag"] == "y"
+
+
+def test_rename_merges_and_delete(tmp_path: Path) -> None:
+    store = TagStore(tmp_path / "tags", host="a")
+    store.add("r", ["a.pdf", "b.pdf"], "会社:ATID")
+    store.add("r", ["b.pdf"], "会社:アティード")
+    store.add("s", ["c.pdf"], "会社:ATID")
+    assert store.rename_tag("会社:ATID", "会社:アティード") == 3  # 全ルート
+    assert store.all_tags() == {"会社:アティード": 3}  # b.pdf では1つにまとめる
+    assert store.rename_tag("無い", "x") == 0
+    assert store.delete_tag("会社:アティード") == 3
+    assert store.all_tags() == {}
+    # ログから読み直しても同じ
+    assert TagStore(tmp_path / "tags", host="a").all_tags() == {}
+
+
+def test_search_with_inheritance() -> None:
+    from tag_keeper.tags import search
+
+    tagged = {"area:finance": {"Finance"}, "type:invoice": {"Finance/Invoices", "Inbox/x.pdf"}, "draft": {"Finance/Invoices/old.pdf"}}
+    entries = [(p, False) for p in ["Finance/Invoices/a.pdf", "Finance/Invoices/old.pdf", "Finance/Receipts/r.pdf", "Inbox/x.pdf", "Inbox/y.pdf"]]
+    assert search(entries, tagged, ["area:finance", "type:invoice"], "and") == ["Finance/Invoices/a.pdf", "Finance/Invoices/old.pdf"]
+    assert search(entries, tagged, ["area:finance", "type:invoice"], "or") == [p for p, _ in entries if p != "Inbox/y.pdf"]
+    assert search(entries, tagged, ["type:invoice"], "and", ["draft"]) == ["Finance/Invoices/a.pdf", "Inbox/x.pdf"]
+    assert search(entries, tagged, [], "and", ["area:finance"]) == ["Inbox/x.pdf", "Inbox/y.pdf"]
+    assert search(entries, tagged, ["無い"], "and") == []

@@ -567,27 +567,164 @@ function preview(url, name, bytes, ctx = null) {
   return h('p', { class: 'muted' }, 'この種類はプレビューできません。');
 }
 
-// ---------- 画面: タグ ----------
+// ---------- 画面: タグ（一覧・名前の変更・削除・複数のタグでの検索） ----------
 
-async function pageTags(main, tag) {
+async function pageTags(main, params) {
+  // 検索の条件は URL に持つ（#/tags?t=含むタグ&not=除くタグ&mode=and|or&q=名前&folders=1）
+  const state = {
+    include: params.getAll('t'),
+    exclude: params.getAll('not'),
+    mode: params.get('mode') === 'or' ? 'or' : 'and',
+    q: params.get('q') || '',
+    folders: params.get('folders') === '1',
+  };
+  const go = () => {
+    const q = new URLSearchParams();
+    state.include.forEach((x) => q.append('t', x));
+    state.exclude.forEach((x) => q.append('not', x));
+    if (state.mode === 'or') q.set('mode', 'or');
+    if (state.q) q.set('q', state.q);
+    if (state.folders) q.set('folders', '1');
+    location.hash = `#/tags${q.toString() ? '?' + q : ''}`;
+  };
+  const root = await firstRoot();
   const { tags } = await api('/api/tags');
-  const list = h('div', { class: 'chips big' }, tags.length
-    ? tags.map((tg) => h('a', { class: `chip ${tg.tag === tag ? 'active' : ''}`, href: `#/tags?tag=${enc(tg.tag)}` }, `${tg.tag}（${tg.count}）`))
-    : h('span', { class: 'muted' }, 'まだタグがありません。「ファイル」の画面で、ファイルやフォルダに付けられます。'));
-  let items = null;
-  if (tag) {
-    const r = await api(`/api/tags/items?tag=${enc(tag)}`);
-    items = h('div', { class: 'card table-wrap' }, h('h2', {}, t('「{tag}」が付いたもの', { tag })),
-      h('p', { class: 'muted' }, 'フォルダに付いたものは、その配下のすべてが対象です。'),
-      h('table', {}, h('tbody', {}, r.items.map((it) => {
-        const dir = it.is_dir ? it.path : it.path.split('/').slice(0, -1).join('/');
-        return h('tr', {},
-          h('td', { class: 'path' }, h('a', { href: browseHref(it.root, dir) }, it.is_dir ? '📁 ' : fileIcon(it.path) + ' ', it.path || it.root),
-            it.exists ? null : [' ', h('span', { class: 'badge danger' }, '見つからない')]),
-          h('td', { class: 'muted' }, it.root));
-      }))));
+  let filter = '';
+  const listEl = h('div', { class: 'tag-list' });
+
+  function toggle(list, tag) {
+    const i = list.indexOf(tag);
+    if (i >= 0) list.splice(i, 1); else list.push(tag);
   }
-  setChildren(main, h('h1', {}, 'タグ'), list, items);
+
+  async function renameTag(tag) {
+    const input = h('input', { class: 'name-input', value: tag, list: 'tag-options' });
+    input.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); document.getElementById('confirm').close('ok'); } });
+    setTimeout(() => { input.focus(); input.select(); }, 50);
+    const ok = await confirmDialog(t('タグの名前を変える'), [
+      h('p', { class: 'muted' }, t('「{tag}」が付いたすべてのファイル・フォルダで名前を変えます。', { tag })),
+      input,
+      h('p', { class: 'muted small' }, t('既にあるタグの名前にすると、2つのタグを1つにまとめます。')),
+    ], t('名前を変える'));
+    const to = input.value.trim();
+    if (!ok || !to || to === tag) return;
+    try {
+      const r = await api('/api/tags/rename', { from: tag, to });
+      toast(t('「{from}」を「{to}」に変えました（{n} 件）', { from: tag, to, n: r.changed }));
+      state.include = state.include.map((x) => (x === tag ? to : x));
+      state.exclude = state.exclude.map((x) => (x === tag ? to : x));
+      go();
+      app.render();
+    } catch (e) { toast(e.message, 'danger'); }
+  }
+
+  async function deleteTag(tag, count) {
+    const ok = await confirmDialog(t('タグを削除しますか？'),
+      h('p', {}, t('「{tag}」を、付いている {n} 件のファイル・フォルダから外します。ファイル自体には何もしません。', { tag, n: count })), t('削除する'), true);
+    if (!ok) return;
+    try {
+      await api('/api/tags/delete', { tag });
+      state.include = state.include.filter((x) => x !== tag);
+      state.exclude = state.exclude.filter((x) => x !== tag);
+      go();
+      app.render();
+    } catch (e) { toast(e.message, 'danger'); }
+  }
+
+  // 名前空間（「種別:請求書」の「種別」）ごとにまとめる
+  function renderList() {
+    const f = filter.toLowerCase();
+    const shown = tags.filter((x) => !f || x.tag.toLowerCase().includes(f));
+    const groups = new Map();
+    for (const x of shown) {
+      const ns = x.tag.includes(':') ? x.tag.split(':')[0] : '';
+      if (!groups.has(ns)) groups.set(ns, []);
+      groups.get(ns).push(x);
+    }
+    const names = [...groups.keys()].sort((a, b) => (a === '') - (b === '') || naturalCompare(a, b));
+    setChildren(listEl, shown.length ? names.map((ns) => h('div', { class: 'tag-group' },
+      h('div', { class: 'tag-ns muted small', translate: 'no' }, ns ? `${ns}:` : t('名前空間なし')),
+      groups.get(ns).sort((a, b) => naturalCompare(a.tag, b.tag)).map((x) => {
+        const inc = state.include.includes(x.tag);
+        const exc = state.exclude.includes(x.tag);
+        return h('div', { class: `tag-row ${inc ? 'included' : ''} ${exc ? 'excluded' : ''}` },
+          h('button', { class: 'tag-pick', title: t('検索に含める'), onclick: () => { toggle(state.include, x.tag); state.exclude = state.exclude.filter((y) => y !== x.tag); go(); } },
+            h('span', { class: 'mark' }, inc ? '✓' : exc ? '⊘' : '＋'),
+            h('span', { class: 'tag-name', translate: 'no' }, ns ? x.tag.slice(ns.length + 1) : x.tag)),
+          h('span', { class: 'muted small num' }, num(x.count)),
+          h('button', { class: 'chip-x', title: t('検索から除く'), onclick: () => { toggle(state.exclude, x.tag); state.include = state.include.filter((y) => y !== x.tag); go(); } }, '⊘'),
+          h('button', { class: 'chip-x', title: t('名前を変える…'), onclick: () => renameTag(x.tag) }, '✎'),
+          h('button', { class: 'chip-x', title: t('タグを削除'), onclick: () => deleteTag(x.tag, x.count) }, '🗑'));
+      }))) : h('p', { class: 'muted' }, tags.length ? t('当てはまるタグがありません。') : t('まだタグがありません。「ファイル」の画面で、ファイルやフォルダに付けられます。')));
+  }
+
+  const left = h('div', { class: 'card' },
+    h('input', { type: 'search', placeholder: t('タグを探す'), oninput: (e) => { filter = e.target.value; renderList(); } }),
+    h('p', { class: 'muted small' }, t('＋ で検索に含め、⊘ で除きます。件数は直接付いている数です。')),
+    listEl);
+  renderList();
+
+  // 右: 選んだタグでの検索結果と、選んだファイルの詳細
+  const right = h('div', {}, h('p', { class: 'muted' }, t('左の一覧からタグを選ぶと、そのタグの付いたファイルを探します。フォルダに付いたタグは、中のファイルにも効きます。')));
+  if (state.include.length || state.exclude.length) {
+    const q = new URLSearchParams({ root, mode: state.mode });
+    state.include.forEach((x) => q.append('tag', x));
+    state.exclude.forEach((x) => q.append('not', x));
+    if (state.q) q.set('q', state.q);
+    if (state.folders) q.set('folders', '1');
+    let res;
+    try { res = await api(`/api/tags/search?${q}`); } catch (e) { res = null; setChildren(right, h('div', { class: 'alert danger' }, e.message)); }
+    if (res) {
+      const sort = sortState('tag-search', { field: 'path', dir: 'asc' });
+      const getters = { name: (x) => x.path.split('/').pop(), path: (x) => x.path, size: (x) => (x.is_dir ? null : x.size), mtime: (x) => x.mtime };
+      const body = h('tbody');
+      const detail = h('div', { class: 'tag-detail' });
+      const head = h('tr');
+      const renderRows = () => {
+        setChildren(head, sortHeader(t('名前'), 'name', sort, renderRows), sortHeader(t('場所'), 'path', sort, renderRows, 'hide-narrow'),
+          h('th', {}, t('タグ')), sortHeader(t('サイズ'), 'size', sort, renderRows, 'num'), sortHeader(t('更新日時'), 'mtime', sort, renderRows, 'num hide-narrow'));
+        setChildren(body, sortItems(res.items, sort, getters, (x) => x.path).map((x) => {
+          const name = x.path.split('/').pop();
+          const dir = x.path.split('/').slice(0, -1).join('/');
+          return h('tr', { class: 'clickable', onclick: () => showDetail(x) },
+            h('td', { class: 'path' }, x.is_dir ? '📁 ' : `${fileIcon(name)} `, name),
+            h('td', { class: 'path muted hide-narrow' }, h('a', { href: browseHref(root, x.is_dir ? x.path : dir), onclick: (e) => e.stopPropagation() }, dir || '/')),
+            h('td', {}, h('div', { class: 'chips' },
+              x.tags.direct.map((tg) => h('span', { class: 'chip' }, tg.tag)),
+              x.tags.inherited.map((tg) => h('span', { class: 'chip inherited', title: t('{from} から継承', { from: tg.from || root }) }, tg.tag)))),
+            h('td', { class: 'num' }, x.is_dir ? '' : size(x.size)),
+            h('td', { class: 'num hide-narrow' }, when(new Date(x.mtime * 1000).toISOString())));
+        }));
+      };
+      const showDetail = (x) => {
+        const name = x.path.split('/').pop();
+        setChildren(detail, h('div', { class: 'card' },
+          h('h2', { class: 'path' }, name), h('div', { class: 'muted mono' }, x.path),
+          h('div', { class: 'buttons' },
+            h('a', { class: 'button small', href: browseHref(root, x.is_dir ? x.path : x.path.split('/').slice(0, -1).join('/')) }, t('フォルダを開く')),
+            x.is_dir ? null : h('a', { class: 'button small', href: fileUrl(root, x.path), target: '_blank', rel: 'noopener' }, t('新しいタブで開く'))),
+          x.is_dir ? null : preview(fileUrl(root, x.path), name, x.size, { root, path: x.path })));
+        detail.scrollIntoView({ block: 'nearest' });
+      };
+      renderRows();
+      const chipsOf = (list, cls) => list.map((x) => h('span', { class: `chip ${cls}`, translate: 'no' }, x));
+      setChildren(right,
+        h('div', { class: 'toolbar' },
+          h('div', { class: 'chips' }, chipsOf(state.include, 'active'), state.exclude.length ? [h('span', { class: 'muted small' }, t('除外:')), chipsOf(state.exclude, 'excluded-chip')] : null),
+          state.include.length > 1 ? h('select', { onchange: (e) => { state.mode = e.target.value; go(); } },
+            h('option', { value: 'and', selected: state.mode === 'and' }, t('すべて含む（AND）')),
+            h('option', { value: 'or', selected: state.mode === 'or' }, t('どれかを含む（OR）'))) : null,
+          h('input', { type: 'search', placeholder: t('名前やフォルダで絞り込む'), value: state.q, onchange: (e) => { state.q = e.target.value.trim(); go(); } }),
+          h('label', { class: 'small' }, h('input', { type: 'checkbox', checked: state.folders, onchange: (e) => { state.folders = e.target.checked; go(); } }), ' ', t('フォルダも出す')),
+          h('button', { class: 'small', onclick: () => { state.include = []; state.exclude = []; state.q = ''; go(); } }, t('条件を消す'))),
+        h('p', { class: 'muted small' }, res.total > res.items.length
+          ? t('{total} 件のうち {n} 件を表示', { total: num(res.total), n: num(res.items.length) })
+          : t('{n} 件', { n: num(res.total) })),
+        detail,
+        h('div', { class: 'card table-wrap' }, h('table', {}, h('thead', {}, head), body)));
+    }
+  }
+  setChildren(main, await tagDatalist(), h('h1', {}, t('タグ')), splitPane('tags', left, right, 30));
 }
 
 // ---------- 整理の提案の部品（受け皿の一覧とファイルブラウザで共通） ----------

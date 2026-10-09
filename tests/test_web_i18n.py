@@ -91,3 +91,14 @@ def test_translation_in_node(tmp_path: Path) -> None:
     assert out["regen"] == "node_modules can be rebuilt"
     assert out["prefixed"] == "Not found: a/b.pdf"
     assert out["untouched"] == "利用者のフォルダ名"  # 辞書に無い文は日本語のまま
+
+
+def test_badges_inside_paths_are_translated() -> None:
+    """ファイル名の欄の中の札（受け皿・今は無い など）も訳す。札の文は辞書にある。"""
+    src = (STATIC / "i18n.js").read_text(encoding="utf-8")
+    assert "const I18N_ALWAYS = '.badge';" in src
+    keys = dictionary_keys()
+    pages = (STATIC / "pages.js").read_text(encoding="utf-8") + (STATIC / "app.js").read_text(encoding="utf-8")
+    for m in re.finditer(r"class: 'badge[^']*' \}, '([^']+)'\)", pages):
+        if re.search(r"[\u3040-\u30ff\u4e00-\u9fff]", m.group(1)):
+            assert m.group(1) in keys, m.group(1)

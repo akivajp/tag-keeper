@@ -575,7 +575,7 @@ async function route() {
   let render;
   if (parts[0] === 'browse') render = () => pageBrowse(main, parts[1], parts.slice(2).join('/'), params);
   else if (parts[0] === 'organize') render = () => pageOrganize(main, parts[1]);
-  else if (parts[0] === 'tags') render = () => pageTags(main, params.get('tag'));
+  else if (parts[0] === 'tags') render = () => pageTags(main, params);
   else if (parts[0] === 'report' && parts[1]) render = () => pageReport(main, parts[1]);
   else if (parts[0] === 'plans' && parts[1]) render = () => pagePlan(main, parts[1]);
   else if (parts[0] === 'plans') render = () => pagePlans(main);

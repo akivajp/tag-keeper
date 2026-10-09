@@ -284,3 +284,20 @@ th.sortable .arrow { margin-left: .25rem; color: var(--accent); }
 .slide ul { margin: .2rem 0; padding-left: 1.2rem; }
 .doc-image { display: block; max-width: 100%; margin: .4rem 0; border-radius: 4px; }
 .sheet td { min-width: 5rem; max-width: 26rem; }
+
+/* タグの画面 */
+.tag-list { max-height: calc(100vh - 16rem); overflow-y: auto; margin-top: .5rem; }
+.tag-group { margin-bottom: .6rem; }
+.tag-ns { margin: .3rem 0 .15rem; font-weight: 600; }
+.tag-row { display: flex; align-items: center; gap: .3rem; padding: .1rem .2rem; border-radius: 6px; }
+.tag-row:hover { background: var(--bg); }
+.tag-row.included { background: var(--ok-bg); }
+.tag-row.excluded { background: var(--danger-bg); }
+.tag-pick { flex: 1 1 auto; text-align: left; border: 0; background: transparent; padding: .15rem .2rem; display: flex; gap: .4rem; }
+.tag-pick .mark { width: 1rem; color: var(--accent); }
+.tag-row.excluded .mark { color: var(--danger); }
+.chip.excluded-chip { border: 1px solid var(--danger); color: var(--danger); background: transparent; }
+tr.clickable { cursor: pointer; }
+tr.clickable:hover td { background: var(--bg); }
+.tag-detail .card { margin-top: 0; }
+.tag-detail .preview.pdf { height: 45vh; }

@@ -123,6 +123,19 @@ const I18N_EN = {
   '再生用に変換できませんでした: {error}': 'Could not convert for playback: {error}',
   '再生用に作り直しています（{pct}%）…': 'Re-encoding for playback ({pct}%)…', '再生用に MP4 にしています…': 'Converting to MP4 for playback…',
 
+  // --- タグの画面 ---
+  'タグの名前を変える': 'Rename tag', '既にあるタグの名前にすると、2つのタグを1つにまとめます。': 'Using the name of an existing tag merges the two.',
+  'タグを削除しますか？': 'Delete this tag?', 'タグを削除': 'Delete tag', '名前空間なし': 'No namespace',
+  '検索に含める': 'Include in the search', '検索から除く': 'Exclude from the search', '当てはまるタグがありません。': 'No matching tags.',
+  'タグを探す': 'Find a tag', '＋ で検索に含め、⊘ で除きます。件数は直接付いている数です。': '＋ includes a tag in the search, ⊘ excludes it. Counts are direct tags.',
+  '左の一覧からタグを選ぶと、そのタグの付いたファイルを探します。フォルダに付いたタグは、中のファイルにも効きます。':
+    'Pick tags on the left to find the files that carry them. A tag on a folder applies to everything inside it.',
+  '除外:': 'Excluding:', '場所': 'Location', 'すべて含む（AND）': 'All of them (AND)', 'どれかを含む（OR）': 'Any of them (OR)', 'フォルダも出す': 'Include folders',
+  '条件を消す': 'Clear', '{total} 件のうち {n} 件を表示': 'Showing {n} of {total}', '{n} 件': '{n} items',
+  '「{tag}」が付いたすべてのファイル・フォルダで名前を変えます。': 'Renames “{tag}” on every file and folder that carries it.',
+  '「{from}」を「{to}」に変えました（{n} 件）': 'Renamed “{from}” to “{to}” ({n})',
+  '「{tag}」を、付いている {n} 件のファイル・フォルダから外します。ファイル自体には何もしません。': 'Removes “{tag}” from the {n} files and folders that carry it. The files themselves are not touched.',
+
   // --- 変数を含む文（t() で使う） ---
   '{h}時間{m}分': '{h} h {m} min', '{m}分{s}秒': '{m} min {s} s', '{s}秒': '{s} s',
   '同期: {state}': 'Sync: {state}',
@@ -260,9 +273,12 @@ function translateString(s) {
 
 const i18nOriginal = new WeakMap();
 
+// 訳さない部分の中でも、札（.badge）は固定の文なので訳す（ファイル名の横の「受け皿」「今は無い」など）
+const I18N_ALWAYS = '.badge';
+
 function translateTextNode(node) {
   const parent = node.parentElement;
-  if (!parent || parent.closest(I18N_SKIP)) return;
+  if (!parent || (parent.closest(I18N_SKIP) && !parent.closest(I18N_ALWAYS))) return;
   const rec = i18nOriginal.get(node);
   const src = rec && node.data === rec.out ? rec.src : node.data;
   const out = i18n.lang === 'ja' ? src : translateString(src);

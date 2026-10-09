@@ -15,6 +15,8 @@ Tag, search and tidy your existing file trees from the outside — without movin
 |---|---|---|
 | ![File browser previewing an Excel workbook](https://raw.githubusercontent.com/akivajp/tag-keeper/main/docs/screenshots/files.png) | ![File browser in dark mode with a PDF preview](https://raw.githubusercontent.com/akivajp/tag-keeper/main/docs/screenshots/files-dark.png) | ![Hygiene report grouped by category](https://raw.githubusercontent.com/akivajp/tag-keeper/main/docs/screenshots/report.png) |
 
+![Tags page: search with several tags, AND/OR and exclusions, with a preview](https://raw.githubusercontent.com/akivajp/tag-keeper/main/docs/screenshots/tags.png)
+
 *Screenshots use made-up demo data (`scripts/make_demo.py`).*
 
 ## Why
@@ -160,6 +162,10 @@ and the theme (system, light or dark).
   (`~/.local/share/tag-keeper/tags/<host>.jsonl`), so they stay readable without the tool
   and never conflict when synced. When a tagged item is moved — by you or by a plan — the
   log records the move and the tags follow.
+- **Find and manage tags** on the Tags page: filter the tag list, search with several tags
+  (all of them or any of them, minus excluded ones, narrowed by name) — tags on a folder
+  count for everything inside — and rename a tag everywhere (renaming onto an existing tag
+  merges the two) or delete it. Results show a preview of the picked file.
 - **Version history** comes from btrfs snapshots through
   [btrfs-timeline](https://github.com/akivajp/btrfs-timeline): the versions of a file, a
   folder as it was at any snapshot (including what has since been deleted), and restoring

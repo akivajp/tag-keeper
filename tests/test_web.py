@@ -328,3 +328,29 @@ def test_media_api(env: dict) -> None:
     res = env["app"].get("/api/media", q, headers={"Range": "bytes=0-99"})
     assert res.status_int == 206 and res.headers["Content-Type"] == "video/mp4"
     env["app"].get("/api/media/status", {"root": "data", "path": "docs/report.pdf"}, status=400)
+
+
+def test_tag_management_and_search(env: dict) -> None:
+    app, root = env["app"], env["root"]
+    origin = {"Origin": f"http://{HOST}"}
+    write(root / "docs" / "sub" / "memo.txt", "m")
+    run_job(env, "/api/roots/data/scan")
+    app.post_json("/api/tags", {"root": "data", "paths": ["docs"], "tag": "area:docs"}, headers=origin)
+    app.post_json("/api/tags", {"root": "data", "paths": ["docs/report.pdf"], "tag": "type:report"}, headers=origin)
+    app.post_json("/api/tags", {"root": "data", "paths": ["docs/sub"], "tag": "draft"}, headers=origin)
+
+    def search(**q: object) -> list[str]:
+        return [x["path"] for x in app.get("/api/tags/search", {"root": "data", **q}).json["items"]]
+
+    assert search(tag=["area:docs", "type:report"]) == ["docs/report.pdf"]
+    assert search(tag="area:docs", **{"not": "draft"}) == ["docs/Thumbs.db", "docs/report.pdf"]
+    assert search(tag="area:docs", q="memo") == ["docs/sub/memo.txt"]
+    assert "docs" in search(tag="area:docs", folders="1")
+    item = app.get("/api/tags/search", {"root": "data", "tag": "type:report"}).json["items"][0]
+    assert item["tags"]["direct"][0]["tag"] == "type:report" and item["tags"]["inherited"][0]["tag"] == "area:docs"
+    app.get("/api/tags/search", {"root": "data"}, status=400)
+
+    assert app.post_json("/api/tags/rename", {"from": "type:report", "to": "type:document"}, headers=origin).json["changed"] == 1
+    assert search(tag="type:document") == ["docs/report.pdf"]
+    assert app.post_json("/api/tags/delete", {"tag": "draft"}, headers=origin).json["changed"] == 1
+    assert {t["tag"] for t in app.get("/api/tags").json["tags"]} == {"area:docs", "type:document"}

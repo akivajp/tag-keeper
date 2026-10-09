@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-10-09
+
+### Added
+
+- **Tag search and management.** The Tags page lists tags by namespace with a filter, and
+  searches with several tags — all of them or any of them, minus excluded ones, narrowed by
+  name, with tags on a folder counting for everything inside. Results sort by column and
+  preview the picked file. A tag can be renamed everywhere (renaming onto an existing tag
+  merges the two) or deleted; both are single `rename` / `delete` entries in the tag log.
+  The search conditions live in the URL.
+
+### Fixed
+
+- Badges inside file-name cells, such as "Inbox" next to an inbox folder or "Gone now" in a
+  past snapshot, stayed in Japanese in the English UI.
+- Some tests wrote to the real tag log under `~/.local/share/tag-keeper/`; all tests now use
+  temporary data and config directories.
+
 ## [0.5.0] - 2026-10-08
 
 ### Added
@@ -130,7 +148,8 @@ First release. The web UI and messages are in Japanese.
 - **Decision log.** Accepted suggestions, tag accept and reject, and undone plans are
   appended per machine; the closest past decisions are given to the model as examples.
 
-[Unreleased]: https://github.com/akivajp/tag-keeper/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/akivajp/tag-keeper/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/akivajp/tag-keeper/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/akivajp/tag-keeper/compare/v0.4.2...v0.5.0
 [0.4.2]: https://github.com/akivajp/tag-keeper/compare/v0.4.1...v0.4.2
 [0.4.1]: https://github.com/akivajp/tag-keeper/compare/v0.4.0...v0.4.1

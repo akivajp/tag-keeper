@@ -15,6 +15,8 @@
 |---|---|---|
 | ![Excel のブックをプレビューしているファイルブラウザ](https://raw.githubusercontent.com/akivajp/tag-keeper/main/docs/screenshots/files.png) | ![ダークモードで PDF をプレビューしているファイルブラウザ](https://raw.githubusercontent.com/akivajp/tag-keeper/main/docs/screenshots/files-dark.png) | ![カテゴリごとにまとめた衛生レポート](https://raw.githubusercontent.com/akivajp/tag-keeper/main/docs/screenshots/report.png) |
 
+![タグの画面: 複数のタグ・AND と OR・除外で探し、選んだファイルをプレビューする](https://raw.githubusercontent.com/akivajp/tag-keeper/main/docs/screenshots/tags.png)
+
 *スクリーンショットは架空の見本のデータ（`scripts/make_demo.py`）で撮っています。画面は英語に切り替えています。*
 
 ## なぜ作るのか
@@ -134,6 +136,9 @@ $ tag-keeper serve                  # http://127.0.0.1:8090/
 - **タグ**: ファイルブラウザから、ファイルやフォルダにタグを付け外しできます。フォルダのタグは配下に継承されます。
   タグは端末ごとの追記専用の JSONL（`~/.local/share/tag-keeper/tags/<ホスト名>.jsonl`）に記録するので、
   ツールが無くても読め、同期しても競合しません。タグの付いたものが（手作業でもプランでも）動いたら、移動を記録してタグを追従させます。
+- **タグの検索と管理**: 「タグ」の画面で、タグの一覧を絞り込み、複数のタグで探せます（すべて含む・どれかを含む・除外・名前での絞り込み）。
+  フォルダに付いたタグは中のものにも効きます。タグの名前は全体で一度に変えられ（既にあるタグの名前にすると1つにまとめます）、削除もできます。
+  結果のファイルは、その場でプレビューできます。
 - **版の履歴**: [btrfs-timeline](https://github.com/akivajp/btrfs-timeline) を使い、btrfs のスナップショットから、
   ファイルの版の一覧、過去のある時点のフォルダの中身（今は消えたものを含む）を見られます。
   過去の版は、今のファイルの隣に日時付きの別名で復元します（上書きしません）。

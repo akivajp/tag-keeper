@@ -12,6 +12,8 @@
     {"at": "...", "host": "zefat", "op": "add",    "root": "onedrive", "path": "a/b.pdf", "tag": "会社:アティード", "source": "manual"}
     {"at": "...", "host": "zefat", "op": "remove", "root": "onedrive", "path": "a/b.pdf", "tag": "会社:アティード"}
     {"at": "...", "host": "zefat", "op": "move",   "root": "onedrive", "from": "a", "to": "c/a"}
+    {"at": "...", "host": "zefat", "op": "rename", "from": "会社:ATID", "to": "会社:アティード"}   # タグの名前の変更（全ルート）
+    {"at": "...", "host": "zefat", "op": "delete", "tag": "仮"}                                 # タグの削除（全ルート）
 """
 
 from __future__ import annotations
@@ -147,6 +149,19 @@ class TagStore:
                 tags.pop(ev["tag"], None)
                 if not tags:
                     del self.items[key]
+        elif op == "rename":
+            # タグの名前の変更。変更先が既に付いているアイテムでは、1つにまとめる
+            src, dst = str(ev["from"]), str(ev["to"])
+            for tags in self.items.values():
+                a = tags.pop(src, None)
+                if a is not None and dst not in tags:
+                    tags[dst] = Assignment(dst, a.source, a.at, a.host)
+        elif op == "delete":
+            tag = str(ev["tag"])
+            for key in [k for k, tags in self.items.items() if tag in tags]:
+                del self.items[key][tag]
+                if not self.items[key]:
+                    del self.items[key]
         elif op == "move":
             src, dst = str(ev["from"]), str(ev["to"])
             moved = [k for k in self.items if k[0] == root and _under(k[1], src)]
@@ -214,6 +229,39 @@ class TagStore:
             self._append(events)
         return len(events)
 
+    def rename_tag(self, old: str, new: str) -> int:
+        """タグの名前を変える（全ルートのすべてのアイテム）。変わったアイテムの数を返す。"""
+        old, new = normalize_tag(old), normalize_tag(new)
+        if old == new:
+            return 0
+        with self.lock:
+            self.reload_if_changed()
+            n = sum(1 for tags in self.items.values() if old in tags)
+            if n:
+                self._append([{"at": utcnow(), "host": self.host, "op": "rename", "from": old, "to": new}])
+        return n
+
+    def delete_tag(self, tag: str) -> int:
+        """タグを、付いているすべてのアイテムから外す。外したアイテムの数を返す。"""
+        tag = normalize_tag(tag)
+        with self.lock:
+            self.reload_if_changed()
+            n = sum(1 for tags in self.items.values() if tag in tags)
+            if n:
+                self._append([{"at": utcnow(), "host": self.host, "op": "delete", "tag": tag}])
+        return n
+
+    def tagged_paths(self, root: str) -> dict[str, set[str]]:
+        """ルートの中で、タグごとに直接付いているアイテムの相対パス（検索用）。"""
+        with self.lock:
+            self.reload_if_changed()
+            out: dict[str, set[str]] = {}
+            for (r, path), tags in self.items.items():
+                if r == root:
+                    for tag in tags:
+                        out.setdefault(tag, set()).add(path)
+            return out
+
     # --- 問い合わせ ---
 
     def tags_of(self, root: str, path: str) -> dict[str, list[dict[str, str]]]:
@@ -252,3 +300,45 @@ class TagStore:
                 for (r, p), tags in self.items.items()
                 if r == root and _under(p, path)
             }
+
+
+def search(
+    entries: Iterable[tuple[str, bool]],
+    tagged: dict[str, set[str]],
+    include: Sequence[str],
+    mode: str = "and",
+    exclude: Sequence[str] = (),
+) -> list[str]:
+    """タグでアイテムを絞り込む。フォルダに付いたタグは、配下のアイテムにも効く（継承）。
+
+    Args:
+        entries: 対象のアイテム（相対パス, フォルダか）。
+        tagged: タグごとに直接付いているアイテムの相対パス（TagStore.tagged_paths）。
+        include: 含むタグ。空なら、除外だけで絞る。
+        mode: "and"（すべて含む）か "or"（どれかを含む）。
+        exclude: 含まないタグ（どれか1つでも効いていれば除く）。
+
+    Returns:
+        当てはまるアイテムの相対パス（entries の順）。
+    """
+    inc = [tagged.get(normalize_tag(t), set()) for t in include]
+    exc = [tagged.get(normalize_tag(t), set()) for t in exclude]
+
+    def has(path: str, paths: set[str]) -> bool:
+        if not paths:
+            return False
+        if path in paths or "" in paths:
+            return True
+        parts = path.split("/")
+        return any("/".join(parts[:i]) in paths for i in range(1, len(parts)))
+
+    out = []
+    for path, _is_dir in entries:
+        if inc:
+            hits = (has(path, s) for s in inc)
+            if not (all(hits) if mode == "and" else any(hits)):
+                continue
+        if any(has(path, s) for s in exc):
+            continue
+        out.append(path)
+    return out

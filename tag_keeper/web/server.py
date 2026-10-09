@@ -82,6 +82,7 @@ from tag_keeper.scan import RootUnavailableError, scan_root
 from tag_keeper.suggest_queue import SuggestQueue
 from tag_keeper.syncguard import OneDriveGuard, SyncError, SyncGuard, make_guard
 from tag_keeper.tags import TagError, TagStore, normalize_tag
+from tag_keeper.tags import search as tags_search
 from tag_keeper.web.auth import (
     Credentials,
     host_allowed,
@@ -944,6 +945,59 @@ def create_app(
             "same_content": same,
             "tags": store.tags_of(rc.name, rel),
             "existing_tags": sorted(store.all_tags()),
+        }
+
+    @app.post("/api/tags/rename")
+    def api_tags_rename() -> dict[str, Any]:
+        """タグの名前を変える（全ルート）。変更先が既にあれば、1つにまとめる。"""
+        data = body()
+        n = settings.tags().rename_tag(str(data.get("from", "")), str(data.get("to", "")))
+        return {"changed": n}
+
+    @app.post("/api/tags/delete")
+    def api_tags_delete() -> dict[str, Any]:
+        """タグを、付いているすべてのアイテムから外す（全ルート）。"""
+        n = settings.tags().delete_tag(str(body().get("tag", "")))
+        return {"changed": n}
+
+    @app.route("/api/tags/search")
+    def api_tags_search() -> dict[str, Any]:
+        """タグで絞り込んだアイテム（フォルダのタグは配下にも効く）。名前の一部でも絞れる。"""
+        q = bottle.request.query
+        config = settings.config()
+        rc = root_config(config, q.getunicode("root", "") or (config.roots[0].name if config.roots else ""))
+        include = [x for x in q.getall("tag") if x]
+        exclude = [x for x in q.getall("not") if x]
+        mode = "or" if q.get("mode") == "or" else "and"
+        word = q.getunicode("q", "").strip().lower()
+        files_only = q.get("folders") != "1"
+        limit = max(1, min(int(q.get("limit", 500)), 5000))
+        if not include and not exclude:
+            raise fail(400, "タグを選んでください")
+        conn = open_db()
+        try:
+            rows = conn.execute(
+                "SELECT relpath, is_dir, size, mtime_ns FROM entries WHERE root_id = ? AND gone_at IS NULL ORDER BY relpath",
+                (root_id_of(conn, rc),),
+            ).fetchall()
+        finally:
+            conn.close()
+        info = {r["relpath"]: r for r in rows if not (files_only and r["is_dir"]) and (not word or word in r["relpath"].lower())}
+        store = settings.tags(config)
+        hits = tags_search(((p, bool(info[p]["is_dir"])) for p in info), store.tagged_paths(rc.name), include, mode, exclude)
+        return {
+            "root": rc.name,
+            "total": len(hits),
+            "items": [
+                {
+                    "path": path,
+                    "is_dir": bool(info[path]["is_dir"]),
+                    "size": info[path]["size"],
+                    "mtime": info[path]["mtime_ns"] // 1_000_000_000,
+                    "tags": store.tags_of(rc.name, path),
+                }
+                for path in hits[:limit]
+            ],
         }
 
     @app.post("/api/tags/feedback")

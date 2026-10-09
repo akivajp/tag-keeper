@@ -20,6 +20,14 @@ def write(path: Path, content: str | bytes = "x") -> Path:
     return path
 
 
+@pytest.fixture(autouse=True)
+def isolated_dirs(tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch) -> None:
+    """データと設定の既定の置き場所を一時フォルダに向ける（利用者の本物のタグのログなどに書き込まないように）。"""
+    base = tmp_path_factory.mktemp("xdg")
+    monkeypatch.setenv("XDG_DATA_HOME", str(base / "data"))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(base / "config"))
+
+
 @pytest.fixture
 def root(tmp_path: Path) -> Path:
     """管理対象のルート（空のフォルダ）。"""
