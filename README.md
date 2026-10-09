@@ -154,7 +154,8 @@ and the theme (system, light or dark).
   folders link to OneDrive on the web, and Office documents to Office for the web. Only types that cannot run scripts open in the page; HTML
   and SVG are shown as plain text, everything else downloads. Paths never leave the root,
   symlinks included.
-- **Rename and delete** any file or folder from the browser. Type any name or take the
+- **Create folders, move, rename and delete** from the browser. Move ticked items by typing a
+  destination or by dragging them onto a folder or the breadcrumbs. Type any name or take the
   suggested one; deleting moves items to the quarantine folder. Both run as one-off plans,
   with snapshots and undo, and a renamed folder keeps its tags.
 - **Tag** files and folders from the browser. A folder's tags are inherited by everything

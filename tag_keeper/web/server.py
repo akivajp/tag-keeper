@@ -1098,20 +1098,53 @@ def create_app(
 
     # --- ファイルブラウザからの名前の変更・削除 ---
 
+    def make_folder(rc: RootConfig, data: dict[str, Any]) -> dict[str, Any]:
+        """フォルダを作る（空のフォルダを作るだけなので、プランにはしない）。"""
+        parent = clean_relpath(str(data.get("parent", "")))
+        name = str(data.get("name", "")).strip()
+        if not name or "/" in name or name in (".", ".."):
+            raise fail(400, f"フォルダの名前が不正です: {name!r}")
+        rel = f"{parent}/{name}" if parent else name
+        problem = rules.cloud_name_problem(rel)
+        if problem:
+            raise fail(400, f"{name}: {problem}")
+        base = resolve_within(rc.path, parent)
+        if not base.is_dir():
+            raise fail(404, f"フォルダがありません: {parent}")
+        target = base / name
+        if os.path.lexists(target):
+            raise fail(409, f"同じ名前のものが既にあります: {name}")
+        target.mkdir()
+        log.info("フォルダを作りました: %s", rel)
+        return {"created": rel}
+
     @app.post("/api/fileops")
     def api_fileops() -> dict[str, Any]:
-        """ファイル・フォルダの名前の変更（rename）か削除（delete）を、1件ずつのプランにしてすぐ実行する。
+        """ファイル・フォルダの名前の変更（rename）・別のフォルダへの移動（move）・削除（delete）を、
+        1件ずつのプランにしてすぐ実行する。フォルダの作成（mkdir）は、その場で作る。
 
-        どちらも整理プランの仕組みに乗せる（実行直前の確認・前後のスナップショット・実行記録・取り消し）。
+        プランにするものは、整理プランの仕組みに乗せる（実行直前の確認・前後のスナップショット・実行記録・取り消し）。
         削除は完全には消さず、隔離フォルダへ移す（F-PL-3）。
         """
         data = body()
         config = settings.config()
         rc = root_config(config, str(data.get("root", "")))
         op_kind = str(data.get("op", ""))
-        if op_kind not in ("rename", "delete"):
+        if op_kind == "mkdir":
+            return make_folder(rc, data)
+        if op_kind not in ("rename", "move", "delete"):
             raise fail(400, f"操作が不明です: {op_kind}")
         items = data.get("items") or []
+        dest_dir = clean_relpath(str(data.get("dest_dir", ""))) if op_kind == "move" else ""
+        if op_kind == "move":
+            problem = rules.cloud_name_problem(dest_dir) if dest_dir else None
+            if problem:
+                raise fail(400, f"{dest_dir}: {problem}")
+            if dest_dir and resolve_within(rc.path, dest_dir).exists() and not (rc.path / dest_dir).is_dir():
+                raise fail(400, f"移動先がフォルダではありません: {dest_dir}")
+            # 選んだフォルダの中にあるものは、フォルダごと移るので重ねて扱わない
+            paths = {clean_relpath(str(it.get("path", ""))) for it in items}
+            items = [it for it in items if not any(clean_relpath(str(it.get("path", ""))).startswith(o + "/") for o in paths)]
         if not items:
             raise fail(400, "対象がありません")
         plan = Plan(
@@ -1130,7 +1163,20 @@ def create_app(
             if fp is None or path.is_symlink():
                 raise fail(404, f"ありません: {src}")
             is_dir = path.is_dir()
-            if op_kind == "rename":
+            if op_kind == "move":
+                if dest_dir == src or dest_dir.startswith(src + "/"):
+                    raise fail(400, f"フォルダをそれ自身の中へは移せません: {src}")
+                dest = f"{dest_dir}/{src.rpartition('/')[2]}" if dest_dir else src.rpartition("/")[2]
+                if dest == src:
+                    continue
+                problem = rules.cloud_name_problem(dest)
+                if problem:
+                    raise fail(400, f"{dest}: {problem}")
+                if dest in dests or os.path.lexists(rc.path / dest):
+                    raise fail(409, f"移動先に同じ名前のものがあります: {dest}")
+                dests.add(dest)
+                plan.ops.append(PlanOp(ACTION_MOVE, src, is_dir, fp.files, fp.size, fp.inode, fp.mtime_ns, CAT_MOVE, "移動", dest=dest))
+            elif op_kind == "rename":
                 name = str(it.get("new_name", "")).strip()
                 if not name or "/" in name or name in (".", ".."):
                     raise fail(400, f"新しい名前が不正です: {name!r}")
@@ -1151,10 +1197,11 @@ def create_app(
                     PlanOp(ACTION_QUARANTINE, src, is_dir, fp.files, fp.size, fp.inode, fp.mtime_ns, CAT_DELETE, "ファイルブラウザから削除")
                 )
         if not plan.ops:
-            raise fail(400, "変えるものがありません（名前が同じ）")
+            raise fail(400, "変えるものがありません（名前も場所も同じ）")
         write_plan(plan, settings.plans_dir / f"{plan.id}.toml")
-        if op_kind == "rename":
-            _log_accepts(settings, config, rc, plan, items, source="browser")
+        if op_kind in ("rename", "move"):
+            # 利用者が決めた名前・置き場所は、提案の手本になる（ファイルだけ）
+            _log_accepts(settings, config, rc, plan, items, source=f"browser-{op_kind}")
         return {"plan_id": plan.id, "ops": len(plan.ops), "job": start_apply(plan)}
 
     # 予期できる失敗は 400 番台の JSON にして、画面にそのまま表示できるようにする

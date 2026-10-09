@@ -301,3 +301,7 @@ tr.clickable { cursor: pointer; }
 tr.clickable:hover td { background: var(--bg); }
 .tag-detail .card { margin-top: 0; }
 .tag-detail .preview.pdf { height: 45vh; }
+
+/* ドラッグで移動するときのドロップ先 */
+tr[draggable="true"] { cursor: grab; }
+.drop-over, tr.drop-over td { background: var(--ok-bg) !important; outline: 2px dashed var(--ok); outline-offset: -2px; }

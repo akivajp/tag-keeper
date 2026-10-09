@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-10-09
+
+### Added
+
+- **New folder** in the file browser, created inside the current folder (names OneDrive
+  cannot store, and names already taken, are refused).
+- **Move** the ticked files and folders to another folder — type a destination (folders are
+  suggested; one that does not exist yet is created) or drag rows onto a folder row or the
+  breadcrumbs. Moves run as one-off plans with snapshots and undo; tags and catalog records
+  follow, a folder cannot be moved into itself, and items inside a ticked folder move with
+  it. File moves are added to the decision log as placement examples.
+
 ## [0.6.0] - 2026-10-09
 
 ### Added
@@ -148,7 +160,8 @@ First release. The web UI and messages are in Japanese.
 - **Decision log.** Accepted suggestions, tag accept and reject, and undone plans are
   appended per machine; the closest past decisions are given to the model as examples.
 
-[Unreleased]: https://github.com/akivajp/tag-keeper/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/akivajp/tag-keeper/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/akivajp/tag-keeper/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/akivajp/tag-keeper/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/akivajp/tag-keeper/compare/v0.4.2...v0.5.0
 [0.4.2]: https://github.com/akivajp/tag-keeper/compare/v0.4.1...v0.4.2

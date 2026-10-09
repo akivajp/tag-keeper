@@ -269,7 +269,7 @@ def test_rename_and_delete_from_the_browser(env: dict) -> None:
     assert (root / "docs" / "20250101_報告書.pdf").read_text() == "keep" and not (root / "docs" / "report.pdf").exists()
     log_dir = env["settings"].decision_log.log_dir
     events = [_json.loads(l) for f in log_dir.glob("*.jsonl") for l in f.read_text(encoding="utf-8").splitlines()]
-    assert events[-1]["source"] == "browser" and events[-1]["final"]["name"] == "20250101_報告書.pdf"
+    assert events[-1]["source"] == "browser-rename" and events[-1]["final"]["name"] == "20250101_報告書.pdf"
     run_job(env, f"/api/plans/{r['plan_id']}/undo")
     assert (root / "docs" / "report.pdf").exists()
 
@@ -354,3 +354,37 @@ def test_tag_management_and_search(env: dict) -> None:
     assert search(tag="type:document") == ["docs/report.pdf"]
     assert app.post_json("/api/tags/delete", {"tag": "draft"}, headers=origin).json["changed"] == 1
     assert {t["tag"] for t in app.get("/api/tags").json["tags"]} == {"area:docs", "type:document"}
+
+
+def test_mkdir_and_move_from_the_browser(env: dict) -> None:
+    app, root = env["app"], env["root"]
+    origin = {"Origin": f"http://{HOST}"}
+    write(root / "inbox" / "a.pdf", "a")
+    write(root / "inbox" / "sub" / "b.pdf", "b")
+    run_job(env, "/api/roots/data/scan")
+    app.post_json("/api/tags", {"root": "data", "paths": ["inbox/sub"], "tag": "keep"}, headers=origin)
+
+    # フォルダの作成
+    assert app.post_json("/api/fileops", {"root": "data", "op": "mkdir", "parent": "docs", "name": "2025"}, headers=origin).json["created"] == "docs/2025"
+    assert (root / "docs" / "2025").is_dir()
+    app.post_json("/api/fileops", {"root": "data", "op": "mkdir", "parent": "docs", "name": "2025"}, headers=origin, status=409)
+    app.post_json("/api/fileops", {"root": "data", "op": "mkdir", "parent": "docs", "name": "a?b"}, headers=origin, status=400)
+    app.post_json("/api/fileops", {"root": "data", "op": "mkdir", "parent": "nope", "name": "x"}, headers=origin, status=404)
+
+    # 移動（選んだフォルダの中のものは重ねて扱わない。まだ無い移動先は作る）
+    items = [{"path": "inbox/a.pdf"}, {"path": "inbox/sub"}, {"path": "inbox/sub/b.pdf"}]
+    r = app.post_json("/api/fileops", {"root": "data", "op": "move", "items": items, "dest_dir": "docs/2025/new"}, headers=origin).json
+    env["jobs"].wait()
+    assert r["ops"] == 2
+    assert (root / "docs" / "2025" / "new" / "a.pdf").exists() and (root / "docs" / "2025" / "new" / "sub" / "b.pdf").exists()
+    entries = {e["name"]: e for e in app.get("/api/browse", {"root": "data", "path": "docs/2025/new"}).json["entries"]}
+    assert entries["sub"]["tags"] == ["keep"]  # タグも追従
+
+    # 断るもの: それ自身の中へ・同じ名前が既にある
+    app.post_json("/api/fileops", {"root": "data", "op": "move", "items": [{"path": "docs/2025"}], "dest_dir": "docs/2025/new"}, headers=origin, status=400)
+    write(root / "a.pdf", "other")
+    app.post_json("/api/fileops", {"root": "data", "op": "move", "items": [{"path": "docs/2025/new/a.pdf"}], "dest_dir": ""}, headers=origin, status=409)
+
+    # 取り消すと元の場所へ戻る
+    run_job(env, f"/api/plans/{r['plan_id']}/undo")
+    assert (root / "inbox" / "a.pdf").exists() and (root / "inbox" / "sub" / "b.pdf").exists()

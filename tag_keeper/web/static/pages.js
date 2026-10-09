@@ -203,7 +203,7 @@ async function pageBrowse(main, root, path, params) {
       const name = e.is_dir
         ? h('a', { href: browseHref(root, rel, at) }, '📁 ', e.name)
         : h('a', { href: '#', onclick: (ev) => { ev.preventDefault(); showDetail(rel, e); } }, fileIcon(e.name), ' ', e.name);
-      return h('tr', { class: e.exists_now === false ? 'gone' : '' },
+      const row = h('tr', { class: e.exists_now === false ? 'gone' : '' },
         h('td', {}, box),
         h('td', { class: 'path' }, name,
           e.inbox ? [' ', h('span', { class: 'badge warn' }, '受け皿')] : null,
@@ -211,6 +211,17 @@ async function pageBrowse(main, root, path, params) {
         h('td', { class: 'hide-narrow' }, h('div', { class: 'chips' }, e.tags.map((tg) => h('span', { class: 'chip' }, tg)))),
         h('td', { class: 'num' }, e.is_dir ? '' : size(e.size)),
         h('td', { class: 'num hide-narrow' }, when(e.mtime)));
+      if (live) {
+        // ドラッグで移動: 選んでいる行をつかんだら選んだもの全部、そうでなければその行だけ
+        row.draggable = true;
+        row.addEventListener('dragstart', (ev) => {
+          const paths = selected.has(rel) ? [...selected] : [rel];
+          ev.dataTransfer.setData(DRAG_TYPE, JSON.stringify({ root, paths }));
+          ev.dataTransfer.effectAllowed = 'move';
+        });
+        if (e.is_dir) dropTarget(row, rel);
+      }
+      return row;
     }));
   }
 
@@ -296,7 +307,7 @@ async function pageBrowse(main, root, path, params) {
   setChildren(main,
     datalist,
     h('datalist', { id: `folders-${enc(root)}` }),
-    h('div', { class: 'crumbs' }, data.crumbs.map((c, i) => [i ? ' / ' : '', h('a', { href: browseHref(root, c.path, at) }, c.name)])),
+    h('div', { class: 'crumbs' }, data.crumbs.map((c, i) => [i ? ' / ' : '', live && c.path !== path ? dropTarget(h('a', { href: browseHref(root, c.path, at) }, c.name), c.path) : h('a', { href: browseHref(root, c.path, at) }, c.name)])),
     h('div', { class: 'toolbar' },
       h('label', {}, '時点: ', timeSel),
       at ? h('span', { class: 'badge warn' }, '過去の時点を表示中（読み取りのみ）') : null,
@@ -320,6 +331,11 @@ async function pageBrowse(main, root, path, params) {
           return { path: rel, is_dir: !!e?.is_dir, size: e?.size };
         }));
       } }, '削除…'),
+      h('button', { onclick: () => {
+        if (!selected.size) { toast(t('移動するものを選んでください'), 'warn'); return; }
+        moveDialog(root, [...selected], path);
+      } }, '移動…'),
+      h('button', { onclick: () => mkdirDialog(root, path) }, 'フォルダを作る…'),
       selInfo) : null,
     splitPane('browse',
       h('div', { class: 'card table-wrap' }, h('table', {}, h('thead', {}, headRow), tableBody)),
@@ -327,12 +343,81 @@ async function pageBrowse(main, root, path, params) {
   renderRows();
 }
 
+// ---------- フォルダの作成・移動（ファイルブラウザから） ----------
+
+const DRAG_TYPE = 'application/x-tag-keeper';
+
+/** 要素を移動先にする（一覧の行やパンくずを、そのフォルダへのドロップ先にする）。 */
+function dropTarget(el, dest) {
+  el.addEventListener('dragover', (ev) => {
+    if (!ev.dataTransfer.types.includes(DRAG_TYPE)) return;
+    ev.preventDefault();
+    ev.dataTransfer.dropEffect = 'move';
+    el.classList.add('drop-over');
+  });
+  el.addEventListener('dragleave', () => el.classList.remove('drop-over'));
+  el.addEventListener('drop', (ev) => {
+    el.classList.remove('drop-over');
+    const raw = ev.dataTransfer.getData(DRAG_TYPE);
+    if (!raw) return;
+    ev.preventDefault();
+    const { root, paths } = JSON.parse(raw);
+    const moving = paths.filter((p) => p !== dest && !dest.startsWith(`${p}/`));
+    if (moving.length) moveConfirm(root, moving, dest);
+  });
+  return el;
+}
+
+/** 移動の確認（移すものと移動先を見せる）。 */
+async function moveConfirm(root, paths, dest) {
+  const ok = await confirmDialog(t('{n} 件を移動しますか？', { n: paths.length }), [
+    h('ul', { class: 'small' }, paths.slice(0, 20).map((p) => h('li', { class: 'path' }, p))),
+    paths.length > 20 ? h('p', { class: 'muted' }, t('ほか {n} 件', { n: paths.length - 20 })) : null,
+    h('p', {}, t('移動先: {dest}', { dest: dest || '/' })),
+    h('p', { class: 'muted small' }, t('実行の前後にスナップショットを撮り、プランの画面から取り消せます。')),
+  ], t('移動する'));
+  if (ok) await runFileOp(root, 'move', paths.map((path) => ({ path })), { dest_dir: dest });
+}
+
+/** 移動のダイアログ（移動先のフォルダを入力すると候補が出る。まだ無いフォルダなら作ってから移す）。 */
+async function moveDialog(root, paths, current) {
+  const input = h('input', { class: 'name-input', value: current, list: `folders-${enc(root)}`, placeholder: t('移動先のフォルダ（/ でルート直下）') });
+  input.addEventListener('input', () => folderSuggest(root, input.value));
+  input.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); document.getElementById('confirm').close('ok'); } });
+  folderSuggest(root, current);
+  setTimeout(() => { input.focus(); input.select(); }, 50);
+  const ok = await confirmDialog(t('{n} 件を移動しますか？', { n: paths.length }), [
+    h('ul', { class: 'small' }, paths.slice(0, 20).map((p) => h('li', { class: 'path' }, p))),
+    paths.length > 20 ? h('p', { class: 'muted' }, t('ほか {n} 件', { n: paths.length - 20 })) : null,
+    h('h3', {}, t('移動先')), input,
+    h('p', { class: 'muted small' }, t('まだ無いフォルダを入れると、作ってから移します。一覧の行をフォルダの行やパンくずへドラッグしても移せます。')),
+  ], t('移動する'));
+  const dest = input.value.trim().replace(/^\/+|\/+$/g, '');
+  if (!ok || dest === current && paths.every((p) => p.split('/').slice(0, -1).join('/') === current)) return;
+  await runFileOp(root, 'move', paths.map((path) => ({ path })), { dest_dir: dest });
+}
+
+/** フォルダの作成のダイアログ。 */
+async function mkdirDialog(root, parent) {
+  const input = h('input', { class: 'name-input', placeholder: t('新しいフォルダの名前') });
+  input.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); document.getElementById('confirm').close('ok'); } });
+  setTimeout(() => input.focus(), 50);
+  const ok = await confirmDialog(t('フォルダを作る'), [h('p', { class: 'muted path' }, `${parent || '/'}`), input], t('作る'));
+  const name = input.value.trim();
+  if (!ok || !name) return;
+  try {
+    const r = await api('/api/fileops', { root, op: 'mkdir', parent, name });
+    toast(t('フォルダを作りました: {path}', { path: r.created }));
+    app.render();
+  } catch (e) { toast(e.message, 'danger'); }
+}
+
 // ---------- 名前の変更・削除（ファイルブラウザから） ----------
 
 /** 名前の変更・削除の API を呼び、実行のジョブの進み具合を表示する。取り消しはプランの画面から。 */
-async function runFileOp(root, op, items) {
+async function runFileOp(root, op, items, extra = {}) {
   try {
-    const r = await api('/api/fileops', { root, op, items });
+    const r = await api('/api/fileops', { root, op, items, ...extra });
     // 名前を変えた・削除したものは、採用リストに残っていても実行できないので外す
     for (const it of items) cart.remove(root, it.path);
     app.job = r.job;
@@ -343,7 +428,7 @@ async function runFileOp(root, op, items) {
     const holder = document.getElementById('alerts');
     // お知らせは最新の1つだけ残す（続けて操作しても積み重ならないように）
     holder.querySelectorAll('.fileop-note').forEach((n) => n.remove());
-    const note = h('div', { class: 'alert info fileop-note' }, op === 'rename' ? '名前を変えています。' : '隔離フォルダへ移しています。', '取り消すには ', link, ' から。');
+    const note = h('div', { class: 'alert info fileop-note' }, { rename: '名前を変えています。', move: '移動しています。' }[op] || '隔離フォルダへ移しています。', '取り消すには ', link, ' から。');
     holder.prepend(note);
     setTimeout(() => note.remove(), 15000);
     return true;
