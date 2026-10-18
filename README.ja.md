@@ -91,6 +91,11 @@ $ tag-keeper undo <プラン ID> --yes         # すべて元に戻す
 systemd で常駐させていると再起動のたびに同じ理由で終了するので、気付かないうちに同期が止まります。
 利用者が承認した大量の削除では、tag-keeper が同期クライアントと連携します（ルートに `sync_client = "onedrive"` を設定）。
 
+rclone を使う場合は `sync_client = "cloud-sync"`、`sync_service = "cloud-sync-<名前>.service"` を設定すると、
+systemd の timer で定期実行する `rclone bisync` と連携します。timer を止め、動いている同期が終わるのを待ち、
+隔離し、その実行に限り `--max-delete` を上げて1回同期して削除を反映し、timer を再開します。
+ルートの画面には「今すぐ同期」ボタンが付き、同期中は全画面の上部に表示が出ます。
+
 1. 常駐の同期を止める（`systemctl --user stop onedrive.service`）
 2. 隔離する
 3. `onedrive --sync` を1回だけ、しきい値を「このプランで一番大きいフォルダ」より少し上に上げて実行し、削除をクラウドに反映する。
@@ -229,7 +234,7 @@ snapper_config = "home"              # 前後のスナップショットを撮�
 [[roots]]
 name = "onedrive"
 path = "~/CloudSync/OneDrive"
-sync_client = "onedrive"             # ""（既定）なら連携しない
+sync_client = "onedrive"             # ""（既定）なら連携しない / "cloud-sync" = rclone bisync の timer
 sync_service = "onedrive.service"    # `onedrive --monitor` を動かしている systemd --user のユニット
 sync_guard = "auto"                  # "auto": 大量削除のときだけ / "always": 実行のたびに
 ```

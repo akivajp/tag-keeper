@@ -112,6 +112,12 @@ coordinates with the client instead (set `sync_client = "onedrive"` on the root)
    plan — not `--force`, which would also let unrelated accidents through,
 4. start the resident sync again.
 
+Prefer rclone? Set `sync_client = "cloud-sync"` and `sync_service = "cloud-sync-<name>.service"`
+to coordinate with an `rclone bisync` job run by a systemd timer instead: tag-keeper stops the
+timer, waits for a running sync to finish, quarantines, runs one sync with a raised
+`--max-delete` for that run only, and starts the timer again. The Roots page then shows a
+*Sync now* button and every page shows a banner while a sync is running.
+
 If step 3 fails, the resident sync is left stopped (restarting it would only exit again),
 the failure is journaled, and the web UI and `tag-keeper sync <plan-id> --retry` offer to
 try again. Small plans are left to the running client as usual.
@@ -264,7 +270,7 @@ Per root, for coordinating with a sync client:
 [[roots]]
 name = "onedrive"
 path = "~/CloudSync/OneDrive"
-sync_client = "onedrive"             # "" (default) = no coordination
+sync_client = "onedrive"             # "" (default) = no coordination / "cloud-sync" = rclone bisync timer
 sync_service = "onedrive.service"    # the systemd --user unit running `onedrive --monitor`
 sync_guard = "auto"                  # "auto": only for big deletions / "always": every run
 ```

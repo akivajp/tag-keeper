@@ -112,7 +112,12 @@ function stateBadge(state) {
 function syncBadge(sync) {
   if (!sync) return null;
   if (sync.error) return h('span', { class: 'badge danger' }, `同期: 状態を読めません`);
-  const map = { active: ['同期: 稼働中', 'ok'], inactive: ['同期: 停止中', 'warn'], failed: ['同期: 失敗', 'danger'] };
+  const map = {
+    active: ['同期: 稼働中', 'ok'], inactive: ['同期: 停止中', 'warn'], failed: ['同期: 失敗', 'danger'],
+    // cloud-sync（定期実行）の状態
+    idle: ['同期: 待機中', 'ok'], running: ['同期中…', 'info'], waiting: ['同期: 順番待ち', 'info'],
+    error: ['同期: 失敗', 'danger'], needs_resync: ['同期: 基準の作り直しが必要', 'danger'], interrupted: ['同期: 中断', 'warn'],
+  };
   const [label, kind] = map[sync.state] || [t('同期: {state}', { state: sync.state }), 'warn'];
   return h('span', { class: `badge ${kind}` }, label);
 }
@@ -143,6 +148,61 @@ function renderAlerts() {
       h('strong', {}, '常駐の同期が止まったままです'),
       h('p', {}, t('プラン {id} の削除をクラウドに反映できていません。', { id: p.id }), ' ', p.sync_paused ? t('理由: {reason}', { reason: p.sync_paused }) : ''),
       h('a', { href: `#/plans/${p.id}` }, 'プランを開いて再試行する')));
+  }
+}
+
+
+// ---------- 同期（cloud-sync）の状態 ----------
+
+let syncTimer = null;
+let syncFastUntil = 0;   // 手動で始めた直後は、動き出すまで細かく確かめる（この時刻まで）
+
+/** 同期が動いている間、どの画面でも上部に出す表示を描く。 */
+function renderSyncBanner(items) {
+  const holder = document.getElementById('alerts');
+  holder.querySelectorAll('.sync-banner').forEach((e) => e.remove());
+  for (const it of items) {
+    if (it.state !== 'running' && it.state !== 'waiting') continue;
+    holder.append(h('div', { class: 'alert info sync-banner' },
+      h('strong', {}, t('同期中: {root}', { root: it.root })),
+      ' ' + (it.started ? t('（{when} に開始）', { when: when(it.started) }) : '')));
+  }
+}
+
+/** 同期の状態を読み、表示を更新する。動いている間は2秒ごと、そうでなければ15秒ごとに確かめる。 */
+async function pollSync() {
+  clearTimeout(syncTimer);
+  let items = [];
+  try {
+    items = (await api('/api/sync')).items;
+  } catch (e) {
+    // 一時的な通信の失敗は、次の問い合わせで回復するのを待つ
+  }
+  const busy = (it) => it.state === 'running' || it.state === 'waiting';
+  const before = app.syncBusy || {};
+  app.syncBusy = Object.fromEntries(items.map((it) => [it.root, busy(it)]));
+  app.syncItems = items;
+  renderSyncBanner(items);
+  for (const it of items) {
+    // 動いていた同期が終わったら知らせて、画面の同期の表示を最新にする
+    if (before[it.root] && !busy(it)) {
+      if (it.state === 'idle') toast(t('同期が終わりました: {root}', { root: it.root }), 'info');
+      else toast(t('同期が失敗しました: {root}: {message}', { root: it.root, message: it.message || it.state }), 'danger');
+      if (app.render) app.render();
+    }
+  }
+  syncTimer = setTimeout(pollSync, items.some(busy) || Date.now() < syncFastUntil ? 2000 : 15000);
+}
+
+/** 今すぐ1回同期する。 */
+async function startSync(root) {
+  try {
+    await api(`/api/sync/${enc(root)}/start`, {});
+    syncFastUntil = Date.now() + 20000;
+    toast(t('同期を始めます: {root}', { root: root }), 'info');
+    pollSync();
+  } catch (e) {
+    toast(e.message, 'danger');
   }
 }
 
@@ -264,13 +324,18 @@ async function pageRoots(main) {
         stat('最後の走査', when(scan.finished_at)),
         scan.status === 'held' ? stat('状態', h('span', { class: 'badge warn' }, '消失の確定を保留')) : null,
       ) : h('p', { class: 'muted' }, 'まだ走査していません。'),
-      r.sync && !r.sync.error ? h('p', { class: 'muted' },
-        t('同期クライアント: {client}（{service}）。子が {n} 件以上のフォルダを消すときは、同期を一時停止して削除を反映してから再開します。',
+      r.sync && !r.sync.error ? h('p', { class: 'muted' }, r.sync.client === 'cloud-sync'
+        ? t('同期: cloud-sync（{service}）。整理プランを実行するときは、定期の同期を止めて隔離し、削除を反映してから再開します。', { service: r.sync.service })
+          + (r.sync.last_ok ? ' ' + t('最後に成功: {when}', { when: when(r.sync.last_ok) }) : '')
+          + (r.sync.timer && r.sync.timer !== 'active' ? ' ' + t('定期の同期は止まっています。') : '')
+        : t('同期クライアント: {client}（{service}）。子が {n} 件以上のフォルダを消すときは、同期を一時停止して削除を反映してから再開します。',
           { client: r.sync.client, service: r.sync.service, n: num(r.sync.threshold) })) : null,
+      r.sync && r.sync.state === 'error' && r.sync.message ? h('div', { class: 'alert danger' }, r.sync.message) : null,
       h('div', { class: 'buttons' },
         h('button', { class: 'primary', disabled: jobRunning(), onclick: () => startJob(`/api/roots/${enc(r.name)}/refresh`) }, '最新にする（走査＋ハッシュ）'),
         h('button', { disabled: jobRunning(), onclick: () => startJob(`/api/roots/${enc(r.name)}/scan`) }, '走査だけ'),
         r.scanned ? h('a', { class: 'button', href: `#/report/${enc(r.name)}` }, 'レポートとプランの作成') : null,
+        r.sync && r.sync.can_trigger ? h('button', { disabled: r.sync.state === 'running' || r.sync.state === 'waiting', onclick: () => startSync(r.name) }, '今すぐ同期') : null,
       ));
   });
   setChildren(main, 
@@ -414,8 +479,10 @@ async function pagePlan(main, id) {
     selectionEl.textContent = t('選択 {sel} / {all} 件・ファイル {files}・{size}', { sel: num(sel.length), all: num(data.ops.length), files: num(sum(sel, 'files')), size: size(sum(sel, 'size')) });
     setChildren(syncNote, willSync(sel) ? h('div', { class: 'alert info' },
       h('strong', {}, '大量の削除になります。'),
-      ' ' + t('実行すると、{client} の常駐の同期（{service}）を一時停止し、隔離した後に削除をクラウドへ反映してから再開します。{client} の大量削除の安全装置（{n} 件）で同期が止まることはありません。',
-        { client: data.sync.client, service: data.sync.service, n: num(data.sync.threshold) })) : '');
+      ' ' + (data.sync.client === 'cloud-sync'
+        ? t('実行すると、cloud-sync の定期の同期（{service}）を止め、動いている同期が終わるのを待って隔離し、削除をクラウドへ反映してから再開します。', { service: data.sync.service })
+        : t('実行すると、{client} の常駐の同期（{service}）を一時停止し、隔離した後に削除をクラウドへ反映してから再開します。{client} の大量削除の安全装置（{n} 件）で同期が止まることはありません。',
+          { client: data.sync.client, service: data.sync.service, n: num(data.sync.threshold) }))) : '');
   }
 
   let saveTimer = null;
@@ -618,4 +685,4 @@ function setupTopbarTools() {
   showTheme();
 }
 
-window.addEventListener('DOMContentLoaded', () => { setupTopbarTools(); route(); pollJob(); });
+window.addEventListener('DOMContentLoaded', () => { setupTopbarTools(); route(); pollJob(); pollSync(); });

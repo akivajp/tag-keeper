@@ -28,6 +28,13 @@ const I18N_EN = {
   '最新にする（走査＋ハッシュ）': 'Refresh (scan + hash)', '走査だけ': 'Scan only', 'レポートとプランの作成': 'Report and plans',
   'ハッシュ計算済み': 'Hashed', '最後の走査': 'Last scan', '消失の確定を保留': 'Disappearances on hold',
   'まだ走査していません。': 'Not scanned yet.', 'ルートがありません。': 'No roots.',
+  '同期: 待機中': 'Sync: idle', '同期中…': 'Syncing…', '同期: 順番待ち': 'Sync: waiting its turn', '同期: 基準の作り直しが必要': 'Sync: needs a resync', '同期: 中断': 'Sync: interrupted',
+  '同期中: {root}': 'Syncing: {root}', '（{when} に開始）': '(started {when})',
+  '同期が終わりました: {root}': 'Sync finished: {root}', '同期が失敗しました: {root}: {message}': 'Sync failed: {root}: {message}',
+  '同期を始めます: {root}': 'Starting sync: {root}', '今すぐ同期': 'Sync now',
+  '同期: cloud-sync（{service}）。整理プランを実行するときは、定期の同期を止めて隔離し、削除を反映してから再開します。': 'Sync: cloud-sync ({service}). When a plan is applied, the scheduled sync is stopped, items are quarantined, the deletions are reflected, and the sync is restarted.',
+  '最後に成功: {when}': 'Last success: {when}', '定期の同期は止まっています。': 'The scheduled sync is stopped.',
+  '実行すると、cloud-sync の定期の同期（{service}）を止め、動いている同期が終わるのを待って隔離し、削除をクラウドへ反映してから再開します。': 'Running it stops the scheduled cloud-sync ({service}), waits for a running sync to finish, quarantines, reflects the deletions in the cloud and restarts the sync.',
   '同期: 稼働中': 'Sync: running', '同期: 停止中': 'Sync: stopped', '同期: 失敗': 'Sync: failed', '同期: 状態を読めません': 'Sync: unknown state',
   '撮らない': 'none',
 

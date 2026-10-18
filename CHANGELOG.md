@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`sync_client = "cloud-sync"`**: coordinate with an `rclone bisync` job run by a systemd timer
+  (a small `cloud-sync` script outside this package). Applying a plan stops the timer, waits for
+  a running sync to finish, quarantines, runs one sync that reflects the deletions (with a raised
+  `--max-delete` for that run only) and starts the timer again.
+- **Sync now** button on the Roots page and a banner on every page while a sync is running
+  (`GET /api/sync`, `POST /api/sync/<root>/start`).
+
 ## [0.7.0] - 2026-10-09
 
 ### Added

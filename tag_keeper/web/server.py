@@ -80,7 +80,7 @@ from tag_keeper.plan import (
 from tag_keeper.report import build_report
 from tag_keeper.scan import RootUnavailableError, scan_root
 from tag_keeper.suggest_queue import SuggestQueue
-from tag_keeper.syncguard import OneDriveGuard, SyncError, SyncGuard, make_guard
+from tag_keeper.syncguard import CloudSyncGuard, OneDriveGuard, SyncError, SyncGuard, make_guard
 from tag_keeper.tags import TagError, TagStore, normalize_tag
 from tag_keeper.tags import search as tags_search
 from tag_keeper.web.auth import (
@@ -352,6 +352,38 @@ def create_app(
             "sync": sync,
             "category_order": rules.CATEGORY_ORDER,
         }
+
+    # --- 同期（cloud-sync）の状態と手動の開始 ---
+
+    def cloud_guard(root: str) -> tuple[RootConfig, CloudSyncGuard]:
+        """ルートの同期窓口が cloud-sync であることを確かめて返す。"""
+        rc = settings.config().find_root(root)
+        if rc is None:
+            raise fail(404, f"ルートがありません: {root}")
+        guard = _guard(rc)
+        if not isinstance(guard, CloudSyncGuard):
+            raise fail(409, f"ルート {root} は cloud-sync と連携していません（sync_client = \"cloud-sync\" を設定してください）")
+        return rc, guard
+
+    @app.route("/api/sync")
+    def api_sync() -> dict[str, Any]:
+        """cloud-sync と連携している全ルートの同期の状態（画面が数秒ごとに読む。カタログには触れない）。"""
+        items: list[dict[str, Any]] = []
+        for rc in settings.config().roots:
+            guard = _guard(rc)
+            if isinstance(guard, CloudSyncGuard):
+                items.append({"root": rc.name, **guard.status()})
+        return {"items": items}
+
+    @app.post("/api/sync/<root>/start")
+    def api_sync_start(root: str) -> dict[str, Any]:
+        """今すぐ1回同期する（定期の同期とは別に手動で始める）。"""
+        _rc, guard = cloud_guard(root)
+        try:
+            guard.trigger()
+        except SyncError as e:
+            raise fail(409, str(e)) from e
+        return {"root": root, **guard.status()}
 
     @app.route("/api/jobs/current")
     def api_job_current() -> dict[str, Any]:

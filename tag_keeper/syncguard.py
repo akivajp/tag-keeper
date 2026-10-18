@@ -14,14 +14,21 @@ tag-keeper が利用者の承認のもとで大量に隔離するときは、次
 
 3 が失敗したら再開しない（再開しても同じ理由で終了を繰り返すため）。
 状態は実行記録に残し、画面やコマンドから再試行できるようにする（plan.retry_sync）。
+
+rclone bisync を timer で定期実行する cloud-sync（CloudSyncGuard）とも連携できる。
+こちらは常駐しないので、1 では timer を止め、動いている同期が終わるのを待つ。
+3 は `cloud-sync run <名前> --max-delete <割合>` で、4 は timer の再開で行う。
 """
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
 import subprocess
+import time
+import tomllib
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -227,8 +234,212 @@ class OneDriveGuard:
         return out
 
 
+# cloud-sync（rclone bisync の定期実行）の出力。-v のログで、消したものは「<パス>: Deleted」と出る
+_RCLONE_DELETED = re.compile(r"INFO\s+: (.+): Deleted\s*$")
+CLOUD_SYNC_BUSY = 75  # cloud-sync の終了コード: 別の同期が動いている
+
+
+def _pid_alive(pid: object) -> bool:
+    """pid のプロセスが生きているか。"""
+    if not isinstance(pid, int):
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+@dataclass
+class CloudSyncGuard:
+    """cloud-sync（rclone bisync を systemd の timer で定期実行する仕組み）との連携。
+
+    cloud-sync は常駐しない。同期中にファイルを移すと途中の状態を拾ってしまうので、
+    実行のたびに timer を止め、動いている同期が終わるのを待ってから隔離する。
+
+    Attributes:
+        service: cloud-sync の systemd --user ユニット名（"cloud-sync-onedrive.service" か、項目名だけでもよい）。
+        mode: 連携の条件。cloud-sync では常に "always"（timer の同期が隔離と重ならないようにするため）。
+        command: cloud-sync の実行ファイル。
+        systemctl: systemctl の実行ファイル。
+        state_dir: cloud-sync の状態ファイルの置き場所（既定は ~/.local/state/cloud-sync）。
+        config_file: cloud-sync の設定ファイル（同期フォルダと、反映時の削除の上限を読む）。
+        wait_seconds: 動いている同期が終わるのを待つ上限（秒）。
+    """
+
+    service: str = "cloud-sync-onedrive.service"
+    mode: str = "always"
+    command: str = "~/scripts/cloud-sync"
+    systemctl: str = "systemctl"
+    state_dir: Path | None = None
+    config_file: Path | None = None
+    wait_seconds: float = 1800.0
+    poll_seconds: float = 2.0
+    name: str = "cloud-sync"
+
+    @property
+    def entry(self) -> str:
+        """cloud-sync の項目名（ユニット名から接頭辞と拡張子を除いたもの）。"""
+        e = re.sub(r"\.(service|timer)$", "", self.service)
+        return e.removeprefix("cloud-sync-")
+
+    @property
+    def timer_unit(self) -> str:
+        """定期実行の timer のユニット名。"""
+        return f"cloud-sync-{self.entry}.timer"
+
+    @property
+    def service_unit(self) -> str:
+        """1回分の同期のユニット名。"""
+        return f"cloud-sync-{self.entry}.service"
+
+    def _state_file(self) -> Path:
+        base = self.state_dir or Path(os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state")) / "cloud-sync"
+        return base / f"{self.entry}.json"
+
+    def _systemctl(self, *args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
+        """systemctl --user を実行する。失敗したら SyncError。"""
+        cmd = [self.systemctl, "--user", *args]
+        try:
+            res = subprocess.run(cmd, capture_output=True, text=True, check=False, timeout=60)
+        except (OSError, subprocess.TimeoutExpired) as e:
+            raise SyncError(f"実行できません: {' '.join(cmd)} ({e})") from e
+        if check and res.returncode != 0:
+            raise SyncError(f"失敗しました: {' '.join(cmd)}: {(res.stderr or res.stdout).strip()}")
+        return res
+
+    def read_state(self) -> dict[str, object]:
+        """cloud-sync の状態ファイルを読む。実行中のはずなのにプロセスが無ければ interrupted にする。"""
+        try:
+            s: dict[str, object] = json.loads(self._state_file().read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {"state": "unknown"}
+        if s.get("state") in ("running", "waiting") and not _pid_alive(s.get("pid")):
+            s["state"] = "interrupted"
+        return s
+
+    def is_running(self) -> bool:
+        """同期が動いている（または順番待ちをしている）か。"""
+        return self.read_state().get("state") in ("running", "waiting")
+
+    def _entry_config(self) -> dict[str, object]:
+        """cloud-sync の設定ファイルのうち、この項目の部分。読めなければ空。"""
+        path = self.config_file or Path(os.path.expanduser("~/.config/cloud-sync/config.toml"))
+        try:
+            raw = tomllib.loads(path.read_text(encoding="utf-8"))
+        except (OSError, tomllib.TOMLDecodeError):
+            return {}
+        entry = raw.get("remotes", {}).get(self.entry, {})
+        return entry if isinstance(entry, dict) else {}
+
+    def sync_dir(self) -> Path:
+        """同期フォルダ（シンボリックリンクは解決する）。"""
+        local = self._entry_config().get("local")
+        if not isinstance(local, str):
+            raise SyncError(f"cloud-sync の設定に項目 {self.entry} がありません")
+        return Path(os.path.expanduser(local)).resolve()
+
+    def relpath(self, path: Path) -> str:
+        """同期フォルダからの相対パス。消えた後でも求められるよう、親だけを解決する。"""
+        resolved = path.parent.resolve() / path.name
+        try:
+            return resolved.relative_to(self.sync_dir()).as_posix()
+        except (ValueError, SyncError):
+            return path.as_posix()
+
+    def needs_pause(self, children: Sequence[int]) -> bool:
+        """常に True（timer の同期が、隔離のための移動と重ならないようにするため）。"""
+        return True
+
+    def pause(self) -> None:
+        """timer を止め、動いている同期が終わるのを待つ。待ち切れなければ SyncError。"""
+        log.info("定期同期を止めます: %s", self.timer_unit)
+        self._systemctl("stop", self.timer_unit)
+        deadline = time.monotonic() + self.wait_seconds
+        while self.is_running():
+            if time.monotonic() > deadline:
+                raise SyncError(f"動いている同期が {int(self.wait_seconds)} 秒たっても終わりません: {self.entry}")
+            time.sleep(self.poll_seconds)
+
+    def flush(
+        self,
+        max_children: int,
+        on_deleted: Callable[[str], None] | None = None,
+        on_line: Callable[[str], None] | None = None,
+    ) -> None:
+        """1回限りの同期で、ローカルでの削除をクラウドに反映する。
+
+        削除の上限（%）は、この実行に限り cloud-sync の設定の flush_max_delete（既定 50）まで上げる。
+        """
+        limit = self._entry_config().get("flush_max_delete", 50)
+        cmd = [os.path.expanduser(self.command), "run", self.entry, "--max-delete", str(limit)]
+        state = self.read_state()
+        log_path = Path(str(state["log"])) if state.get("log") else None
+        offset = log_path.stat().st_size if log_path and log_path.exists() else 0
+        log.info("削除をクラウドに反映します: %s", " ".join(cmd))
+        try:
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+        except OSError as e:
+            raise SyncError(f"cloud-sync を実行できません: {e}") from e
+        assert proc.stdout is not None
+        tail: list[str] = []
+        for raw in proc.stdout:
+            line = raw.rstrip("\n")
+            tail = (tail + [line])[-20:]
+            if on_line is not None:
+                on_line(line)
+        code = proc.wait()
+        # 消えた一覧は、実行中に増えたログから拾う
+        state = self.read_state()
+        log_path = Path(str(state["log"])) if state.get("log") else log_path
+        if on_deleted is not None and log_path and log_path.exists():
+            with open(log_path, encoding="utf-8", errors="replace") as f:
+                f.seek(offset)
+                for line in f:
+                    m = _RCLONE_DELETED.search(line)
+                    if m:
+                        on_deleted(m.group(1))
+        if code == CLOUD_SYNC_BUSY:
+            raise SyncError(f"別の同期が動いています: {self.entry}")
+        if code != 0:
+            detail = str(state.get("message") or " / ".join(tail[-3:]))
+            raise SyncError(f"cloud-sync が失敗しました（終了コード {code}）: {detail}")
+
+    def resume(self) -> None:
+        """timer を再開する。"""
+        log.info("定期同期を再開します: %s", self.timer_unit)
+        self._systemctl("start", self.timer_unit)
+
+    def trigger(self) -> None:
+        """今すぐ1回同期する（待たずに戻る）。すでに動いていれば SyncError。"""
+        if self.is_running():
+            raise SyncError(f"すでに同期が動いています: {self.entry}")
+        self._systemctl("start", "--no-block", self.service_unit)
+
+    def status(self) -> dict[str, str | int | bool]:
+        """同期の状態（画面の表示用）。state は idle / running / waiting / error / needs_resync / interrupted / unknown。"""
+        s = self.read_state()
+        timer = self._systemctl("is-active", self.timer_unit, check=False).stdout.strip() or "unknown"
+        out: dict[str, str | int | bool] = {
+            "client": self.name, "service": self.service_unit, "mode": self.mode, "threshold": 0,
+            "can_trigger": True, "timer": timer, "state": str(s.get("state", "unknown")),
+        }
+        for k in ("started", "finished", "last_ok", "message", "saved_versions"):
+            if s.get(k) not in (None, ""):
+                out[k] = s[k]  # type: ignore[assignment]
+        try:
+            out["sync_dir"] = str(self.sync_dir())
+        except SyncError as e:
+            out["error"] = str(e)
+        return out
+
+
 def make_guard(sync_client: str, service: str, mode: str) -> SyncGuard | None:
     """ルートの設定から連携の窓口を作る。連携しないなら None。"""
     if sync_client == "onedrive":
         return OneDriveGuard(service=service, mode=mode)
+    if sync_client == "cloud-sync":
+        return CloudSyncGuard(service=service)
     return None

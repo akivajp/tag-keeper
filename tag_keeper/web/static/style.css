@@ -108,6 +108,15 @@ button:disabled { opacity: .5; cursor: not-allowed; }
 .badge.ok { background: var(--ok-bg); color: var(--ok); }
 .badge.warn { background: var(--warn-bg); color: var(--warn); }
 .badge.danger { background: var(--danger-bg); color: var(--danger); }
+.badge.info { background: var(--accent); color: var(--accent-text); }
+
+/* 同期が動いている間の表示 */
+.sync-banner { border-color: var(--accent); }
+.sync-banner strong::before {
+  content: ''; display: inline-block; width: .8em; height: .8em; margin-right: .5em; vertical-align: -.1em;
+  border: 2px solid var(--accent); border-right-color: transparent; border-radius: 50%; animation: sync-spin 1s linear infinite;
+}
+@keyframes sync-spin { to { transform: rotate(360deg); } }
 
 .alert { border-radius: 10px; padding: .75rem 1rem; margin: .75rem 0; border: 1px solid; }
 .alert.danger { background: var(--danger-bg); border-color: var(--danger); }
