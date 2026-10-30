@@ -165,8 +165,44 @@ function renderSyncBanner(items) {
     if (it.state !== 'running' && it.state !== 'waiting') continue;
     holder.append(h('div', { class: 'alert info sync-banner' },
       h('strong', {}, t('同期中: {root}', { root: it.root })),
-      ' ' + (it.started ? t('（{when} に開始）', { when: when(it.started) }) : '')));
+      ' ' + (it.started ? t('（{when} に開始）', { when: when(it.started) }) : ''),
+      it.progress ? syncProgressView(it.progress) : null));
   }
+}
+
+// 同期の段階（サーバーの SyncProgress.phase）の表示名
+const SYNC_PHASES = {
+  starting: '開始しています', listing: '一覧を作っています', diff: '差分を調べています', applying: '変更を反映しています',
+  download: 'クラウドから取り込んでいます', upload: 'クラウドへ送っています', updating: '一覧を更新しています',
+  no_changes: '変更はありません', finished: '仕上げています',
+};
+
+/** 同期の進み具合（段階・進捗バー・件数・転送量・残り時間・最後に扱ったファイル）を描く。 */
+function syncProgressView(p) {
+  const st = p.stats || {};
+  const total = (p.queued_copies || 0) + (p.queued_deletes || 0);
+  const done = Math.min(total, (p.copied || 0) + (p.deleted || 0));
+  // 反映する件数が分かれば件数の割合、分からなければ動いていることだけを示す
+  const bar = total
+    ? h('div', { class: 'bar' }, h('div', { style: `width:${(done / total * 100).toFixed(1)}%` }))
+    : h('div', { class: 'bar indeterminate' }, h('div'));
+  const figures = [h('span', {}, t(SYNC_PHASES[p.phase] || p.phase))];
+  if (total) figures.push(h('span', {}, t('反映 {done} / {total} 件（{pct}%）', { done: num(done), total: num(total), pct: (done / total * 100).toFixed(1) })));
+  if (p.queued_copies) figures.push(h('span', {}, t('コピー {done} / {total}', { done: num(p.copied), total: num(p.queued_copies) })));
+  if (p.queued_deletes) figures.push(h('span', {}, t('削除 {done} / {total}', { done: num(p.deleted), total: num(p.queued_deletes) })));
+  if (!total && st.listed) figures.push(h('span', {}, t('一覧 {n} 件', { n: num(st.listed) })));
+  if (st.bytes_total && st.bytes_total !== '0 B') {
+    figures.push(h('span', {}, t('転送 {done} / {total}', { done: st.bytes_done, total: st.bytes_total })));
+    if (st.speed && st.speed !== '0 B/s') figures.push(h('span', {}, t('速さ {rate}/秒', { rate: st.speed.replace(/\/s$/, '') })));
+    if (st.eta && st.eta !== '-') figures.push(h('span', {}, t('転送の残り {eta}', { eta: st.eta })));
+  }
+  if (st.elapsed) figures.push(h('span', { class: 'muted' }, t('経過 {elapsed}', { elapsed: st.elapsed })));
+  if (p.errors) figures.push(h('span', { class: 'badge danger' }, t('エラー {n} 件', { n: num(p.errors) })));
+  return h('div', { class: 'sync-progress' },
+    bar,
+    h('div', { class: 'figures' }, figures),
+    p.last_file ? h('div', { class: 'muted path' }, p.last_file) : null,
+    p.last_error ? h('div', { class: 'error-line' }, p.last_error) : null);
 }
 
 /** 同期の状態を読み、表示を更新する。動いている間は2秒ごと、そうでなければ15秒ごとに確かめる。 */

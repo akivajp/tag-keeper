@@ -95,6 +95,7 @@ rclone を使う場合は `sync_client = "cloud-sync"`、`sync_service = "cloud-
 systemd の timer で定期実行する `rclone bisync` と連携します。timer を止め、動いている同期が終わるのを待ち、
 隔離し、その実行に限り `--max-delete` を上げて1回同期して削除を反映し、timer を再開します。
 ルートの画面には「今すぐ同期」ボタンが付き、同期中は全画面の上部に表示が出ます。
+この表示には、cloud-sync のログから読み取った進み具合（段階・反映した件数・転送量・速さ・残り時間・最後に扱ったファイル・エラー）が出ます。
 
 1. 常駐の同期を止める（`systemctl --user stop onedrive.service`）
 2. 隔離する

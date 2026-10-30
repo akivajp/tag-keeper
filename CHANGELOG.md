@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Sync progress** in the banner shown while a cloud-sync run is going: phase, items applied
+  (copies and deletions against what bisync queued), bytes transferred, speed, time left, the
+  latest file and errors, read from the cloud-sync log (`progress` in `GET /api/sync`). Only the
+  part of the log written since the last poll is read.
+
 ## [0.8.0] - 2026-10-18
 
 ### Added

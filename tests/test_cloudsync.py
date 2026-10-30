@@ -158,3 +158,89 @@ def test_api_sync_status_and_manual_start(web: tuple[TestApp, CloudSyncGuard, Pa
     (g._state_file()).write_text(json.dumps({"state": "running", "pid": os.getpid()}))
     app.post_json("/api/sync/data/start", {}, headers={"Origin": f"http://{HOST}"}, status=409)
     assert app.get("/api/sync").json["items"][0]["state"] == "running"
+
+
+# 前回の実行（数えない）と、今回の実行の途中までのログ。rclone -v --stats の出力の形
+_PREV_RUN = """
+===== 2026-10-30T22:00:00+09:00 cloud-sync onedrive =====
+2026/10/30 22:00:01 INFO  : old/a.txt: Copied (new)
+"""
+_CUR_RUN = """
+===== 2026-10-30T22:33:29+09:00 cloud-sync onedrive =====
+2026/10/30 22:33:40 INFO  : Building Path1 and Path2 listings
+2026/10/30 22:34:01 INFO  : 
+Transferred:   	          0 B / 0 B, -, 0 B/s, ETA -
+Checks:                 0 / 0, -, Listed 3007
+Elapsed time:        20.2s
+
+2026/10/30 22:35:09 INFO  : Path1 checking for diffs
+2026/10/30 22:35:09 INFO  : Path1: 3 changes: 2 new,    0 modified, 1 deleted
+2026/10/30 22:35:09 INFO  : Applying changes
+2026/10/30 22:35:09 INFO  : - Path1             Queue copy to Path2                         - /home/u/OneDrive/new/a.txt
+2026/10/30 22:35:09 INFO  : - Path1             Queue copy to Path2                         - /home/u/OneDrive/new/b.txt
+2026/10/30 22:35:09 INFO  : - Path2             Queue delete                                - /home/u/OneDrive/old/c.txt
+2026/10/30 22:35:09 INFO  : - Path1             Do queued copies to                         - Path2
+2026/10/30 22:36:00 INFO  : new/a.txt: Copied (new)
+2026/10/30 22:36:01 ERROR : new/b.sys: Failed to copy: malwareDetected
+2026/10/30 22:36:31 INFO  : 
+Transferred:   	    1.172 GiB / 3.554 GiB, 33%, 4.131 MiB/s, ETA 9m50s
+Checks:             28164 / 28164, 100%, Listed 45973
+Transferred:           98 / 5376, 2%
+Elapsed time:      3m50.2s
+"""
+
+
+def test_progress_reads_only_the_current_run_incrementally(guard: tuple[CloudSyncGuard, Path, Path], tmp_path: Path) -> None:
+    g, _calls, state = guard
+    log = tmp_path / "onedrive.log"
+    log.write_text(_PREV_RUN + _CUR_RUN + "2026/10/30 22:36:40 INFO  : old/c.txt: Moved into b")  # 最後の行は書きかけ
+    (state / "onedrive.json").write_text(json.dumps(
+        {"state": "running", "pid": os.getpid(), "started": "2026-10-30T22:33:29+09:00", "log": str(log)}))
+    p = g.status()["progress"]
+    assert p["phase"] == "download"
+    assert p["changes"] == {"Path1": {"new": 2, "modified": 0, "deleted": 1}}
+    assert (p["queued_copies"], p["queued_deletes"], p["copied"], p["deleted"]) == (2, 1, 1, 0)  # 前回の実行の行は数えない
+    assert p["errors"] == 1 and "malwareDetected" in p["last_error"]
+    assert p["stats"] == {
+        "bytes_done": "1.172 GiB", "bytes_total": "3.554 GiB", "bytes_pct": "33%", "speed": "4.131 MiB/s", "eta": "9m50s",
+        "checks": 28164, "listed": 45973, "files_done": 98, "files_total": 5376, "elapsed": "3m50.2s",
+    }
+    # 書きかけだった行が書き終わると、次の問い合わせで増えた分だけ数える
+    with open(log, "a") as f:
+        f.write("ackup dir\n2026/10/30 22:37:00 INFO  : Updating listings\n2026/10/30 22:37:01 INFO  : Bisync successful\n")
+    p = g.progress()
+    assert (p["copied"], p["deleted"], p["last_file"], p["phase"]) == (1, 1, "old/c.txt", "finished")
+
+
+def test_progress_before_the_run_heading_is_written(guard: tuple[CloudSyncGuard, Path, Path], tmp_path: Path) -> None:
+    g, _calls, state = guard
+    log = tmp_path / "onedrive.log"
+    log.write_text(_PREV_RUN)
+    # 状態は「実行中」になったが、ログに今回の見出しがまだ無い
+    (state / "onedrive.json").write_text(json.dumps(
+        {"state": "running", "pid": os.getpid(), "started": "2026-10-30T22:33:29+09:00", "log": str(log)}))
+    p = g.progress()
+    assert p is not None and p["phase"] == "starting" and p["copied"] == 0
+    # 見出しが書かれた後は、今回の分を数える
+    with open(log, "a") as f:
+        f.write(_CUR_RUN)
+    assert g.progress()["copied"] == 1  # type: ignore[index]
+
+
+def test_find_run_start_across_blocks(tmp_path: Path) -> None:
+    from tag_keeper import syncguard
+
+    log = tmp_path / "big.log"
+    # 見出しの後ろに 1MB（探すブロックの大きさ）を超える行を置き、見出しが前のブロックにあっても見つかることを確かめる
+    filler = "".join(f"2026/10/30 22:00:00 INFO  : - Path1 File is new - dir/{i:07d}.txt\n" for i in range(30000))
+    log.write_text("===== 2026-10-30T21:00:00+09:00 cloud-sync pcloud =====\n" + "x\n" * 10
+                   + "===== 2026-10-30T22:00:00+09:00 cloud-sync onedrive =====\n" + filler
+                   + "===== 2026-10-30T23:00:00+09:00 cloud-sync pcloud =====\n")
+    found = syncguard._find_run_start(log, "onedrive")
+    assert found is not None
+    offset, iso = found
+    assert iso == "2026-10-30T22:00:00+09:00"
+    with open(log, "rb") as f:
+        f.seek(offset)
+        assert f.readline().startswith(b"===== 2026-10-30T22:00:00+09:00 cloud-sync onedrive")
+    assert syncguard._find_run_start(log, "nope") is None

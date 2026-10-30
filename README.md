@@ -116,7 +116,9 @@ Prefer rclone? Set `sync_client = "cloud-sync"` and `sync_service = "cloud-sync-
 to coordinate with an `rclone bisync` job run by a systemd timer instead: tag-keeper stops the
 timer, waits for a running sync to finish, quarantines, runs one sync with a raised
 `--max-delete` for that run only, and starts the timer again. The Roots page then shows a
-*Sync now* button and every page shows a banner while a sync is running.
+*Sync now* button and every page shows a banner while a sync is running, with its progress read
+from the cloud-sync log (phase, items applied, bytes transferred, speed, time left, the latest
+file and errors).
 
 If step 3 fails, the resident sync is left stopped (restarting it would only exit again),
 the failure is journaled, and the web UI and `tag-keeper sync <plan-id> --retry` offer to

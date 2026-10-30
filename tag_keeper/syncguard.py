@@ -22,11 +22,13 @@ rclone bisync を timer で定期実行する cloud-sync（CloudSyncGuard）と�
 
 from __future__ import annotations
 
+import datetime as dt
 import json
 import logging
 import os
 import re
 import subprocess
+import threading
 import time
 import tomllib
 from collections.abc import Callable, Sequence
@@ -238,6 +240,146 @@ class OneDriveGuard:
 _RCLONE_DELETED = re.compile(r"INFO\s+: (.+): Deleted\s*$")
 CLOUD_SYNC_BUSY = 75  # cloud-sync の終了コード: 別の同期が動いている
 
+# 同期中の進み具合を、cloud-sync のログ（rclone -v --stats）から読み取るための行の形（rclone v1.7x で確認）
+_LOG_TIME = re.compile(r"^(\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2}) ")
+_RUN_MARKER = re.compile(r"^===== (\S+) cloud-sync (\S+) ")  # cloud-sync が実行ごとに書く見出し
+# bisync の段階を示す行（INFO  : の後ろ）。Path1 はクラウド、Path2 はローカル
+_PHASES: tuple[tuple[str, str], ...] = (
+    ("Building Path1 and Path2 listings", "listing"),
+    ("Path1 checking for diffs", "diff"),
+    ("Path2 checking for diffs", "diff"),
+    ("Applying changes", "applying"),
+    ("Do queued copies to                         - Path2", "download"),
+    ("Do queued copies to                         - Path1", "upload"),
+    ("Updating listings", "updating"),
+    ("No changes found", "no_changes"),
+    ("Bisync successful", "finished"),
+)
+_CHANGES = re.compile(r"INFO\s+: (Path[12]): +(\d+) changes: +(\d+) new, +(\d+) modified, +(\d+) deleted")
+_QUEUE = re.compile(r"INFO\s+: - Path[12] +Queue (copy to|delete) ")
+_COPIED = re.compile(r"INFO\s+: (.+): Copied \(")
+_REMOVED = re.compile(r"INFO\s+: (.+): (?:Deleted|Moved into backup dir)\s*$")
+_ERROR = re.compile(r"(?:ERROR|CRITICAL)\s*: (.*)$")
+# --stats が一定間隔で書く集計（複数行）。転送量の行と件数の行は、どちらも Transferred: で始まる
+_ST_BYTES = re.compile(r"^Transferred:\s+(.+?) / (.+?), (-|\d+%), (.+?), ETA (\S+)")
+_ST_FILES = re.compile(r"^Transferred:\s+(\d+) / (\d+), (-|\d+%)\s*$")
+_ST_CHECKS = re.compile(r"^Checks:\s+(\d+) / (\d+), (?:-|\d+%)(?:, Listed (\d+))?")
+_ST_ELAPSED = re.compile(r"^Elapsed time:\s+(\S+)")
+# 1回の実行の見出しを探すときに、ログの末尾から遡る上限（バイト）
+_MARKER_SEARCH_LIMIT = 512 * 1024 * 1024
+
+
+@dataclass
+class SyncProgress:
+    """1回の同期の進み具合（cloud-sync のログを1行ずつ読んで数える）。"""
+
+    phase: str = "starting"
+    changes: dict[str, dict[str, int]] = field(default_factory=dict)
+    queued_copies: int = 0
+    queued_deletes: int = 0
+    copied: int = 0
+    deleted: int = 0
+    errors: int = 0
+    last_error: str = ""
+    last_file: str = ""
+    updated: str = ""
+    stats: dict[str, str | int] = field(default_factory=dict)
+
+    def feed(self, line: str) -> None:
+        """ログの1行を読み、段階や件数を更新する。"""
+        m = _LOG_TIME.match(line)
+        if m:
+            self.updated = m.group(1)
+        # 集計の行（時刻の付かない行）
+        if not m:
+            if mm := _ST_BYTES.match(line):
+                self.stats.update(bytes_done=mm.group(1).strip(), bytes_total=mm.group(2).strip(),
+                                  bytes_pct=mm.group(3), speed=mm.group(4).strip(), eta=mm.group(5))
+            elif mm := _ST_FILES.match(line):
+                self.stats.update(files_done=int(mm.group(1)), files_total=int(mm.group(2)))
+            elif mm := _ST_CHECKS.match(line):
+                self.stats.update(checks=int(mm.group(1)))
+                if mm.group(3):
+                    self.stats["listed"] = int(mm.group(3))
+            elif mm := _ST_ELAPSED.match(line):
+                self.stats["elapsed"] = mm.group(1)
+            return
+        # 1件ごとの行は数が多いので、先に安く判定する
+        if (mm := _COPIED.search(line)) is not None:
+            self.copied += 1
+            self.last_file = mm.group(1)
+            return
+        if (mm := _REMOVED.search(line)) is not None:
+            self.deleted += 1
+            self.last_file = mm.group(1)
+            return
+        if (mm := _QUEUE.search(line)) is not None:
+            if mm.group(1) == "delete":
+                self.queued_deletes += 1
+            else:
+                self.queued_copies += 1
+            return
+        if (mm := _CHANGES.search(line)) is not None:
+            self.changes[mm.group(1)] = {"new": int(mm.group(3)), "modified": int(mm.group(4)), "deleted": int(mm.group(5))}
+            return
+        if (mm := _ERROR.search(line)) is not None:
+            self.errors += 1
+            self.last_error = mm.group(1)[:300]
+            return
+        for text, phase in _PHASES:
+            if text in line:
+                self.phase = phase
+                return
+
+    def to_dict(self) -> dict[str, object]:
+        """画面に渡す形にする。"""
+        return {
+            "phase": self.phase, "changes": {k: dict(v) for k, v in self.changes.items()},
+            "queued_copies": self.queued_copies, "queued_deletes": self.queued_deletes,
+            "copied": self.copied, "deleted": self.deleted,
+            "errors": self.errors, "last_error": self.last_error,
+            "last_file": self.last_file, "updated": self.updated, "stats": dict(self.stats),
+        }
+
+
+def _find_run_start(path: Path, entry: str, limit: int = _MARKER_SEARCH_LIMIT) -> tuple[int, str] | None:
+    """ログの末尾から遡って、最後の実行の見出し行の位置（バイト）と、見出しの日時を返す。
+
+    ログは実行ごとに追記されて大きくなるので、全体は読まずに末尾からブロック単位で探す。
+    """
+    needle = f" cloud-sync {entry} ".encode()
+    block = 1024 * 1024
+    with open(path, "rb") as f:
+        end = f.seek(0, os.SEEK_END)
+        pos = end
+        carry = b""
+        while pos > 0 and end - pos < limit:
+            start = max(0, pos - block)
+            f.seek(start)
+            chunk = f.read(pos - start) + carry
+            # 行頭の "===== " を後ろから探す（ブロックの先頭で切れた行は次のブロックに回す）
+            i = len(chunk)
+            while (i := chunk.rfind(b"===== ", 0, i)) >= 0:
+                at_line_start = i == 0 and start == 0 or i > 0 and chunk[i - 1 : i] == b"\n"
+                if at_line_start:
+                    eol = chunk.find(b"\n", i)
+                    line = chunk[i : eol if eol >= 0 else len(chunk)]
+                    if needle in line:
+                        m = _RUN_MARKER.match(line.decode("utf-8", "replace"))
+                        return start + i, m.group(1) if m else ""
+            cut = chunk.find(b"\n")
+            carry = chunk[: cut + 1] if cut >= 0 and start > 0 else b""
+            pos = start
+    return None
+
+
+def _iso_seconds(iso: str) -> float | None:
+    """ISO 8601 の日時を UNIX 時刻にする。読めなければ None。"""
+    try:
+        return dt.datetime.fromisoformat(iso).timestamp()
+    except (TypeError, ValueError):
+        return None
+
 
 def _pid_alive(pid: object) -> bool:
     """pid のプロセスが生きているか。"""
@@ -278,6 +420,9 @@ class CloudSyncGuard:
     wait_seconds: float = 1800.0
     poll_seconds: float = 2.0
     name: str = "cloud-sync"
+    # 進み具合の読み取りの途中経過（ログのパス, 実行の開始日時, 次に読む位置, 集計）。画面が数秒ごとに読むので差分だけ読む
+    _progress: tuple[str, str, int, SyncProgress] | None = field(default=None, init=False, repr=False)
+    _progress_lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
 
     @property
     def entry(self) -> str:
@@ -433,7 +578,59 @@ class CloudSyncGuard:
             out["sync_dir"] = str(self.sync_dir())
         except SyncError as e:
             out["error"] = str(e)
+        if out["state"] == "running":
+            try:
+                progress = self.progress(s)
+            except OSError as e:
+                log.warning("同期の進み具合を読めません: %s", e)
+                progress = None
+            if progress is not None:
+                out["progress"] = progress  # type: ignore[assignment]
         return out
+
+    def progress(self, state: dict[str, object] | None = None) -> dict[str, object] | None:
+        """動いている同期の進み具合を、cloud-sync のログから読み取って返す。読めなければ None。
+
+        初回はログの末尾から今回の実行の見出しを探し、以降は前回読んだ位置から増えた分だけを読む。
+        """
+        # 画面の問い合わせが重なっても、同じ行を二重に数えないようにする
+        with self._progress_lock:
+            return self._read_progress(state)
+
+    def _read_progress(self, state: dict[str, object] | None) -> dict[str, object] | None:
+        """progress の本体（ロックを取った状態で呼ぶ）。"""
+        s = state if state is not None else self.read_state()
+        log_path = s.get("log")
+        started = str(s.get("started") or "")
+        if not isinstance(log_path, str) or not log_path:
+            return None
+        path = Path(log_path)
+        if not path.exists():
+            return None
+        cached = self._progress
+        if cached is not None and cached[0] == log_path and cached[1] == started and path.stat().st_size >= cached[2]:
+            _p, _s, offset, prog = cached
+        else:
+            found = _find_run_start(path, self.entry)
+            if found is None:
+                return SyncProgress().to_dict()
+            offset, marker_iso = found
+            # 見出しがまだ書かれていない（前回の実行の見出ししか無い）なら、始まったところとして扱う
+            t_marker, t_started = _iso_seconds(marker_iso), _iso_seconds(started)
+            if t_marker is not None and t_started is not None and t_marker < t_started - 5:
+                return SyncProgress().to_dict()
+            prog = SyncProgress()
+        with open(path, "rb") as f:
+            f.seek(offset)
+            while True:
+                raw = f.readline()
+                # 書きかけの行（改行で終わっていない行）は、次の問い合わせで読む
+                if not raw or not raw.endswith(b"\n"):
+                    break
+                offset += len(raw)
+                prog.feed(raw.decode("utf-8", "replace").rstrip("\r\n"))
+        self._progress = (log_path, started, offset, prog)
+        return prog.to_dict()
 
 
 def make_guard(sync_client: str, service: str, mode: str) -> SyncGuard | None:
