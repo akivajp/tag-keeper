@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.1] - 2026-11-05
+
+### Fixed
+
+- **Tag search with non-ASCII tags.** Searching for a tag such as `種類:請求書` on the Tags page
+  failed with "control characters are not allowed"; the search parameters were read as latin-1.
+- **English text in the Japanese UI.** Toasts for finished jobs, the category labels on the
+  report's plan form and some plan item details were translated to English even in the
+  Japanese UI.
+
 ## [0.9.0] - 2026-10-30
 
 ### Added
@@ -180,7 +190,8 @@ First release. The web UI and messages are in Japanese.
 - **Decision log.** Accepted suggestions, tag accept and reject, and undone plans are
   appended per machine; the closest past decisions are given to the model as examples.
 
-[Unreleased]: https://github.com/akivajp/tag-keeper/compare/v0.9.0...HEAD
+[Unreleased]: https://github.com/akivajp/tag-keeper/compare/v0.9.1...HEAD
+[0.9.1]: https://github.com/akivajp/tag-keeper/compare/v0.9.0...v0.9.1
 [0.9.0]: https://github.com/akivajp/tag-keeper/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/akivajp/tag-keeper/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/akivajp/tag-keeper/compare/v0.6.0...v0.7.0
