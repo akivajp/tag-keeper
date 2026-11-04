@@ -350,6 +350,12 @@ def test_tag_management_and_search(env: dict) -> None:
     assert item["tags"]["direct"][0]["tag"] == "type:report" and item["tags"]["inherited"][0]["tag"] == "area:docs"
     app.get("/api/tags/search", {"root": "data"}, status=400)
 
+    # 日本語のタグでも探せる（複数の値をとる問い合わせも UTF-8 として読む）
+    app.post_json("/api/tags", {"root": "data", "paths": ["docs/report.pdf"], "tag": "種類:報告書"}, headers=origin)
+    assert search(tag="種類:報告書") == ["docs/report.pdf"]
+    assert search(tag="area:docs", **{"not": "種類:報告書"}) == ["docs/Thumbs.db", "docs/sub/memo.txt"]
+    app.post_json("/api/tags", {"root": "data", "paths": ["docs/report.pdf"], "tag": "種類:報告書", "op": "remove"}, headers=origin)
+
     assert app.post_json("/api/tags/rename", {"from": "type:report", "to": "type:document"}, headers=origin).json["changed"] == 1
     assert search(tag="type:document") == ["docs/report.pdf"]
     assert app.post_json("/api/tags/delete", {"tag": "draft"}, headers=origin).json["changed"] == 1

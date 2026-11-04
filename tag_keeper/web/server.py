@@ -998,8 +998,10 @@ def create_app(
         q = bottle.request.query
         config = settings.config()
         rc = root_config(config, q.getunicode("root", "") or (config.roots[0].name if config.roots else ""))
-        include = [x for x in q.getall("tag") if x]
-        exclude = [x for x in q.getall("not") if x]
+        # getall() は値を latin-1 のまま返すので、UTF-8 に直した写しから読む（日本語のタグのため）
+        uq = q.decode()
+        include = [x for x in uq.getall("tag") if x]
+        exclude = [x for x in uq.getall("not") if x]
         mode = "or" if q.get("mode") == "or" else "and"
         word = q.getunicode("q", "").strip().lower()
         files_only = q.get("folders") != "1"
