@@ -71,6 +71,7 @@ const out = {
 };
 i18n.lang = 'ja';
 out.ja = t('{n} 件を選択中', { n: 3 });
+out.jaString = translateString('プランの作成: demo');
 console.log(JSON.stringify(out));
 """
 
@@ -91,6 +92,7 @@ def test_translation_in_node(tmp_path: Path) -> None:
     assert out["regen"] == "node_modules can be rebuilt"
     assert out["prefixed"] == "Not found: a/b.pdf"
     assert out["untouched"] == "利用者のフォルダ名"  # 辞書に無い文は日本語のまま
+    assert out["jaString"] == "プランの作成: demo"  # 日本語の画面では、サーバーからの文も訳さない
 
 
 def test_badges_inside_paths_are_translated() -> None:

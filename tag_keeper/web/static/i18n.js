@@ -269,7 +269,8 @@ function t(text, params = {}) {
 
 /** 表示されたテキスト1つを英語にする（辞書・正規表現・文ごと・「前置き: 値」の順に試す）。 */
 function translateString(s) {
-  if (!I18N_JA_CHARS.test(s)) return s;
+  // 日本語の画面では訳さない（ジョブの題名やカテゴリなど、サーバーからの文を直接渡す呼び出し元があるため）
+  if (i18n.lang === 'ja' || !I18N_JA_CHARS.test(s)) return s;
   const lead = s.match(/^\s*/)[0];
   const tail = s.match(/\s*$/)[0];
   const core = s.trim();
