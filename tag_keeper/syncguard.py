@@ -57,8 +57,8 @@ class SyncGuard(Protocol):
         """消すパスごとの子の数から、同期を止めて連携する必要があるかを返す。"""
         ...
 
-    def pause(self) -> None:
-        """常駐の同期を止める。"""
+    def pause(self) -> bool:
+        """常駐の同期を止める。止める前に動いていたかを返す（利用者が止めていたなら False。終わった後に再開しない）。"""
         ...
 
     def flush(
@@ -170,13 +170,15 @@ class OneDriveGuard:
         res = self._run([self.systemctl, "--user", "is-active", self.service], check=False)
         return res.stdout.strip() or "unknown"
 
-    def pause(self) -> None:
-        """常駐の同期を止める。止まったことを確かめられなければ SyncError。"""
+    def pause(self) -> bool:
+        """常駐の同期を止める。止まったことを確かめられなければ SyncError。止める前に動いていたかを返す。"""
+        was_active = self.is_active() == "active"
         log.info("常駐の同期を止めます: %s", self.service)
         self._run([self.systemctl, "--user", "stop", self.service])
         state = self.is_active()
         if state == "active":
             raise SyncError(f"常駐の同期が止まりません: {self.service}")
+        return was_active
 
     def flush(
         self,
@@ -498,15 +500,25 @@ class CloudSyncGuard:
         """常に True（timer の同期が、隔離のための移動と重ならないようにするため）。"""
         return True
 
-    def pause(self) -> None:
-        """timer を止め、動いている同期が終わるのを待つ。待ち切れなければ SyncError。"""
+    def pause(self) -> bool:
+        """timer を止め、動いている同期が終わるのを待つ。止める前に timer が動いていたかを返す。
+
+        待ち切れなければ、まだ何も動かしていないので timer を元に戻して（動いていたなら再開して）SyncError を投げる。
+        """
+        was_active = self._systemctl("is-active", self.timer_unit, check=False).stdout.strip() == "active"
         log.info("定期同期を止めます: %s", self.timer_unit)
         self._systemctl("stop", self.timer_unit)
         deadline = time.monotonic() + self.wait_seconds
         while self.is_running():
             if time.monotonic() > deadline:
+                if was_active:
+                    try:
+                        self._systemctl("start", self.timer_unit)
+                    except SyncError as e:
+                        log.error("止めた定期同期を戻せませんでした: %s", e)
                 raise SyncError(f"動いている同期が {int(self.wait_seconds)} 秒たっても終わりません: {self.entry}")
             time.sleep(self.poll_seconds)
+        return was_active
 
     def flush(
         self,

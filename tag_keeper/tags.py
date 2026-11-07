@@ -75,6 +75,50 @@ def _under(path: str, base: str) -> bool:
     return base == "" or path == base or path.startswith(base + "/")
 
 
+def order_moves(moves: list[tuple[str, str]]) -> list[tuple[str, str]]:
+    """同時に起きた移動を、1件ずつ順に当てはめても同時に当てはめたのと同じ結果になる順に並べる。
+
+    - 配下の移動を先に: 「a → b」と「a/x.pdf → b/y.pdf」を同時に見つけたとき、a を先に動かすと
+      a/x.pdf のタグが実在しない b/x.pdf へ行ってしまう
+    - 入れ替えでは、移動元を先に空ける: 「a → b」と「c → a」では、c を先に動かすと c のタグが a と混ざって b へ行く
+    - 循環（a → b と b → a）だけは順番では解けないので、深い順に並べて警告する（1回の走査でまず起きない）
+    """
+    items = list(dict.fromkeys(moves))
+    n = len(items)
+    if n <= 1:
+        return items
+
+    def strictly_under(path: str, base: str) -> bool:
+        return path != base and _under(path, base)
+
+    # i → j: i を j より先に当てはめる
+    after: list[set[int]] = [set() for _ in range(n)]
+    indeg = [0] * n
+    for i, (si, _di) in enumerate(items):
+        for j, (sj, dj) in enumerate(items):
+            if i == j:
+                continue
+            # 配下の移動（si が sj の配下）を先に / j の移動先が i の移動元にかかるなら、i を先に動かして空ける
+            if (strictly_under(si, sj) or _under(dj, si)) and j not in after[i]:
+                after[i].add(j)
+                indeg[j] += 1
+    ready = sorted((k for k in range(n) if indeg[k] == 0), key=lambda k: (-items[k][0].count("/"), k))
+    out: list[int] = []
+    while ready:
+        k = ready.pop(0)
+        out.append(k)
+        for j in sorted(after[k]):
+            indeg[j] -= 1
+            if indeg[j] == 0:
+                ready.append(j)
+        ready.sort(key=lambda m: (-items[m][0].count("/"), m))
+    if len(out) < n:
+        rest = sorted((k for k in range(n) if k not in out), key=lambda k: (-items[k][0].count("/"), k))
+        log.warning("移動が循環しているため、タグの追従が正しくない可能性があります: %s", [items[k] for k in rest])
+        out.extend(rest)
+    return [items[k] for k in out]
+
+
 @dataclass(frozen=True)
 class Assignment:
     """アイテムに直接付いたタグ1件。"""
@@ -218,14 +262,54 @@ class TagStore:
         return len(events)
 
     def follow_moves(self, root: str, moves: Iterable[tuple[str, str]]) -> int:
-        """移動・改名に追従する。タグの付いたアイテムを含む移動だけを記録する。"""
+        """移動・改名に追従する。タグの付いたアイテムを含む移動だけを記録する。
+
+        1回の走査で見つけた移動は同時に起きたものなので、順に当てはめても同じ結果になる順に並べ直してから記録する
+        （order_moves を参照）。
+        """
         now = utcnow()
         with self.lock:
             self.reload_if_changed()
             events = []
-            for src, dst in moves:
+            for src, dst in order_moves(list(moves)):
                 if any(k[0] == root and _under(k[1], src) for k in self.items):
                     events.append({"at": now, "host": self.host, "op": "move", "root": root, "from": src, "to": dst})
+            self._append(events)
+        return len(events)
+
+    def detach_under(self, root: str, base: str) -> dict[str, list[list[str]]]:
+        """base とその配下に直接付いたタグを外し、外したもの（相対パス → [タグ, 出所] の一覧）を返す。
+
+        隔離したアイテムのタグを、そのパスに残さないために使う（残すと、後で同じパスに来た別のファイルに付いてしまう）。
+        返したものを実行記録に残しておき、取り消しのときに attach で戻す。
+        """
+        now = utcnow()
+        with self.lock:
+            self.reload_if_changed()
+            detached = {
+                p: [[a.tag, a.source] for a in sorted(tags.values(), key=lambda a: a.tag)]
+                for (r, p), tags in self.items.items()
+                if r == root and _under(p, base) and tags
+            }
+            events = [
+                {"at": now, "host": self.host, "op": "remove", "root": root, "path": p, "tag": tag}
+                for p, pairs in sorted(detached.items())
+                for tag, _source in pairs
+            ]
+            self._append(events)
+        return detached
+
+    def attach(self, root: str, detached: dict[str, list[list[str]]]) -> int:
+        """detach_under で外したタグを付け直す（出所も元のまま）。付けた件数を返す。"""
+        now = utcnow()
+        with self.lock:
+            self.reload_if_changed()
+            events = [
+                {"at": now, "host": self.host, "op": "add", "root": root, "path": p, "tag": tag, "source": source}
+                for p, pairs in sorted(detached.items())
+                for tag, source in pairs
+                if tag not in self.items.get((root, p), {})
+            ]
             self._append(events)
         return len(events)
 

@@ -102,3 +102,37 @@ def test_search_with_inheritance() -> None:
     assert search(entries, tagged, ["type:invoice"], "and", ["draft"]) == ["Finance/Invoices/a.pdf", "Inbox/x.pdf"]
     assert search(entries, tagged, [], "and", ["area:finance"]) == ["Inbox/x.pdf", "Inbox/y.pdf"]
     assert search(entries, tagged, ["無い"], "and") == []
+
+
+def test_moves_found_together_are_applied_as_if_at_once(tmp_path: Path) -> None:
+    """1回の走査で見つけた移動は、配下を先に・入れ替えでは移動元を先に空けて当てはめる。"""
+    from tag_keeper.tags import order_moves
+
+    store = TagStore(tmp_path / "tags", host="a")
+    store.add("r", ["a/x.pdf"], "種別:請求書")
+    store.add("r", ["c"], "会社:アティード")
+    store.add("r", ["p"], "色:赤")
+    # フォルダの改名と、その中のファイルの改名（a → b、a/x.pdf → b/y.pdf）と、入れ替え（p → q、c → p）
+    store.follow_moves("r", [("a", "b"), ("a/x.pdf", "b/y.pdf"), ("c", "p"), ("p", "q")])
+    assert store.tags_of("r", "b/y.pdf")["direct"] == [{"tag": "種別:請求書", "source": "manual"}]
+    assert store.tags_of("r", "b/x.pdf")["direct"] == []
+    assert [t["tag"] for t in store.tags_of("r", "p")["direct"]] == ["会社:アティード"]
+    assert [t["tag"] for t in store.tags_of("r", "q")["direct"]] == ["色:赤"]
+    # 並べ方: 配下が先、移動元を空けるものが先
+    assert order_moves([("a", "b"), ("a/x.pdf", "b/y.pdf")]) == [("a/x.pdf", "b/y.pdf"), ("a", "b")]
+    assert order_moves([("c", "p"), ("p", "q")]) == [("p", "q"), ("c", "p")]
+
+
+def test_detach_and_attach_keep_the_source(tmp_path: Path) -> None:
+    store = TagStore(tmp_path / "tags", host="a")
+    store.add("r", ["d"], "x", source="manual")
+    store.add("r", ["d/f.pdf"], "y", source="suggested")
+    store.add("r", ["other"], "z")
+    detached = store.detach_under("r", "d")
+    assert detached == {"d": [["x", "manual"]], "d/f.pdf": [["y", "suggested"]]}
+    assert store.tags_of("r", "d/f.pdf") == {"direct": [], "inherited": []}
+    assert store.attach("r", detached) == 2
+    assert store.tags_of("r", "d/f.pdf")["direct"] == [{"tag": "y", "source": "suggested"}]
+    # ログから読み直しても同じ
+    again = TagStore(tmp_path / "tags", host="a")
+    assert again.tags_of("r", "d")["direct"] == [{"tag": "x", "source": "manual"}]

@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Restoring an old version could write outside the root**, and the history and
+  past-folder views could read outside it, through an empty path or a symlink inside the
+  root. These paths are now checked like the rest of the file browser.
+- An inbox plan could move a file outside the root through a symlink in its destination;
+  moves are now also checked right before they run.
+- Plans made from the file browser for a root whose name contains spaces or other
+  characters could not be opened or undone from the web UI.
+- One damaged line in a plan's journal (power loss while writing) made every page fail to
+  load and the undo fail; unreadable lines are now skipped.
+- A folder holding only files the scan skips (excluded or not readable as UTF-8) was
+  offered as an empty folder and quarantined with its contents.
+- A file name that is not valid UTF-8 made the whole scan fail; such names are now skipped
+  with a warning.
+- When a running cloud-sync run did not finish in time, applying a plan gave up but left the
+  sync timer stopped and the plan stuck as interrupted. The timer is now restarted and the
+  plan can be run again.
+- Applying a plan restarted a sync timer or service that you had stopped yourself.
+- Names that differ only in case (OneDrive treats them as the same) were not caught when
+  moving, renaming, creating folders or accepting inbox suggestions.
+- Renaming a folder and a file inside it between two scans left the file's tags on a path
+  that does not exist.
+- Tags of a quarantined item stayed on its path and attached themselves to the next file
+  that took that name. They are now taken off and put back by undo.
+
 ## [0.9.1] - 2026-11-05
 
 ### Fixed

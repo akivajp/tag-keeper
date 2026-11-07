@@ -69,6 +69,7 @@ from tag_keeper.plan import (
     journal_path,
     list_plans,
     load_plan,
+    new_plan_id,
     pending_restores,
     plan_info,
     read_journal,
@@ -579,6 +580,10 @@ def create_app(
         rel = clean_relpath(q.getunicode("path", ""))
         snapshot = q.getunicode("snapshot", "")
         if snapshot:
+            # スナップショットの中でも、シンボリックリンクでルートの外へ出ない。btrfs-timeline は今のツリーで
+            # リンクを解決してからスナップショットの中のパスに直すので、今のツリーの側でも確かめる
+            resolve_within(rc.path, rel)
+            resolve_within(history.snapshot_path(rc.path, "", snapshot), rel)
             entries = history.list_directory_at(rc.path, rel, snapshot)
             entries.sort(key=lambda e: (not e["is_dir"], e["name"].casefold()))
         else:
@@ -672,6 +677,7 @@ def create_app(
         q = bottle.request.query
         rc = root_config(settings.config(), q.getunicode("root", ""))
         rel = clean_relpath(q.getunicode("path", ""))
+        resolve_within(rc.path, rel)
         conn = open_db()
         try:
             versions = history.versions(conn, root_id_of(conn, rc), rc.path, rel)
@@ -689,8 +695,16 @@ def create_app(
         data = body()
         rc = root_config(settings.config(), str(data.get("root", "")))
         rel = clean_relpath(str(data.get("path", "")))
+        if not rel:
+            raise fail(400, "復元するファイルを指定してください")
         version_rel = clean_relpath(str(data.get("version_path") or rel))
-        dest = history.restore_beside(rc.path, rel, version_rel, str(data.get("snapshot", "")))
+        snapshot = str(data.get("snapshot", ""))
+        # 復元先（今のパスの隣）と、読み出す版（スナップショットの中）が、どちらもルートの外を指さないこと
+        # btrfs-timeline は今のツリーでリンクを解決してから版を探すので、版のパスは今のツリーの側でも確かめる
+        resolve_within(rc.path, rel)
+        resolve_within(rc.path, version_rel)
+        resolve_within(history.snapshot_path(rc.path, "", snapshot), version_rel)
+        dest = history.restore_beside(rc.path, rel, version_rel, snapshot)
         restored = dest.relative_to(rc.path).as_posix()
         log.info("過去の版を復元しました: %s → %s（スナップショット %s）", version_rel, restored, data.get("snapshot"))
         return {"restored": restored}
@@ -865,7 +879,7 @@ def create_app(
         if not items:
             raise fail(400, "採用した提案がありません")
         plan = Plan(
-            id=f"{datetime.now():%Y%m%d-%H%M%S}-{rc.name}-organize",
+            id=new_plan_id(rc.name, "organize"),
             root=rc.name,
             root_path=rc.path,
             created_at=utcnow(),
@@ -879,9 +893,13 @@ def create_app(
             problem = rules.cloud_name_problem(dest)
             if problem:
                 raise fail(400, f"{dest}: {problem}")
-            if dest in dests or (rc.path / dest).exists():
-                raise fail(409, f"移動先に同じ名前のものがあります: {dest}")
-            dests.add(dest)
+            # 移動先の途中にルートの外を指すシンボリックリンクがあれば、ルートの外へ移ってしまうので断る
+            resolve_within(rc.path, dest)
+            # OneDrive は大文字・小文字を区別しないので、それだけが違う名前も同じ名前として扱う
+            clash = rules.case_conflict(rc.path, dest, src)
+            if rules.name_key(dest) in dests or os.path.lexists(rc.path / dest) or clash:
+                raise fail(409, f"移動先に同じ名前のものがあります: {clash or dest}")
+            dests.add(rules.name_key(dest))
             fp = fingerprint(resolve_within(rc.path, src))
             if fp is None:
                 raise fail(404, f"ありません: {src}")
@@ -1146,8 +1164,9 @@ def create_app(
         if not base.is_dir():
             raise fail(404, f"フォルダがありません: {parent}")
         target = base / name
-        if os.path.lexists(target):
-            raise fail(409, f"同じ名前のものが既にあります: {name}")
+        clash = rules.case_conflict(rc.path, rel)
+        if os.path.lexists(target) or clash:
+            raise fail(409, f"同じ名前のものが既にあります: {clash.rpartition('/')[2] if clash else name}")
         target.mkdir()
         log.info("フォルダを作りました: %s", rel)
         return {"created": rel}
@@ -1182,7 +1201,7 @@ def create_app(
         if not items:
             raise fail(400, "対象がありません")
         plan = Plan(
-            id=f"{datetime.now():%Y%m%d-%H%M%S}-{rc.name}-{op_kind}",
+            id=new_plan_id(rc.name, op_kind),
             root=rc.name,
             root_path=rc.path,
             created_at=utcnow(),
@@ -1206,9 +1225,10 @@ def create_app(
                 problem = rules.cloud_name_problem(dest)
                 if problem:
                     raise fail(400, f"{dest}: {problem}")
-                if dest in dests or os.path.lexists(rc.path / dest):
-                    raise fail(409, f"移動先に同じ名前のものがあります: {dest}")
-                dests.add(dest)
+                clash = rules.case_conflict(rc.path, dest, src)
+                if rules.name_key(dest) in dests or os.path.lexists(rc.path / dest) or clash:
+                    raise fail(409, f"移動先に同じ名前のものがあります: {clash or dest}")
+                dests.add(rules.name_key(dest))
                 plan.ops.append(PlanOp(ACTION_MOVE, src, is_dir, fp.files, fp.size, fp.inode, fp.mtime_ns, CAT_MOVE, "移動", dest=dest))
             elif op_kind == "rename":
                 name = str(it.get("new_name", "")).strip()
@@ -1222,9 +1242,10 @@ def create_app(
                     raise fail(400, f"{name}: {problem}")
                 # 大文字・小文字だけの変更は、同じものとして見えるので許す（同じ inode か）
                 target = rc.path / dest
-                if dest in dests or (target.exists() and os.stat(target).st_ino != fp.inode):
-                    raise fail(409, f"同じ名前のものが既にあります: {name}")
-                dests.add(dest)
+                clash = rules.case_conflict(rc.path, dest, src)
+                if rules.name_key(dest) in dests or (target.exists() and os.stat(target).st_ino != fp.inode) or clash:
+                    raise fail(409, f"同じ名前のものが既にあります: {clash.rpartition('/')[2] if clash else name}")
+                dests.add(rules.name_key(dest))
                 plan.ops.append(PlanOp(ACTION_MOVE, src, is_dir, fp.files, fp.size, fp.inode, fp.mtime_ns, CAT_MOVE, "名前の変更", dest=dest))
             else:
                 plan.ops.append(

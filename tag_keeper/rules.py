@@ -8,8 +8,10 @@ from __future__ import annotations
 
 import os
 import re
+import unicodedata
 from collections.abc import Iterable
 from dataclasses import dataclass
+from pathlib import Path
 
 # カテゴリ（報告での表示順）
 CAT_APP_DATA = "アプリのデータ"
@@ -215,4 +217,45 @@ def cloud_name_problem(relpath: str) -> str | None:
             return f"予約された名前: {part}"
         if part.startswith("~$"):
             return f"~$ で始まる名前は同期されない: {part}"
+    return None
+
+
+def name_key(name: str) -> str:
+    """OneDrive が同じ名前とみなすかを比べるためのキー（大文字・小文字と、Unicode の正規化の違いを無視する）。"""
+    return unicodedata.normalize("NFC", name).casefold()
+
+
+def case_conflict(root: Path, relpath: str, src: str | None = None) -> str | None:
+    """移動先 relpath の途中か最後に、大文字・小文字だけが違う名前のものが既にあれば、そのパスを返す。
+
+    OneDrive は大文字・小文字を区別しないので、`report.pdf` のあるフォルダへ `Report.pdf` を置くと、
+    同期で衝突する（アップロードの拒否や競合コピー）。ここではツリーの中を実際に見て確かめる。
+    同じ名前そのもの（完全一致）は、呼び出し側の「同じ名前のものがある」の確認に任せる。
+
+    Args:
+        root: ルートの絶対パス。
+        relpath: 移動先（ルートからの相対パス）。
+        src: 動かす元（ルートからの相対パス）。大文字・小文字だけの改名を許すため、これ自身は衝突とみなさない。
+    """
+    parts = relpath.split("/")
+    base = root
+    for i, part in enumerate(parts):
+        key = name_key(part)
+        try:
+            with os.scandir(base) as it:
+                names = [de.name for de in it]
+        except (FileNotFoundError, NotADirectoryError):
+            return None
+        prefix = "/".join(parts[:i])
+        for name in names:
+            if name == part or name_key(name) != key:
+                continue
+            other = f"{prefix}/{name}" if prefix else name
+            if src is not None and (other == src or src.startswith(other + "/")):
+                continue
+            return other
+        if part not in names:
+            # ここから先はまだ無い（新しく作る）フォルダなので、衝突は起きない
+            return None
+        base = base / part
     return None

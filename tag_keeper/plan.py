@@ -113,10 +113,40 @@ def fingerprint(path: Path) -> Fingerprint | None:
     return Fingerprint(st.st_ino, len(files), sum(ob.size for ob in files), newest)
 
 
+def dir_is_empty(path: Path) -> bool:
+    """フォルダの中に、空のフォルダ以外のもの（ファイル・シンボリックリンクなど何でも）が無いか。
+
+    カタログには、走査で除外したもの・名前を読めないもの・通常のファイル以外が入らないので、
+    「空フォルダ」を隔離する前に、ディスクを直接見て確かめる。
+    """
+    try:
+        stack = [path]
+        while stack:
+            with os.scandir(stack.pop()) as it:
+                for de in it:
+                    if de.is_dir(follow_symlinks=False):
+                        stack.append(Path(de.path))
+                    else:
+                        return False
+    except OSError:
+        # 読めないものがあるなら、空とはみなさない
+        return False
+    return True
+
+
 def _slug(name: str) -> str:
     """ルート名を、プラン ID に使える短い文字列にする。"""
     s = re.sub(r"[^\w.-]+", "_", name).strip("_")
     return s[-40:] or "root"
+
+
+def new_plan_id(root_name: str, kind: str = "", when: datetime | None = None) -> str:
+    """新しいプランの ID（日時-ルート名[-種類]）。
+
+    ルート名は ID に使える文字にそろえる（そろえないと、空白などを含むルート名のプランを画面から開けず、取り消せない）。
+    """
+    stamp = f"{(when or datetime.now()):%Y%m%d-%H%M%S}-{_slug(root_name)}"
+    return f"{stamp}-{_slug(kind)}" if kind else stamp
 
 
 def _path_key(relpath: str) -> list[str]:
@@ -159,6 +189,9 @@ def build_plan(
         fp = fingerprint(root_path / f.relpath)
         if fp is None:
             log.warning("走査の後に見えなくなったため、プランに含めません: %s", f.relpath)
+            continue
+        if f.category == rules.CAT_EMPTY_DIR and not dir_is_empty(root_path / f.relpath):
+            log.warning("空ではない（走査の対象外のものがある）ため、プランに含めません: %s", f.relpath)
             continue
         plan.ops.append(
             PlanOp(
@@ -298,8 +331,18 @@ def check_op(plan: Plan, op: PlanOp) -> str | None:
         return "別のものに置き換わった"
     if (fp.files, fp.size, fp.mtime_ns) != (op.files, op.size, op.mtime_ns):
         return "プランの作成後に変更された"
-    if op.action == ACTION_MOVE and os.path.lexists(plan.root_path / op.dest):
-        return "移動先に同じ名前のものがある"
+    if op.category == rules.CAT_EMPTY_DIR and op.is_dir and not dir_is_empty(plan.root_path / op.path):
+        return "空ではない（走査の対象外のものがある）"
+    if op.action == ACTION_MOVE:
+        # 移動先の途中にルートの外を指すシンボリックリンクがあると、ルートの外へ移ってしまう
+        real = Path(os.path.realpath(plan.root_path / op.dest))
+        base = Path(os.path.realpath(plan.root_path))
+        if base not in real.parents:
+            return "移動先がルートの外を指している"
+        if os.path.lexists(plan.root_path / op.dest):
+            return "移動先に同じ名前のものがある"
+        if rules.case_conflict(plan.root_path, op.dest, op.path):
+            return "移動先に大文字・小文字だけが違う名前のものがある"
     return None
 
 
@@ -372,11 +415,21 @@ def _append(journal: Path, record: dict[str, Any]) -> None:
 
 
 def read_journal(journal: Path) -> Iterator[dict[str, Any]]:
-    """実行記録を先頭から読む。"""
-    with journal.open(encoding="utf-8") as f:
-        for line in f:
-            if line.strip():
-                yield json.loads(line)
+    """実行記録を先頭から読む。
+
+    書き込みの途中の電源断などで欠けた行は、警告して飛ばす（残りの記録から、取り消しなどを続けられるように）。
+    """
+    with journal.open(encoding="utf-8", errors="replace") as f:
+        for n, line in enumerate(f, 1):
+            if not line.strip():
+                continue
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                log.warning("実行記録の %d 行目を読めないので飛ばします: %s", n, journal)
+                continue
+            if isinstance(rec, dict):
+                yield rec
 
 
 # --- 進捗の通知 ---
@@ -488,6 +541,7 @@ def _flush_and_resume(
     paths: Sequence[str],
     max_children: int,
     rep: Reporter,
+    restart: bool = True,
 ) -> str | None:
     """止めておいた同期で削除をクラウドに反映し、常駐の同期を再開する。
 
@@ -499,6 +553,7 @@ def _flush_and_resume(
         paths: クラウドから消えるはずのパス（同期フォルダからの相対パス）。進捗の表示に使う。
         max_children: 消したパスの子の数の最大値。
         rep: 進捗の通知先。
+        restart: 反映の後に常駐の同期を再開するか。止める前から止まっていた（利用者が止めていた）なら False。
     """
     expected = set(paths)
     seen: set[str] = set()
@@ -516,6 +571,11 @@ def _flush_and_resume(
         _append(journal, {"event": "sync-error", "detail": str(e)})
         return str(e)
     _append(journal, {"event": "sync-flush", "deleted": len(seen), "expected": len(expected)})
+    if not restart:
+        # 利用者が止めていた同期は、止めたままにしておく（勝手に動かし始めない）
+        log.info("同期は実行の前から止まっていたので、再開しません")
+        _append(journal, {"event": "sync-resume", "restarted": False})
+        return None
     rep.phase("常駐の同期を再開")
     try:
         sync.resume()
@@ -597,15 +657,21 @@ def apply_plan(
             "pre_snapshot": result.pre_snapshot,
         },
     )
+    was_active = True
     if use_sync:
         assert sync is not None
         rep.phase("常駐の同期を一時停止")
         try:
-            sync.pause()
+            # 止める前に動いていたか（利用者が止めていたなら、終わった後も再開しない）。
+            # 返り値の無い古い実装（None）は、これまでどおり再開する
+            was_active = sync.pause() is not False
         except SyncError as e:
             _append(journal, {"event": "abort", "detail": str(e)})
             raise
-        _append(journal, {"event": "sync-pause", "client": sync.name, "max_children": max_children})
+        _append(
+            journal,
+            {"event": "sync-pause", "client": sync.name, "max_children": max_children, "was_active": was_active},
+        )
 
     rep.phase("実行（隔離・移動）", total=len(ops))
     try:
@@ -613,7 +679,7 @@ def apply_plan(
             if op.action == ACTION_MOVE:
                 outcome = _move_one(conn, plan, op, root_id, journal, tags)
             else:
-                outcome = _quarantine_one(conn, plan, op, root_id, dest_root, journal, gone_at)
+                outcome = _quarantine_one(conn, plan, op, root_id, dest_root, journal, gone_at, tags)
             result.outcomes.append(outcome)
             rep.advance()
     finally:
@@ -622,7 +688,7 @@ def apply_plan(
             assert sync is not None
             quarantined = {op.path for op in ops if op.action == ACTION_QUARANTINE}
             paths = [sync.relpath(plan.root_path / o.path) for o in result.done if o.path in quarantined]
-            result.sync_error = _flush_and_resume(sync, journal, paths, max_children, rep)
+            result.sync_error = _flush_and_resume(sync, journal, paths, max_children, rep, restart=was_active)
 
     rep.phase("実行後のスナップショット")
     result.post_snapshot = _take_post(snapshot, result.pre_snapshot, f"tag-keeper apply {plan.id}")
@@ -710,8 +776,13 @@ def _quarantine_one(
     dest_root: Path,
     journal: Path,
     gone_at: str,
+    tags: TagStore | None = None,
 ) -> OpOutcome:
-    """1操作を確かめてから隔離フォルダへ移し、実行記録とカタログを更新する。"""
+    """1操作を確かめてから隔離フォルダへ移し、実行記録・カタログ・タグを更新する。
+
+    隔離したアイテムのタグは外し、実行記録に残す（パスに残すと、後で同じパスに来た別のファイルに付いてしまう）。
+    取り消しで元に戻したら付け直す。
+    """
     src = plan.root_path / op.path
     dst = dest_root / op.path
     problem = check_op(plan, op)
@@ -729,6 +800,7 @@ def _quarantine_one(
         log.warning("飛ばしました: %s（%s）", op.path, outcome.detail)
         _append(journal, {"event": "skip", "path": op.path, "detail": outcome.detail})
         return outcome
+    detached = tags.detach_under(plan.root, op.path) if tags is not None else {}
     _append(
         journal,
         {
@@ -740,6 +812,7 @@ def _quarantine_one(
             "src": str(src),
             "dst": str(dst),
             "gone_at": gone_at,
+            **({"tags": detached} if detached else {}),
         },
     )
     where, args = _subtree_sql(op.path)
@@ -766,6 +839,8 @@ class Restorable:
     quarantine: Path  # このプランの隔離先（<quarantine_dir>/<プラン ID>）
     kind: str = ACTION_QUARANTINE  # quarantine（隔離から戻す） / move（移動・改名を戻す）
     dest: str = ""  # 移動・改名の移動先（ルートからの相対パス）
+    # 隔離のときに外したタグ（相対パス → [タグ, 出所] の一覧）。戻したら付け直す
+    tags: dict[str, list[list[str]]] = field(default_factory=dict)
 
 
 def pending_restores(journal: Path) -> list[Restorable]:
@@ -791,6 +866,7 @@ def pending_restores(journal: Path) -> list[Restorable]:
                 dst=Path(rec["dst"]),
                 gone_at=rec["gone_at"],
                 quarantine=quarantine,
+                tags=rec.get("tags") or {},
             )
         elif event == "move":
             moved[rec["path"]] = Restorable(
@@ -872,6 +948,8 @@ def undo_plan(
         elif outcome.done:
             _remove_empty_parents(it.dst.parent, it.quarantine)
             _append(journal, {"event": "restore", "path": it.path})
+            if tags is not None and it.tags:
+                tags.attach(it.root, it.tags)
             where, args = _subtree_sql(it.path)
             now = utcnow()
             with conn:
@@ -945,13 +1023,16 @@ def retry_sync(
     if sync_paused(journal) is None:
         raise PlanError(f"同期を止めたままのプランではありません: {plan_id}")
     max_children = 0
+    was_active = True
     paths: list[str] = []
     for rec in read_journal(journal):
         if rec.get("event") == "sync-pause":
             max_children = int(rec.get("max_children", 0))
+            # 古い記録には無い（これまでどおり再開する）
+            was_active = rec.get("was_active", True) is not False
         elif rec.get("event") == "quarantine":
             paths.append(sync.relpath(Path(rec["src"])))
-    return _flush_and_resume(sync, journal, paths, max_children, reporter or Reporter())
+    return _flush_and_resume(sync, journal, paths, max_children, reporter or Reporter(), restart=was_active)
 
 
 def force_resume_sync(plan_id: str, *, journal_dir: Path, sync: SyncGuard) -> None:
@@ -989,10 +1070,16 @@ def plan_state(journal: Path) -> tuple[str, int, int]:
     if not journal.exists():
         return "draft", 0, 0
     applied = finished = restored = False
+    ops_since_apply = 0
     for rec in read_journal(journal):
         event = rec.get("event")
         if event == "apply":
-            applied, finished = True, False
+            applied, finished, ops_since_apply = True, False, 0
+        elif event in ("quarantine", "move"):
+            ops_since_apply += 1
+        elif event == "abort" and ops_since_apply == 0:
+            # 何も動かす前に止めた（動いている同期を待ち切れなかったなど）。未実行に戻し、画面から実行し直せるようにする
+            applied = False
         elif event == "finish":
             finished = True
         elif event == "restore":
@@ -1036,8 +1123,9 @@ def list_plans(plans_dir: Path, journal_dir: Path) -> list[PlanInfo]:
     for f in sorted(plans_dir.glob("*.toml"), reverse=True):
         try:
             out.append(plan_info(f, journal_dir))
-        except PlanError as e:
-            log.warning("%s", e)
+        except (PlanError, OSError, ValueError, KeyError, TypeError) as e:
+            # 1つのプランが読めなくても、一覧（と、それを使う全画面）は出す
+            log.warning("プランを読めないので一覧から外します: %s (%s)", f, e)
     return out
 
 

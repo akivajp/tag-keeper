@@ -49,6 +49,17 @@ class WalkResult:
     observed: dict[str, Observation] = field(default_factory=dict)
     # 読めなかったフォルダ（ルートからの相対パス）。中身は消えたと扱わない
     unreadable: list[str] = field(default_factory=list)
+    # 名前を UTF-8 として読めずに飛ばしたものの数
+    undecodable: int = 0
+
+
+def _utf8_ok(name: str) -> bool:
+    """名前が UTF-8 として読めたか（読めないバイトは os が surrogateescape で文字にしている）。"""
+    try:
+        name.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return True
 
 
 @dataclass
@@ -113,6 +124,12 @@ def walk_tree(
         with it:
             for de in it:
                 rel = f"{rel_dir}/{de.name}" if rel_dir else de.name
+                if not _utf8_ok(de.name):
+                    # 名前を UTF-8 として読めない（CP932 の名前のまま展開した zip の中身など）。
+                    # カタログ（SQLite）にも画面にも入れられないので、飛ばして知らせる（走査全体は止めない）
+                    log.warning("名前を UTF-8 として読めないので飛ばします: %s", os.fsencode(de.path).decode("utf-8", "backslashreplace"))
+                    result.undecodable += 1
+                    continue
                 if patterns and is_excluded(rel, de.name, patterns):
                     continue
                 try:

@@ -244,3 +244,43 @@ def test_find_run_start_across_blocks(tmp_path: Path) -> None:
         f.seek(offset)
         assert f.readline().startswith(b"===== 2026-10-30T22:00:00+09:00 cloud-sync onedrive")
     assert syncguard._find_run_start(log, "nope") is None
+
+
+def test_pause_that_gives_up_restarts_the_timer_it_stopped(guard: tuple[CloudSyncGuard, Path, Path]) -> None:
+    """動いている同期を待ち切れずに諦めたら、止めた timer を戻す（まだ何も動かしていないので）。"""
+    g, calls, state = guard
+    (state / "onedrive.json").write_text(json.dumps({"state": "running", "pid": os.getpid()}))
+    with pytest.raises(SyncError, match="終わりません"):
+        g.pause()
+    lines = calls.read_text().splitlines()
+    assert lines[-2:] == ["systemctl --user stop cloud-sync-onedrive.timer", "systemctl --user start cloud-sync-onedrive.timer"]
+
+
+def test_timer_stopped_by_the_user_is_left_stopped(guard: tuple[CloudSyncGuard, Path, Path], tmp_path: Path) -> None:
+    """利用者が止めていた timer は、隔離のために止めた後も再開しない（勝手に同期を動かし始めない）。"""
+    from tag_keeper.catalog import connect, ensure_root
+    from tag_keeper.config import SafetyConfig
+    from tag_keeper.plan import ACTION_QUARANTINE, Plan, PlanOp, apply_plan, fingerprint, read_journal, journal_path
+    from tag_keeper.scan import scan_root
+
+    g, calls, _state = guard
+    g.systemctl = str(make_exe(tmp_path / "systemctl-inactive", f'echo "systemctl $*" >> {calls}\ncase "$2" in is-active) echo inactive;; esac\n'))
+    root = g.sync_dir()
+    write(root / "keep.txt", "keep")
+    write(root / "junk.tmp", "junk")
+    conn = connect(tmp_path / "catalog.db")
+    root_id = ensure_root(conn, "od", root)
+    scan_root(conn, root_id, root, SafetyConfig())
+    fp = fingerprint(root / "junk.tmp")
+    assert fp is not None
+    plan = Plan(id="p1", root="od", root_path=root, created_at="t")
+    plan.ops.append(PlanOp(ACTION_QUARANTINE, "junk.tmp", False, fp.files, fp.size, fp.inode, fp.mtime_ns, "一時", "test"))
+    result = apply_plan(conn, plan, quarantine_dir=tmp_path / "q", journal_dir=tmp_path / "j", snapshot=None, sync=g)
+    assert result.sync_error is None and len(result.done) == 1
+    log = calls.read_text()
+    assert "systemctl --user stop cloud-sync-onedrive.timer" in log
+    assert "systemctl --user start cloud-sync-onedrive.timer" not in log  # 再開しない
+    events = [r for r in read_journal(journal_path(tmp_path / "j", "p1"))]
+    assert {"event": "sync-resume", "restarted": False}.items() <= next(r for r in events if r["event"] == "sync-resume").items()
+    pause = next(r for r in events if r["event"] == "sync-pause")
+    assert pause["was_active"] is False

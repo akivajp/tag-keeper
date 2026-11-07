@@ -335,3 +335,138 @@ def test_move_plan_rejects_names_the_cloud_cannot_store(tmp_path: Path) -> None:
     )
     with pytest.raises(PlanError, match="使えない文字"):
         load_plan(bad)
+
+
+# ---------- バグ調査（v0.9.1）で見つかったものの回帰テスト ----------
+
+
+def test_empty_folder_with_files_the_scan_skips_is_not_quarantined(
+    conn: sqlite3.Connection, root_id: int, root: Path, tmp_path: Path
+) -> None:
+    """走査で除外したファイルだけを持つフォルダは、カタログでは空に見えても、隔離しない（中のファイルごと消えるため）。"""
+    write(root / "keep.txt", "keep")
+    write(root / "work" / "thesis.partial", "100 pages of draft")
+    (root / "really-empty" / "sub").mkdir(parents=True)
+    scan_root(conn, root_id, root, SAFETY, exclude=["*.partial"])
+    report = build_report(conn, root_id, "test", HYGIENE)
+    plan = build_plan(report, "test", root, [rules.CAT_EMPTY_DIR])
+    assert [op.path for op in plan.ops] == ["really-empty/sub"]  # 本当に空のもの（最も深いもの）だけ
+    # 前の版で作ったプラン（空フォルダとして work を含む）でも、実行の直前にディスクで確かめて飛ばす
+    from tag_keeper.plan import ACTION_QUARANTINE, PlanOp, fingerprint
+
+    fp = fingerprint(root / "work")
+    assert fp is not None
+    plan.ops = [PlanOp(ACTION_QUARANTINE, "work", True, fp.files, fp.size, fp.inode, fp.mtime_ns, rules.CAT_EMPTY_DIR, "中身が無い")]
+    result = run_apply(conn, plan, tmp_path)
+    assert result.done == [] and result.skipped[0].detail == "空ではない（走査の対象外のものがある）"
+    assert (root / "work" / "thesis.partial").exists()
+
+
+def test_quarantined_items_take_their_tags_along_and_undo_brings_them_back(
+    conn: sqlite3.Connection, root_id: int, root: Path, tmp_path: Path
+) -> None:
+    """隔離したアイテムのタグはパスに残さない（後で同じパスに来た別のファイルに付かない）。取り消せば戻る。"""
+    from tag_keeper.tags import TagStore
+
+    write(root / "docs" / "invoice.pdf", "invoice")
+    write(root / "scan001.pdf", "photo of a cat")
+    write(root / "keep.txt", "keep")
+    store = TagStore(tmp_path / "tags", host="t")
+    store.add("test", ["docs/invoice.pdf"], "種別:請求書", source="suggested")
+    plan, _ = make_plan(conn, root_id, root, tmp_path)
+    plan.ops = [op for op in plan.ops if op.path == "docs/invoice.pdf"] or plan.ops
+    from tag_keeper.plan import ACTION_QUARANTINE, PlanOp, fingerprint
+
+    fp = fingerprint(root / "docs" / "invoice.pdf")
+    assert fp is not None
+    plan.ops = [PlanOp(ACTION_QUARANTINE, "docs/invoice.pdf", False, fp.files, fp.size, fp.inode, fp.mtime_ns, "削除", "test")]
+    apply_plan(conn, plan, quarantine_dir=tmp_path / "quarantine", journal_dir=tmp_path / "journal", snapshot=None, tags=store)
+    assert store.tags_of("test", "docs/invoice.pdf")["direct"] == []
+    # 別のファイルが同じパスに来ても、古いタグは付かない
+    os.rename(root / "scan001.pdf", root / "docs" / "invoice.pdf")
+    assert store.tags_of("test", "docs/invoice.pdf")["direct"] == []
+    os.rename(root / "docs" / "invoice.pdf", root / "scan001.pdf")
+    # 取り消すと、タグも元の出所のまま戻る
+    undo_plan(conn, plan.id, journal_dir=tmp_path / "journal", snapshot=None, tags=store)
+    assert store.tags_of("test", "docs/invoice.pdf")["direct"] == [{"tag": "種別:請求書", "source": "suggested"}]
+
+
+def test_broken_journal_line_does_not_block_listing_or_undo(
+    conn: sqlite3.Connection, root_id: int, tree: Path, tmp_path: Path
+) -> None:
+    """実行記録の最後の行が欠けても（書き込み中の電源断など）、一覧は出せて、読める記録の分は取り消せる。"""
+    from tag_keeper.plan import list_plans, plan_info
+
+    plan, plan_file = make_plan(conn, root_id, tree, tmp_path)
+    run_apply(conn, plan, tmp_path)
+    journal = journal_path(tmp_path / "journal", plan.id)
+    with journal.open("a", encoding="utf-8") as f:
+        f.write('{"at": "2026-11-08T00:00:00+00:00", "event": "fin')
+    assert plan_info(plan_file, tmp_path / "journal").state == "applied"
+    assert [p.id for p in list_plans(plan_file.parent, tmp_path / "journal")] == [plan.id]
+    result = undo_plan(conn, plan.id, journal_dir=tmp_path / "journal", snapshot=None)
+    assert len(result.done) == len(plan.ops)
+    assert (tree / "Documents" / "DMMGames" / "a.dat").exists()
+
+
+def test_plan_aborted_before_moving_anything_can_be_run_again(
+    conn: sqlite3.Connection, root_id: int, tree: Path, tmp_path: Path
+) -> None:
+    """同期を止められずに中止した（何も動かしていない）プランは未実行に戻り、実行し直せる。"""
+    from tag_keeper.plan import plan_info
+    from tag_keeper.syncguard import SyncError
+
+    class Stubborn:
+        name = "test"
+
+        def needs_pause(self, children: object) -> bool:
+            return True
+
+        def pause(self) -> bool:
+            raise SyncError("止まりません")
+
+    plan, plan_file = make_plan(conn, root_id, tree, tmp_path)
+    with pytest.raises(SyncError):
+        apply_plan(conn, plan, quarantine_dir=tmp_path / "quarantine", journal_dir=tmp_path / "journal", snapshot=None, sync=Stubborn())  # type: ignore[arg-type]
+    assert plan_info(plan_file, tmp_path / "journal").state == "draft"
+    run_apply(conn, plan, tmp_path)
+    assert plan_info(plan_file, tmp_path / "journal").state == "applied"
+
+
+def test_move_into_a_symlink_that_leaves_the_root_is_refused(
+    conn: sqlite3.Connection, root_id: int, root: Path, tmp_path: Path
+) -> None:
+    """移動先の途中に、ルートの外を指すシンボリックリンクがあれば移さない（プランを手で書き換えた場合も）。"""
+    from tag_keeper.plan import ACTION_MOVE, PlanOp, fingerprint
+
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    write(root / "a.pdf", "a")
+    (root / "link").symlink_to(outside)
+    scan_root(conn, root_id, root, SAFETY)
+    fp = fingerprint(root / "a.pdf")
+    assert fp is not None
+    plan = Plan(id="m1", root="test", root_path=root, created_at="t")
+    plan.ops = [PlanOp(ACTION_MOVE, "a.pdf", False, fp.files, fp.size, fp.inode, fp.mtime_ns, "整理", "test", dest="link/a.pdf")]
+    result = run_apply(conn, plan, tmp_path)
+    assert result.skipped[0].detail == "移動先がルートの外を指している"
+    assert (root / "a.pdf").exists() and not (outside / "a.pdf").exists()
+
+
+def test_move_onto_a_name_that_differs_only_in_case_is_refused(
+    conn: sqlite3.Connection, root_id: int, root: Path, tmp_path: Path
+) -> None:
+    """OneDrive は大文字・小文字を区別しないので、それだけが違う名前のある場所へは移さない。"""
+    from tag_keeper.plan import ACTION_MOVE, PlanOp, fingerprint
+
+    write(root / "A" / "Report.pdf", "mine")
+    write(root / "B" / "report.pdf", "theirs")
+    scan_root(conn, root_id, root, SAFETY)
+    fp = fingerprint(root / "A" / "Report.pdf")
+    assert fp is not None
+    plan = Plan(id="m2", root="test", root_path=root, created_at="t")
+    plan.ops = [PlanOp(ACTION_MOVE, "A/Report.pdf", False, fp.files, fp.size, fp.inode, fp.mtime_ns, "整理", "test", dest="B/Report.pdf")]
+    assert run_apply(conn, plan, tmp_path).skipped[0].detail == "移動先に大文字・小文字だけが違う名前のものがある"
+    # 大文字・小文字だけの改名（自分自身）は許す
+    assert rules.case_conflict(root, "A/report.pdf", "A/Report.pdf") is None
+    assert rules.case_conflict(root, "b/new.pdf") == "B"

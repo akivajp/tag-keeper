@@ -187,3 +187,15 @@ def test_exclude_patterns(conn: sqlite3.Connection, root_id: int, root: Path) ->
 )
 def test_is_excluded(relpath: str, pattern: str, expected: bool) -> None:
     assert is_excluded(relpath, relpath.rsplit("/", 1)[-1], [pattern]) is expected
+
+
+def test_names_that_are_not_utf8_are_skipped_without_failing_the_scan(
+    conn: sqlite3.Connection, root_id: int, root: Path
+) -> None:
+    """UTF-8 として読めない名前（CP932 の名前のまま展開した zip の中身など）があっても、走査全体は止めない。"""
+    write(root / "ok.txt", "ok")
+    bad = os.fsencode(root) + b"/" + "請求書.pdf".encode("cp932")
+    with open(bad, "wb") as f:
+        f.write(b"x")
+    res = scan_root(conn, root_id, root, SAFETY)
+    assert res.added == 1 and live_paths(conn, root_id) == {"ok.txt"}

@@ -394,3 +394,105 @@ def test_mkdir_and_move_from_the_browser(env: dict) -> None:
     # 取り消すと元の場所へ戻る
     run_job(env, f"/api/plans/{r['plan_id']}/undo")
     assert (root / "inbox" / "a.pdf").exists() and (root / "inbox" / "sub" / "b.pdf").exists()
+
+
+# ---------- バグ調査（v0.9.1）で見つかったものの回帰テスト ----------
+
+
+def test_history_apis_do_not_leave_the_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """過去の版の復元・過去の時点の一覧・版の履歴も、ルートの外（リンクの先・ルートの親）を読み書きしない。"""
+    import datetime as dt
+
+    from btrfs_timeline.core.mounts import MountPoint
+    from btrfs_timeline.core.snapshots import Snapshot
+
+    from tag_keeper import history
+
+    mnt = tmp_path / "mnt"
+    root, outside = mnt / "root", mnt / "outside"
+    write(root / "a.txt", "a-now")
+    write(outside / "secret.txt", "SECRET-NOW")
+    (root / "link").symlink_to(outside)
+    snap_root = mnt / ".snapshots" / "1" / "snapshot"
+    write(snap_root / "root" / "a.txt", "a-then")
+    write(snap_root / "outside" / "secret.txt", "SECRET-THEN")
+    mount = MountPoint(mount_point=str(mnt), fs_type="btrfs", device="fake", subvol="/", root="/")
+    snap = Snapshot(id="1", root=str(snap_root), taken_at=dt.datetime(2026, 1, 1, tzinfo=dt.timezone.utc), description="", layout="snapper")
+    monkeypatch.setattr(history, "snapshots_for", lambda path: (mount, [snap]))
+    cfg = write(tmp_path / "config.toml", f'[[roots]]\nname = "r"\npath = "{root}"\n[tags]\ndir = "{tmp_path / "tags"}"\n')
+    jobs = JobManager(tmp_path / "logs")
+    app = TestApp(create_app(Settings(cfg, tmp_path / "data" / "catalog.db"), jobs=jobs), extra_environ={"HTTP_HOST": HOST})
+    origin = {"Origin": f"http://{HOST}"}
+    app.post_json("/api/roots/r/scan", {}, headers=origin)
+    jobs.wait()
+
+    # 外の版をルートの中へ複製する・外へ書き込む・ルートの親へ書き込む、はどれも断る
+    for body in (
+        {"path": "a.txt", "version_path": "link/secret.txt"},
+        {"path": "link/secret.txt", "version_path": "a.txt"},
+        {"path": "", "version_path": "a.txt"},
+    ):
+        app.post_json("/api/restore", {"root": "r", "snapshot": "1", **body}, headers=origin, status=400)
+    assert sorted(p.name for p in outside.iterdir()) == ["secret.txt"]
+    assert sorted(p.name for p in mnt.iterdir() if p.name.startswith("root")) == ["root"]
+    app.get("/api/browse", {"root": "r", "path": "link", "snapshot": "1"}, status=400)
+    app.get("/api/history", {"root": "r", "path": "link/secret.txt"}, status=400)
+    # ルートの中なら復元できる（今のファイルの隣に日時付きの別名で）
+    restored = app.post_json("/api/restore", {"root": "r", "path": "a.txt", "snapshot": "1"}, headers=origin).json["restored"]
+    assert (root / restored).read_text() == "a-then"
+
+
+def test_plans_of_a_root_with_spaces_in_its_name_can_be_undone_from_the_web(tmp_path: Path, root: Path) -> None:
+    """ルート名に空白などがあっても、ファイルブラウザで作ったプランを画面から開けて取り消せる。"""
+    write(root / "a.txt", "a")
+    write(root / "keep.txt", "keep")
+    cfg = write(tmp_path / "config.toml", f'[[roots]]\nname = "My Drive"\npath = "{root}"\n[plan]\nquarantine_dir = "{tmp_path / "q"}"\n[tags]\ndir = "{tmp_path / "tags"}"\n')
+    jobs = JobManager(tmp_path / "logs")
+    app = TestApp(create_app(Settings(cfg, tmp_path / "data" / "catalog.db"), jobs=jobs), extra_environ={"HTTP_HOST": HOST})
+    origin = {"Origin": f"http://{HOST}"}
+    app.post_json("/api/roots/My Drive/scan", {}, headers=origin)
+    jobs.wait()
+    res = app.post_json("/api/fileops", {"root": "My Drive", "op": "delete", "items": [{"path": "a.txt"}]}, headers=origin).json
+    jobs.wait()
+    assert "My_Drive" in res["plan_id"] and not (root / "a.txt").exists()
+    assert app.get(f"/api/plans/{res['plan_id']}").json["info"]["state"] == "applied"
+    app.post_json(f"/api/plans/{res['plan_id']}/undo", {}, headers=origin)
+    jobs.wait()
+    assert (root / "a.txt").exists()
+
+
+def test_organize_plan_refuses_destinations_outside_the_root(env: dict, tmp_path: Path) -> None:
+    root = env["root"]
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (root / "link").symlink_to(outside)
+    run_job(env, "/api/roots/data/refresh")
+    env["app"].post_json(
+        "/api/organize/data/plan", {"items": [{"path": "docs/report.pdf", "dest": "link/report.pdf"}]},
+        headers={"Origin": f"http://{HOST}"}, status=400,
+    )
+    assert (root / "docs" / "report.pdf").exists() and list(outside.iterdir()) == []
+
+
+def test_names_that_differ_only_in_case_are_refused(env: dict) -> None:
+    """OneDrive は大文字・小文字を区別しないので、それだけが違う名前は同じ名前として断る。"""
+    app, root = env["app"], env["root"]
+    origin = {"Origin": f"http://{HOST}"}
+    write(root / "A" / "Report.pdf", "mine")
+    write(root / "B" / "report.pdf", "theirs")
+    write(root / "C" / "draft.pdf", "draft")
+    write(root / "C" / "memo.pdf", "memo")
+    write(root / "x.pdf", "x")
+    write(root / "y.pdf", "y")
+    run_job(env, "/api/roots/data/refresh")
+    app.post_json("/api/fileops", {"root": "data", "op": "move", "items": [{"path": "A/Report.pdf"}], "dest_dir": "B"}, headers=origin, status=409)
+    app.post_json("/api/fileops", {"root": "data", "op": "rename", "items": [{"path": "C/draft.pdf", "new_name": "MEMO.pdf"}]}, headers=origin, status=409)
+    app.post_json(
+        "/api/organize/data/plan", {"items": [{"path": "x.pdf", "dest": "D/Same.pdf"}, {"path": "y.pdf", "dest": "D/same.pdf"}]},
+        headers=origin, status=409,
+    )
+    app.post_json("/api/fileops", {"root": "data", "op": "mkdir", "parent": "", "name": "b"}, headers=origin, status=409)
+    # 自分自身の大文字・小文字だけの改名は許す
+    res = app.post_json("/api/fileops", {"root": "data", "op": "rename", "items": [{"path": "C/draft.pdf", "new_name": "Draft.pdf"}]}, headers=origin).json
+    env["jobs"].wait()
+    assert res["ops"] == 1 and (root / "C" / "Draft.pdf").exists()
