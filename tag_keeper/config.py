@@ -19,12 +19,26 @@
     mass_missing_ratio = 0.2         # 一度に消えたとみなす割合がこれを超えたら確定を保留する
     mass_missing_min = 100
 
+    [scan]
+    auto_refresh = 60                # Web の画面を動かしている間、この間隔（分）で各ルートを最新にする。0 で止める
+    after_sync = true                # cloud-sync の同期が終わるたびに、そのルートを最新にする
+    relink_days = 30                 # inode で結び付かない移動を内容ハッシュで探すとき、何日前までに消えたものを相手にするか。0 で探さない
+
     [plan]
     quarantine_dir = "~/.local/share/tag-keeper/quarantine"  # 隔離先（ルートと同じファイルシステム）
     snapper_config = "home"          # 実行の前後にスナップショットを撮る snapper の設定名（"" で撮らない）
 
     [tags]
     dir = "~/.local/share/tag-keeper/tags"  # タグのログ（端末ごとの JSONL）の置き場所
+
+    [extract]
+    enabled = true                   # Web の画面を動かしている間、裏で本文を抽出して全文検索の索引を作る
+    ocr = true                       # tesseract があれば、文字の無いスキャンの PDF を OCR にかける
+    ocr_images = false               # 画像（jpg・png など）も OCR にかける
+    ocr_lang = "jpn+eng"             # tesseract の言語（縦書きも読むなら "jpn+jpn_vert+eng"）
+    ocr_pages = 3                    # OCR にかける PDF のページ数（先頭から）
+    max_chars = 50000                # 1ファイルから保存する本文の上限（文字数）
+    max_mb = 200                     # これより大きいファイルは抽出しない（MB）
 
     [organize]
     inbox_patterns = ["tmp", "temp", "*未整理*", "*inbox*"]  # 受け皿とみなすフォルダ名（大文字・小文字を区別しない glob）
@@ -108,6 +122,19 @@ class SafetyConfig:
 
 
 @dataclass
+class ScanConfig:
+    """カタログを最新に保つ設定（要件 F-SC-3・F-ID-1、原則 P4）。"""
+
+    # Web の画面（serve）を動かしている間、この間隔（分）で各ルートを最新にする（走査とハッシュ計算）。0 で止める
+    auto_refresh: int = 60
+    # cloud-sync の同期が終わるたびに、そのルートを最新にする（クラウド側の変更をすぐにカタログへ反映する）
+    after_sync: bool = True
+    # inode で結び付かない移動（クラウド側での移動が「削除と新規」として届いたものなど）を、
+    # 内容ハッシュで探すときに相手にする「消えたもの」の古さの上限（日）。0 で探さない
+    relink_days: int = 30
+
+
+@dataclass
 class PlanConfig:
     """整理プランの実行に関する設定（要件 F-PL・F-VS-3）。"""
 
@@ -124,6 +151,26 @@ class TagsConfig:
 
     # タグのログ（端末ごとの追記専用 JSONL）の置き場所。ツリーの外に置く（P6）
     dir: Path = field(default_factory=lambda: default_data_dir() / "tags")
+
+
+@dataclass
+class ExtractConfig:
+    """全文検索のための本文の抽出の設定（要件 F-EX-1・5・6、F-SE-2）。"""
+
+    # Web の画面（serve）を動かしている間、ハッシュを計算済みのファイルから裏で本文を抽出し、索引に入れる
+    enabled: bool = True
+    # tesseract があれば、文字を取り出せないスキャンの PDF を OCR にかける
+    ocr: bool = True
+    # 画像（jpg・png など）も OCR にかけるか（写真やアイコンが多いと時間がかかり、意味の無い文字も拾うので既定は切る）
+    ocr_images: bool = False
+    # tesseract の言語。入っていないものは除いて使う（縦書きも読むなら "jpn+jpn_vert+eng"）
+    ocr_lang: str = "jpn+eng"
+    # OCR にかける PDF のページ数（先頭から）
+    ocr_pages: int = 3
+    # 1ファイルから保存する本文の上限（文字数）。索引の大きさを抑えるため
+    max_chars: int = 50_000
+    # これより大きいファイルは抽出しない（MB）
+    max_mb: int = 200
 
 
 @dataclass
@@ -162,8 +209,10 @@ class Config:
     roots: list[RootConfig] = field(default_factory=list)
     hygiene: HygieneConfig = field(default_factory=HygieneConfig)
     safety: SafetyConfig = field(default_factory=SafetyConfig)
+    scan: ScanConfig = field(default_factory=ScanConfig)
     plan: PlanConfig = field(default_factory=PlanConfig)
     tags: TagsConfig = field(default_factory=TagsConfig)
+    extract: ExtractConfig = field(default_factory=ExtractConfig)
     organize: OrganizeConfig = field(default_factory=OrganizeConfig)
 
     def find_root(self, name: str) -> RootConfig | None:
@@ -234,6 +283,17 @@ def load_config(path: Path | None = None) -> Config:
     if "mass_missing_min" in sf:
         safety.mass_missing_min = int(sf["mass_missing_min"])
 
+    sc = data.get("scan", {})
+    scan = ScanConfig()
+    if "auto_refresh" in sc:
+        scan.auto_refresh = int(sc["auto_refresh"])
+    if "after_sync" in sc:
+        scan.after_sync = bool(sc["after_sync"])
+    if "relink_days" in sc:
+        scan.relink_days = int(sc["relink_days"])
+    if scan.auto_refresh < 0 or scan.relink_days < 0:
+        raise ConfigError(f"{path}: [scan] の auto_refresh と relink_days は 0 以上にしてください")
+
     pl = data.get("plan", {})
     plan = PlanConfig()
     if "quarantine_dir" in pl:
@@ -245,6 +305,22 @@ def load_config(path: Path | None = None) -> Config:
     tags = TagsConfig()
     if "dir" in tg:
         tags.dir = _expand(str(tg["dir"]))
+
+    ex = data.get("extract", {})
+    extract = ExtractConfig()
+    for key, conv in (
+        ("enabled", bool),
+        ("ocr", bool),
+        ("ocr_images", bool),
+        ("ocr_lang", str),
+        ("ocr_pages", int),
+        ("max_chars", int),
+        ("max_mb", int),
+    ):
+        if key in ex:
+            setattr(extract, key, conv(ex[key]))
+    if extract.ocr_pages < 1 or extract.max_chars < 1 or extract.max_mb < 1:
+        raise ConfigError(f"{path}: [extract] の ocr_pages・max_chars・max_mb は 1 以上にしてください")
 
     og = data.get("organize", {})
     organize = OrganizeConfig()
@@ -266,4 +342,6 @@ def load_config(path: Path | None = None) -> Config:
         if key in og:
             setattr(organize, key, conv(og[key]))
 
-    return Config(roots=roots, hygiene=hygiene, safety=safety, plan=plan, tags=tags, organize=organize)
+    return Config(
+        roots=roots, hygiene=hygiene, safety=safety, scan=scan, plan=plan, tags=tags, extract=extract, organize=organize
+    )

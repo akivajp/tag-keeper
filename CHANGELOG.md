@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Full-text search.** The Tags page became the Search page: search by name and folder, by
+  the text inside PDF, Office and text files, by kind and by tags, in any combination, with
+  the matches highlighted. Scanned PDFs without text are read with tesseract when it is
+  installed (`jpn+eng` by default). Text is kept by content hash in an SQLite FTS5 trigram
+  index, so Japanese works without word splitting; one- and two-letter words are searched
+  without the index. While `serve` runs, documents are read in the background at low
+  priority (`[extract]`); `tag-keeper extract` does the same from the command line, and
+  `tag-keeper search` searches from it. `#/tags` links still open the page.
+- **Moves found by content hash.** A move that arrives as "deleted here, new there" — a
+  folder renamed on another device and brought in by rclone bisync gets new inodes — is
+  matched after hashing: only one-to-one matches (or, inside a folder that moved, the file
+  at the same relative path), never files the tool quarantined. The old catalog row comes
+  back at the new path, a folder whose files all moved is recorded as one folder move, and
+  tags and version history follow (`[scan] relink_days`).
+- **The catalog keeps itself up to date** while `serve` runs: each root is refreshed every
+  60 minutes and after every cloud-sync run (`[scan] auto_refresh`, `after_sync`). These
+  jobs do not pop up toasts or redraw the page you are working on.
+- The Roots page warns when the last scan is old and shows how many disappearances are on
+  hold.
+- The cache of MP4s made for playback is kept under 5 GB, removing the least recently
+  watched first.
+
+### Changed
+
+- The catalog schema is now version 3 (`extracts` table rebuilt for the index, `gone_by`
+  column). Older catalogs are upgraded on first use; older versions of tag-keeper cannot
+  open an upgraded catalog.
+
 ### Fixed
 
 - **Restoring an old version could write outside the root**, and the history and

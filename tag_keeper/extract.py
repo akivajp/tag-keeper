@@ -12,10 +12,15 @@
 
 from __future__ import annotations
 
+import functools
+import html
 import logging
+import os
 import re
+import shutil
 import subprocess
 import tempfile
+import unicodedata
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -118,4 +123,175 @@ def extract(path: Path, max_chars: int = 4000, use_images: bool = True) -> Extra
     except (OSError, zipfile.BadZipFile, subprocess.TimeoutExpired) as e:
         log.warning("内容を読めませんでした: %s (%s)", path, e)
         return Extracted("none", note=f"読めない: {e}")
+    return Extracted("none", note="内容を読まない種類")
+
+
+# ---------- 全文検索の索引のための抽出（要件 F-EX-1・F-SE-2） ----------
+#
+# 上の extract() は整理の提案のためのもの（先頭の数ページ・数千字、スキャンは画像のままモデルに見せる）。
+# 索引のためには、文書全体の文字（上限つき）を取り出し、スキャンの PDF は tesseract で OCR にかける。
+
+# Office 文書（マクロ付きのものも、中の XML の構成は同じ）
+INDEX_OFFICE_PARTS = {
+    ".docx": OFFICE_PARTS[".docx"], ".docm": OFFICE_PARTS[".docx"],
+    ".pptx": OFFICE_PARTS[".pptx"], ".pptm": OFFICE_PARTS[".pptx"],
+    ".xlsx": OFFICE_PARTS[".xlsx"], ".xlsm": OFFICE_PARTS[".xlsx"],
+}
+# OCR にかけられる画像（ocr_images を有効にしたときだけ）
+OCR_IMAGE_EXTS = frozenset({".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp", ".webp"})
+# pdftotext で読むページ数の上限（巨大な PDF で時間がかかりすぎないように）
+INDEX_PDF_PAGES = 300
+# Office 文書の中の1つの XML の大きさの上限（壊れた・細工したファイルでメモリを使い切らないように）
+MAX_OFFICE_PART = 50 * 1024 * 1024
+# 和文の文字（OCR が文字の間に入れる空白を詰めるのに使う）
+_CJK = "　-〿぀-ヿ㐀-䶿一-鿿豈-﫿＀-￯"
+_CJK_GAP = re.compile(f"(?<=[{_CJK}])[ \t]+(?=[{_CJK}])")
+
+
+def index_exts(ocr_images: bool = False) -> frozenset[str]:
+    """全文検索の索引に入れるファイルの種類（拡張子）。"""
+    exts = {".pdf", *INDEX_OFFICE_PARTS, *TEXT_EXTS}
+    if ocr_images:
+        exts |= OCR_IMAGE_EXTS
+    return frozenset(exts)
+
+
+def normalize_text(text: str, limit: int, *, join_cjk: bool = False) -> str:
+    """索引に入れる本文の表記をそろえる（NFKC、空白をまとめ、上限で切る）。
+
+    NFKC で全角の英数字と半角のカナをそろえるので、検索語も同じように直してから探す。
+
+    Args:
+        text: 取り出した本文。
+        limit: 上限（文字数）。
+        join_cjk: 和文の文字どうしの間の空白を詰めるか。OCR と PDF から取り出した文字は、
+            文字の間に空白が入りやすく「請 求 書」では探せないので詰める。書き手が入れた空白（Office・テキスト）は残す。
+    """
+    t = unicodedata.normalize("NFKC", text)
+    if join_cjk:
+        t = _CJK_GAP.sub("", t)
+    return _squeeze(t, limit)
+
+
+@functools.lru_cache(maxsize=1)
+def tesseract_languages() -> frozenset[str] | None:
+    """tesseract に入っている言語。tesseract が無ければ None。"""
+    if shutil.which("tesseract") is None:
+        return None
+    try:
+        res = subprocess.run(["tesseract", "--list-langs"], capture_output=True, text=True, timeout=30, check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    # 1行目は「List of available languages in ...」
+    return frozenset(line.strip() for line in res.stdout.splitlines()[1:] if line.strip())
+
+
+def ocr_languages(wanted: str) -> str | None:
+    """使う OCR の言語（"jpn+eng" のうち、入っているものだけ）。OCR を使えなければ None。"""
+    langs = tesseract_languages()
+    if not langs or shutil.which("pdftoppm") is None:
+        return None
+    have = [x for x in wanted.split("+") if x in langs]
+    return "+".join(have) if have else None
+
+
+def _niced(cmd: list[str]) -> list[str]:
+    """他の処理の邪魔をしないよう、優先度を下げて動かす（nice があれば）。"""
+    return ["nice", "-n", "19", *cmd] if shutil.which("nice") else cmd
+
+
+def ocr_image(path: Path, lang: str, timeout: float = 180) -> str:
+    """画像を tesseract で OCR にかけた文字を返す。読めなければ空。"""
+    env = {**os.environ, "OMP_THREAD_LIMIT": "1"}  # 1つのコアだけを使う
+    res = subprocess.run(
+        _niced(["tesseract", str(path), "stdout", "-l", lang]), capture_output=True, timeout=timeout, check=False, env=env
+    )
+    return res.stdout.decode("utf-8", errors="replace") if res.returncode == 0 else ""
+
+
+def ocr_pdf(path: Path, lang: str, pages: int, timeout: float = 180) -> str:
+    """PDF の先頭の pages ページを画像にして（300dpi・グレー）、OCR にかけた文字を返す。"""
+    with tempfile.TemporaryDirectory() as tmp:
+        prefix = Path(tmp) / "page"
+        res = subprocess.run(
+            _niced(["pdftoppm", "-r", "300", "-gray", "-png", "-f", "1", "-l", str(pages), str(path), str(prefix)]),
+            capture_output=True, timeout=timeout, check=False,
+        )
+        if res.returncode != 0:
+            return ""
+        return "\n".join(ocr_image(p, lang, timeout) for p in sorted(Path(tmp).glob("page*.png")))
+
+
+def extract_text(
+    path: Path,
+    *,
+    max_chars: int = 50_000,
+    max_mb: int = 200,
+    ocr_lang: str | None = None,
+    ocr_pages: int = 3,
+    ocr_images: bool = False,
+) -> Extracted:
+    """全文検索の索引に入れる本文を取り出す。例外にはせず、読めなければ method="error" で返す。
+
+    Args:
+        path: 対象のファイル。
+        max_chars: 本文の上限（文字数）。
+        max_mb: これより大きいファイルは読まない（MB）。
+        ocr_lang: OCR に使う tesseract の言語（ocr_languages の結果）。None なら OCR しない。
+        ocr_pages: OCR にかける PDF のページ数。
+        ocr_images: 画像も OCR にかけるか。
+
+    Returns:
+        method は pdftotext / office / text / ocr（読めた）、scan（文字の無い PDF・画像で、OCR を使えるようになったら読み直す）、
+        none（中身が空・読まない種類・大きすぎる）、error（壊れている・時間切れ）のどれか。
+    """
+    ext = path.suffix.lower()
+    try:
+        if path.stat().st_size > max_mb * 1024 * 1024:
+            return Extracted("none", note=f"{max_mb}MB より大きいので読まない")
+        if ext == ".pdf":
+            if shutil.which("pdftotext") is None:
+                # 入れたら読み直せるよう、保存しない印を返す
+                return Extracted("unavailable", note="pdftotext がありません")
+            # 裏で少しずつ進める処理なので、優先度を下げて動かす（画面の操作や同期の邪魔をしない）
+            res = _run(_niced(["pdftotext", "-l", str(INDEX_PDF_PAGES), "-enc", "UTF-8", str(path), "-"]), timeout=180)
+            text = normalize_text(_decode(res.stdout), max_chars, join_cjk=True) if res.returncode == 0 else ""
+            if len(text) >= SCAN_THRESHOLD:
+                return Extracted("pdftotext", text)
+            if res.returncode != 0 and b"Incorrect password" in res.stderr:
+                return Extracted("none", note="パスワードで保護された PDF")
+            if ocr_lang:
+                ocr = normalize_text(ocr_pdf(path, ocr_lang, ocr_pages), max_chars, join_cjk=True)
+                return Extracted("ocr", ocr or text, note="" if ocr else "OCR で文字を読み取れなかった")
+            return Extracted("scan", text, note="文字の無い PDF（OCR を使えるようになったら読み直す）")
+        if ext in INDEX_OFFICE_PARTS:
+            parts: list[str] = []
+            with zipfile.ZipFile(path) as z:
+                for info in sorted(z.infolist(), key=lambda i: i.filename):
+                    if not INDEX_OFFICE_PARTS[ext].match(info.filename):
+                        continue
+                    if info.file_size > MAX_OFFICE_PART:
+                        return Extracted("error", note=f"中の XML が大きすぎる: {info.filename}")
+                    xml = z.read(info).decode("utf-8", errors="replace")
+                    # 段落・行・セルの区切りを改行にしてから、タグを除き、文字参照（&amp; など）を戻す
+                    xml = re.sub(r"</(w:p|a:p|si)>", "\n", xml)
+                    parts.append(html.unescape(re.sub(r"<[^>]+>", "", xml)))
+            return Extracted("office", normalize_text("\n".join(parts), max_chars))
+        if ext in TEXT_EXTS:
+            with path.open("rb") as f:
+                data = f.read(max_chars * 4)
+            return Extracted("text", normalize_text(_decode(data), max_chars))
+        if ext in OCR_IMAGE_EXTS and ocr_images:
+            if not ocr_lang:
+                return Extracted("scan", note="画像（OCR を使えるようになったら読み直す）")
+            return Extracted("ocr", normalize_text(ocr_image(path, ocr_lang), max_chars, join_cjk=True))
+    except subprocess.TimeoutExpired:
+        return Extracted("error", note="時間内に読み終わらなかった")
+    except FileNotFoundError as e:
+        # 道具（pdftotext など）が無い。入れたら読み直せるよう、保存しない印を返す
+        if e.filename and Path(str(e.filename)).name in ("pdftotext", "pdftoppm", "tesseract", "nice"):
+            return Extracted("unavailable", note=f"{e.filename} がありません")
+        return Extracted("error", note=f"読めない: {e}")
+    except (OSError, zipfile.BadZipFile, ValueError, RuntimeError) as e:
+        return Extracted("error", note=f"読めない: {e}")
     return Extracted("none", note="内容を読まない種類")

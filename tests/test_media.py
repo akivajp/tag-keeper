@@ -66,3 +66,28 @@ def test_broken_file_reports_error_and_can_retry(tmp_path: Path) -> None:
     # 失敗は、問い合わせのたびにはやり直さない
     assert conv.status(src, "sha2") is job
     assert conv.status(src, "sha2", retry=True) is not job
+
+
+def test_cache_is_kept_under_its_size_limit(tmp_path: Path) -> None:
+    """保存した MP4 が上限を超えたら、しばらく使っていないものから消す。消したものは作り直せる。"""
+    import os
+
+    from tag_keeper.media import MediaConverter
+
+    conv = MediaConverter(tmp_path / "cache", max_bytes=250)
+    conv.cache_dir.mkdir()
+    for i, name in enumerate(["old", "used", "new"]):
+        p = conv.output_path(name)
+        p.write_bytes(b"x" * 100)
+        os.utime(p, (1000 + i, 1000 + i))
+    # 「old」より前に作った「used」を開くと、使ったことになる
+    assert conv.status(tmp_path / "v.flv", "used").state == "done"
+    conv._prune(keep=conv.output_path("new"))
+    assert sorted(p.stem for p in conv.cache_dir.glob("*.mp4")) == ["new", "used"]
+    # 消した MP4 を「できている」と返し続けない（作り直しを始める。ここでは ffmpeg が無くても構わない）
+    from tag_keeper.media import Conversion
+
+    stale = Conversion(state="done", progress=1.0, output=conv.output_path("old"))
+    conv.jobs["old"] = stale
+    again = conv.status(tmp_path / "missing.flv", "old")
+    assert again is not stale and again.state in ("running", "error")

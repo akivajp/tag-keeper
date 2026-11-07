@@ -3,6 +3,8 @@
     tag-keeper roots                 設定済みのルートと、カタログの状態を一覧する
     tag-keeper scan [ROOT ...]       ルートを走査してカタログを更新する（読み取り専用）
     tag-keeper hash [ROOT ...]       変わったファイルだけ内容ハッシュを計算する
+    tag-keeper extract [ROOT ...]    本文を抽出して、全文検索の索引に入れる
+    tag-keeper search [WORD ...]     名前・本文（--text）・種類・タグで探す
     tag-keeper report [ROOT ...]     整理候補（置く価値の薄いファイル・重複）を報告する
     tag-keeper plan ROOT             整理候補を隔離するプラン（TOML）を書き出す
     tag-keeper apply PLAN [--yes]    プランを確認する。--yes で実行する（隔離フォルダへ移す）
@@ -20,6 +22,7 @@ import json
 import logging
 import sys
 from collections.abc import Sequence
+from datetime import datetime
 from pathlib import Path
 
 from rich.console import Console
@@ -39,6 +42,7 @@ from rich.progress import (
 from rich.table import Table
 
 from tag_keeper import __version__, rules
+from tag_keeper import extract as extract_mod
 from tag_keeper.catalog import connect, ensure_root, last_scan
 from tag_keeper.config import (
     Config,
@@ -48,6 +52,7 @@ from tag_keeper.config import (
     default_db_path,
     load_config,
 )
+from tag_keeper.fulltext import KINDS, Pending, find_entries, query_terms, run_pending, snippets
 from tag_keeper.hashing import hash_root
 from tag_keeper.plan import (
     OpOutcome,
@@ -71,9 +76,10 @@ from tag_keeper.plan import (
     write_plan,
 )
 from tag_keeper.report import Report, build_report
-from tag_keeper.scan import RootUnavailableError, scan_root
+from tag_keeper.scan import RootUnavailableError, relink_by_hash, scan_root
 from tag_keeper.syncguard import SyncError, SyncGuard, make_guard
 from tag_keeper.tags import TagStore
+from tag_keeper.tags import search as search_tags
 
 log = logging.getLogger("tag_keeper")
 
@@ -252,6 +258,97 @@ def cmd_hash(args: argparse.Namespace, config: Config) -> int:
             f"{res.skipped_changed:,}",
             f"{res.skipped_error:,}",
         )
+        # inode で結び付かなかった移動（クラウド側での移動が「削除と新規」として届いたものなど）を、
+        # 内容ハッシュで結び付け、タグを追従させる（F-ID-1・P4）
+        rl = relink_by_hash(conn, root_id, days=config.scan.relink_days)
+        if rl.moves:
+            TagStore(config.tags.dir).follow_moves(rc.name, rl.moves)
+    return 0
+
+
+def cmd_extract(args: argparse.Namespace, config: Config) -> int:
+    """ハッシュを計算済みのファイルから本文を抽出し、全文検索の索引に入れる（Web の画面が裏で行うのと同じ）。"""
+    if args.no_ocr:
+        config.extract.ocr = False
+    ocr = extract_mod.ocr_languages(config.extract.ocr_lang) if config.extract.ocr else None
+    log.info("OCR: %s", ocr or ("tesseract が無いので使いません" if config.extract.ocr else "使いません"))
+    conn = connect(args.db)
+    for rc in resolve_roots(config, args.roots):
+        root_id = ensure_root(conn, rc.name, rc.path)
+        with Progress(
+            TextColumn("{task.description}"),
+            BarColumn(),
+            MofNCompleteColumn(),
+            TimeElapsedColumn(),
+            TimeRemainingColumn(),
+            TextColumn("[dim]{task.fields[current]}"),
+            console=err_console,
+        ) as progress:
+            task = progress.add_task(f"本文の抽出: {rc.name}", total=None, current="")
+
+            def on_start(count: int) -> None:
+                log.info("本文を抽出します: %s  %s 件", rc.name, f"{count:,}")
+                progress.update(task, total=count)
+
+            def on_item(item: Pending, _ex: object) -> None:
+                progress.update(task, advance=1, current=item.relpath[-50:])
+
+            res = run_pending(conn, root_id, rc.path, config, limit=args.limit, on_start=on_start, on_item=on_item)
+        log.info(
+            "本文の抽出を終えました: %s  抽出 %s 件（うち OCR %s） / 読めない %s / 後回し %s",
+            rc.name,
+            f"{res.done:,}",
+            f"{res.ocr:,}",
+            f"{res.errors:,}",
+            f"{res.skipped:,}",
+        )
+    return 0
+
+
+def cmd_search(args: argparse.Namespace, config: Config) -> int:
+    """名前・本文・種類・タグで探して、表にする（Web の画面の「検索」と同じ条件）。"""
+    if not (args.words or args.text or args.kind or args.tag or args.exclude):
+        log.error("探す条件（名前の語・--text・--kind・--tag・--not のどれか）を指定してください")
+        return 2
+    conn = connect(args.db)
+    store = TagStore(config.tags.dir)
+    terms = query_terms(args.text or "")
+    table = Table(title="検索の結果")
+    for col, just in (("ルート", "left"), ("パス", "left"), ("サイズ", "right"), ("更新日時", "left"), ("一致したところ", "left")):
+        table.add_column(col, justify=just)  # type: ignore[arg-type]
+    total = 0
+    for rc in resolve_roots(config, args.root or []):
+        row = conn.execute("SELECT id FROM roots WHERE name = ?", (rc.name,)).fetchone()
+        if row is None:
+            log.warning("まだ走査していません: %s", rc.name)
+            continue
+        rows = find_entries(
+            conn, int(row["id"]), words=args.words, text=args.text or "", kind=args.kind or "", files_only=not args.folders
+        )
+        info = {r["relpath"]: r for r in rows}
+        paths = list(info)
+        if args.tag or args.exclude:
+            paths = search_tags(
+                ((p, bool(info[p]["is_dir"])) for p in paths),
+                store.tagged_paths(rc.name),
+                args.tag or [],
+                "or" if args.any else "and",
+                args.exclude or [],
+            )
+        # 表に載せる件数の上限は、全ルートを通して数える
+        shown = paths[: max(args.limit - len(table.rows), 0)]
+        snips = snippets(conn, [info[p]["sha256"] for p in shown if info[p]["sha256"]], terms) if terms else {}
+        for p in shown:
+            r = info[p]
+            mtime = datetime.fromtimestamp(r["mtime_ns"] / 1e9).strftime("%Y-%m-%d %H:%M")
+            table.add_row(
+                rc.name, p + ("/" if r["is_dir"] else ""), "" if r["is_dir"] else human_size(r["size"]), mtime,
+                snips.get(r["sha256"] or "", ""),
+            )
+        total += len(paths)
+    out_console.print(table)
+    shown_n = len(table.rows)
+    out_console.print(f"[dim]{total:,} 件{f'（うち {shown_n:,} 件を表示。--limit で増やせます）' if shown_n < total else ''}[/dim]")
     return 0
 
 
@@ -630,6 +727,24 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("hash", help="変わったファイルだけ内容ハッシュ（SHA-256）を計算する")
     p.add_argument("roots", nargs="*", metavar="ROOT", help="ルート名かフォルダのパス（省略時は全ルート）")
     p.set_defaults(func=cmd_hash)
+
+    p = sub.add_parser("extract", help="ハッシュを計算済みのファイルから本文を抽出し、全文検索の索引に入れる")
+    p.add_argument("roots", nargs="*", metavar="ROOT", help="ルート名かフォルダのパス（省略時は全ルート）")
+    p.add_argument("--limit", type=int, default=None, help="この回に抽出する件数の上限（書類・新しいものから）")
+    p.add_argument("--no-ocr", action="store_true", help="tesseract があっても OCR を使わない（スキャンは後で読み直す）")
+    p.set_defaults(func=cmd_extract)
+
+    p = sub.add_parser("search", help="名前・本文・種類・タグで探す")
+    p.add_argument("words", nargs="*", metavar="WORD", help="名前やフォルダに含む語（すべて含むもの）")
+    p.add_argument("-t", "--text", default=None, help="本文に含む語（空白区切りで、すべて含むもの）")
+    p.add_argument("-k", "--kind", choices=sorted(KINDS), default=None, help="種類で絞り込む")
+    p.add_argument("--tag", action="append", metavar="TAG", help="付いているタグ（複数指定可。フォルダのタグは配下にも効く）")
+    p.add_argument("--not", dest="exclude", action="append", metavar="TAG", help="付いていないタグ（複数指定可）")
+    p.add_argument("--any", action="store_true", help="--tag のどれかを含むもの（既定はすべて含むもの）")
+    p.add_argument("--folders", action="store_true", help="フォルダも結果に出す")
+    p.add_argument("-r", "--root", action="append", metavar="ROOT", help="探すルート（複数指定可、省略時は全ルート）")
+    p.add_argument("--limit", type=int, default=50, help="表に載せる件数")
+    p.set_defaults(func=cmd_search)
 
     p = sub.add_parser("report", help="整理候補（置く価値の薄いもの・重複）を報告する")
     p.add_argument("roots", nargs="*", metavar="ROOT", help="ルート名かフォルダのパス（省略時は全ルート）")

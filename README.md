@@ -6,8 +6,9 @@ Tag, search and tidy your existing file trees from the outside — without movin
 
 > **Status: pre-alpha.** What works today: the inventory (scanning, content hashing, a
 > hygiene report), cleaning up with plans you approve (with undo), a file browser with tags
-> and version history from btrfs snapshots, and name and folder suggestions for your inbox
-> folders from a local model. Search and the rest of tagging come next. See [Roadmap](#roadmap).
+> and version history from btrfs snapshots, search by name, full text (with OCR for scans)
+> and tags, and name and folder suggestions for your inbox folders from a local model.
+> Tag aliases, parents and typed fields come next. See [Roadmap](#roadmap).
 
 ![Inbox: pick a file and a model suggests a name, a folder and tags](https://raw.githubusercontent.com/akivajp/tag-keeper/main/docs/screenshots/inbox.png)
 
@@ -15,7 +16,7 @@ Tag, search and tidy your existing file trees from the outside — without movin
 |---|---|---|
 | ![File browser previewing an Excel workbook](https://raw.githubusercontent.com/akivajp/tag-keeper/main/docs/screenshots/files.png) | ![File browser in dark mode with a PDF preview](https://raw.githubusercontent.com/akivajp/tag-keeper/main/docs/screenshots/files-dark.png) | ![Hygiene report grouped by category](https://raw.githubusercontent.com/akivajp/tag-keeper/main/docs/screenshots/report.png) |
 
-![Tags page: search with several tags, AND/OR and exclusions, with a preview](https://raw.githubusercontent.com/akivajp/tag-keeper/main/docs/screenshots/tags.png)
+![Search page: full-text search with the matches highlighted, combined with tags on the left](https://raw.githubusercontent.com/akivajp/tag-keeper/main/docs/screenshots/search.png)
 
 *Screenshots use made-up demo data (`scripts/make_demo.py`).*
 
@@ -43,10 +44,16 @@ there it helps you keep the tree clean:
 $ tag-keeper scan ~/CloudSync/OneDrive     # read-only walk; updates the catalog
 $ tag-keeper hash ~/CloudSync/OneDrive     # SHA-256 of files that changed since last time
 $ tag-keeper report ~/CloudSync/OneDrive   # what is probably not worth keeping in the cloud
+$ tag-keeper extract                       # read the text of documents into the full-text index
+$ tag-keeper search --text invoice         # search by name, text (--text), kind and tags
 ```
 
 - **scan** records path, size, mtime and inode of every file and folder. Renames and
   moves are tracked by inode, so a moved file keeps its row (and its hash).
+  - Moves that arrive as "deleted here, new there" — a folder renamed on another device and
+    brought in by rclone bisync, for instance, gets new inodes — are matched by content
+    hash after **hash**: only one-to-one matches, and a folder whose files all moved is
+    recorded as one folder move, so tags and version history follow it.
   - **Safety valve:** if a large share of files vanishes at once — an unmounted drive, a
     sync client accident — the deletions are *held*, not recorded. They are recorded only
     if they are still missing on the next scan (or with `--accept-missing`).
@@ -146,6 +153,10 @@ and the theme (system, light or dark).
   bound address (against DNS rebinding).
 - One job runs at a time. Each job also writes its own log under
   `~/.local/share/tag-keeper/logs/jobs/`.
+- **Kept up to date by itself.** While the server runs, each root is refreshed (scan, hash
+  and the content-hash move matching) every 60 minutes and after every cloud-sync run
+  (`[scan]`), and documents are read into the full-text index in the background at low
+  priority (`[extract]`). The Roots page warns when a scan is old or deletions are on hold.
 
 ### Files, tags and history
 
@@ -171,10 +182,17 @@ and the theme (system, light or dark).
   (`~/.local/share/tag-keeper/tags/<host>.jsonl`), so they stay readable without the tool
   and never conflict when synced. When a tagged item is moved — by you or by a plan — the
   log records the move and the tags follow.
-- **Find and manage tags** on the Tags page: filter the tag list, search with several tags
-  (all of them or any of them, minus excluded ones, narrowed by name) — tags on a folder
-  count for everything inside — and rename a tag everywhere (renaming onto an existing tag
-  merges the two) or delete it. Results show a preview of the picked file.
+- **Search** by name and folder, by the text inside documents, by kind (documents, PDF,
+  Office, images, videos and so on) and by tags, in any combination. Full-text search covers
+  PDF, Office and text files; scanned PDFs without text are read with tesseract when it is
+  installed. Text is stored by content hash in an SQLite FTS5 index (trigram, so Japanese
+  works without word splitting; one- and two-letter words are searched without the index),
+  and the matches are highlighted in the results. Rebuildable folders such as `node_modules`
+  and application data are left out.
+- **Find and manage tags** on the same page: filter the tag list, search with several tags
+  (all of them or any of them, minus excluded ones) — tags on a folder count for everything
+  inside — and rename a tag everywhere (renaming onto an existing tag merges the two) or
+  delete it. Results show a preview of the picked file.
 - **Version history** comes from btrfs snapshots through
   [btrfs-timeline](https://github.com/akivajp/btrfs-timeline): the versions of a file, a
   folder as it was at any snapshot (including what has since been deleted), and restoring
@@ -226,7 +244,8 @@ Optional tools, each used only by the feature that needs it:
 
 | Tool | Used for |
 |---|---|
-| poppler-utils (`pdftotext`, `pdftoppm`) | reading PDFs for inbox suggestions |
+| poppler-utils (`pdftotext`, `pdftoppm`) | reading PDFs for full-text search and inbox suggestions |
+| tesseract-ocr (with `jpn` for Japanese) | OCR of scanned PDFs for full-text search |
 | [ollama](https://ollama.com/) | inbox suggestions |
 | btrfs and snapper | version history, and snapshots around plans |
 | OneDrive client for Linux | coordinating big deletions with the sync, links to OneDrive on the web |
@@ -264,6 +283,20 @@ mass_missing_min = 100
 [plan]
 quarantine_dir = "~/.local/share/tag-keeper/quarantine"  # must be on the root's filesystem
 snapper_config = "home"              # snapper config for pre/post snapshots ("" = none)
+
+[scan]
+auto_refresh = 60                    # while `serve` runs, refresh each root every N minutes (0 = never)
+after_sync = true                    # also refresh a root after each cloud-sync run
+relink_days = 30                     # match moves by content hash against files gone this recently (0 = off)
+
+[extract]
+enabled = true                       # while `serve` runs, read documents into the full-text index
+ocr = true                           # OCR scanned PDFs when tesseract is installed
+ocr_images = false                   # also OCR images (slow, and photos give noise)
+ocr_lang = "jpn+eng"                 # tesseract languages ("jpn+jpn_vert+eng" for vertical text)
+ocr_pages = 3                        # pages of a scanned PDF to OCR
+max_chars = 50000                    # text kept per file
+max_mb = 200                         # larger files are not read
 ```
 
 Per root, for coordinating with a sync client:
@@ -303,10 +336,12 @@ Every command accepts `--log-file PATH` to keep a timestamped log.
 1. **Inventory and hygiene report**, and tidy-up plans that quarantine what you approve,
    with snapper snapshots and undo. *(done)*
 2. **Tags and search** — *partly done:* tags inherited from folders in append-only logs, a
-   file browser, version history across moves. *Next:* aliases and parents, typed fields,
-   search by tag, name and content.
-3. **Content extraction** — *partly done:* text from PDF and Office files, images through a
-   local model, for inbox suggestions. *Next:* OCR and transcripts for full-text search.
+   file browser, version history across moves (including moves found by content hash),
+   search by tag, name, kind and content. *Next:* aliases and parents, typed fields, saved
+   searches.
+3. **Content extraction** — *partly done:* text from PDF and Office files and OCR of scans
+   for full-text search, images through a local model for inbox suggestions. *Next:*
+   transcripts of audio and video.
 4. **Placement and structure** — *partly done:* name and folder suggestions for inbox files.
    *Next:* directory cards, structure review.
 

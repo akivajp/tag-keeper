@@ -28,6 +28,13 @@ const I18N_EN = {
   '最新にする（走査＋ハッシュ）': 'Refresh (scan + hash)', '走査だけ': 'Scan only', 'レポートとプランの作成': 'Report and plans',
   'ハッシュ計算済み': 'Hashed', '最後の走査': 'Last scan', '消失の確定を保留': 'Disappearances on hold',
   'まだ走査していません。': 'Not scanned yet.', 'ルートがありません。': 'No roots.',
+  '{d}日': '{d} days', '消失の確定を保留（{n} 件）': 'Disappearances on hold ({n})',
+  '次の走査でも見えなければ、消えたと確定します。': 'If they are still missing at the next scan, they are recorded as gone.',
+  '最後の走査から {age} たっています。カタログ（タグの検索・レポート・移動の追従）が今のファイルと合っていない可能性があります。':
+    'The last scan was {age} ago. The catalog (search, report, following moves) may not match the files any more.',
+  '設定の [scan] auto_refresh で、自動で最新にできます。': 'Set [scan] auto_refresh in the config file to refresh automatically.',
+  '自動で最新にします（{m} 分ごと{sync}）。': 'Refreshed automatically (every {m} min{sync}).', 'と、同期が終わるたび': ' and after each sync',
+  '自動では最新にしません。': 'Not refreshed automatically.',
   '同期: 待機中': 'Sync: idle', '同期中…': 'Syncing…', '同期: 順番待ち': 'Sync: waiting its turn', '同期: 基準の作り直しが必要': 'Sync: needs a resync', '同期: 中断': 'Sync: interrupted',
   '同期中: {root}': 'Syncing: {root}', '（{when} に開始）': '(started {when})',
   '開始しています': 'Starting', '一覧を作っています': 'Listing files', '差分を調べています': 'Finding changes', '変更を反映しています': 'Applying changes',
@@ -145,6 +152,16 @@ const I18N_EN = {
   'タグの名前を変える': 'Rename tag', '既にあるタグの名前にすると、2つのタグを1つにまとめます。': 'Using the name of an existing tag merges the two.',
   'タグを削除しますか？': 'Delete this tag?', 'タグを削除': 'Delete tag', '名前空間なし': 'No namespace',
   '検索に含める': 'Include in the search', '検索から除く': 'Exclude from the search', '当てはまるタグがありません。': 'No matching tags.',
+  // --- 検索（名前・本文・種類・タグ） ---
+  '検索': 'Search', '名前やフォルダで探す': 'Search names and folders', '本文に含む語': 'Words in the text', 'PDF・Office・テキストの本文から探します（文字の無いスキャンは OCR で読んだもの）': 'Searches the text of PDF, Office and text files (scans without text are read by OCR)',
+  '種類': 'Kind', 'すべての種類': 'All kinds', '書類（PDF・Office・テキスト）': 'Documents (PDF, Office, text)', 'Office 文書': 'Office documents',
+  'テキスト': 'Text', '画像': 'Images', '動画': 'Videos', '音声': 'Audio', '圧縮ファイル': 'Archives',
+  '名前・本文・種類で探すか、左の一覧からタグを選んでください。フォルダに付いたタグは、中のファイルにも効きます。':
+    'Search by name, text or kind, or pick tags on the left. Tags on a folder apply to everything inside it.',
+  '本文の索引: {n} 件': 'Text index: {n} files', '抽出待ち {n} 件': '{n} waiting to be read', 'OCR: 使える（{lang}）': 'OCR: available ({lang})',
+  'OCR: tesseract が無いので使えません': 'OCR: unavailable (tesseract is not installed)', 'OCR: 使わない設定': 'OCR: turned off',
+  'OCR を待っているスキャン {n} 件': '{n} scans waiting for OCR', '裏での抽出は止めてあります（[extract] enabled）': 'Reading text in the background is turned off ([extract] enabled)',
+  '裏での抽出は Web の画面（serve）が動かします': 'The web UI (serve) reads the text in the background',
   'タグを探す': 'Find a tag', '＋ で検索に含め、⊘ で除きます。件数は直接付いている数です。': '＋ includes a tag in the search, ⊘ excludes it. Counts are direct tags.',
   '左の一覧からタグを選ぶと、そのタグの付いたファイルを探します。フォルダに付いたタグは、中のファイルにも効きます。':
     'Pick tags on the left to find the files that carry them. A tag on a folder applies to everything inside it.',
@@ -218,6 +235,7 @@ const I18N_EN = {
   '移動先がルートの外を指している': 'the destination points outside the root',
   '移動先に大文字・小文字だけが違う名前のものがある': 'the destination has a name that differs only in case',
   '空ではない（走査の対象外のものがある）': 'not empty (it holds items the scan skips)',
+  '探す条件を入れてください': 'Enter something to search for', '種類が不正です': 'Unknown kind',
   '復元するファイルを指定してください': 'Choose a file to restore', 'ルートの外を指しています': 'Points outside the root',
   '元の場所に別のものがある': 'something else is at the original path', '隔離先に見つからない': 'not found in quarantine', '移動先に見つからない': 'not found at the destination',
   'プランで除外': 'excluded in the plan', '名前の変更': 'rename', 'ファイルブラウザから削除': 'deleted from the file browser',
@@ -230,8 +248,9 @@ const I18N_EN = {
 
 // サーバーから来る、変数を含む文（正規表現 → 英語）
 const I18N_PATTERNS = [
-  [/^(走査|ハッシュ計算|最新にする（走査とハッシュ計算）|プランの作成|整理の提案|実行|取り消し|確認|削除の反映の再試行|常駐の同期の再開): (.+)$/, (m) => `${{
-    '走査': 'Scan', 'ハッシュ計算': 'Hash', '最新にする（走査とハッシュ計算）': 'Refresh (scan and hash)', 'プランの作成': 'Create plan',
+  [/^(走査|ハッシュ計算|最新にする（走査とハッシュ計算）|自動で最新にする|プランの作成|整理の提案|実行|取り消し|確認|削除の反映の再試行|常駐の同期の再開): (.+)$/, (m) => `${{
+    '走査': 'Scan', 'ハッシュ計算': 'Hash', '最新にする（走査とハッシュ計算）': 'Refresh (scan and hash)', '自動で最新にする': 'Auto refresh',
+    'プランの作成': 'Create plan',
     '整理の提案': 'Inbox suggestions', '実行': 'Apply', '取り消し': 'Undo', '確認': 'Check', '削除の反映の再試行': 'Retry reflecting deletions',
     '常駐の同期の再開': 'Restart resident sync',
   }[m[1]]}: ${m[2]}`],

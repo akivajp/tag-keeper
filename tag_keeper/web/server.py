@@ -25,10 +25,11 @@ import logging
 import os
 import re
 import sqlite3
+import threading
 import urllib.error
 import urllib.request
 from dataclasses import asdict
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from socketserver import ThreadingMixIn
 from typing import Any
@@ -47,9 +48,10 @@ from tag_keeper.config import (
     load_config,
 )
 from tag_keeper.decisions import DecisionLog
+from tag_keeper.fulltext import KINDS, ExtractWorker, find_entries, index_status, query_terms, snippets
 from tag_keeper.hashing import hash_root, sha256_file
 from tag_keeper.history import HistoryError
-from tag_keeper.jobs import JobBusyError, JobManager, JobReporter
+from tag_keeper.jobs import AutoRefresh, JobBusyError, JobManager, JobReporter, RootTiming
 from tag_keeper.media import MediaConverter
 from tag_keeper.organize import OllamaError
 from tag_keeper.plan import (
@@ -79,7 +81,7 @@ from tag_keeper.plan import (
     write_plan,
 )
 from tag_keeper.report import build_report
-from tag_keeper.scan import RootUnavailableError, scan_root
+from tag_keeper.scan import RootUnavailableError, relink_by_hash, scan_root
 from tag_keeper.suggest_queue import SuggestQueue
 from tag_keeper.syncguard import CloudSyncGuard, OneDriveGuard, SyncError, SyncGuard, make_guard
 from tag_keeper.tags import TagError, TagStore, normalize_tag
@@ -129,6 +131,8 @@ class Settings:
         self.media = MediaConverter(data_dir / "media-cache")
         self._sha_cache: dict[tuple[str, int, int], str] = {}
         self._links: dict[tuple[str, str], OneDriveLinks | None] = {}
+        # 裏で本文を抽出するスレッド（serve が動かす。テストでは無し）。ルートを最新にしたら起こす
+        self.extractor: ExtractWorker | None = None
 
     def sha256_of(self, path: Path) -> str:
         """ファイルの内容ハッシュ（大きさと更新日時が同じあいだは、計算し直さない）。"""
@@ -290,6 +294,9 @@ def create_app(
             "config_path": str(settings.config_path or default_config_path()),
             "quarantine_dir": str(config.plan.quarantine_dir),
             "snapper_config": config.plan.snapper_config,
+            # 自動で最新にする設定（画面で、走査が古いかを判断するのに使う）
+            "auto_refresh": config.scan.auto_refresh,
+            "after_sync": config.scan.after_sync,
             "roots": roots,
             "plans": plans,
             "job": job.to_dict() if job else None,
@@ -404,25 +411,7 @@ def create_app(
     def api_root_action(root: str, action: str) -> dict[str, Any]:
         config = settings.config()
         rc = root_config(config, root)
-        titles = {"scan": "走査", "hash": "ハッシュ計算", "refresh": "最新にする（走査とハッシュ計算）"}
-
-        def run(rep: JobReporter) -> dict[str, Any]:
-            conn = open_db()
-            try:
-                root_id = ensure_root(conn, rc.name, rc.path)
-                out: dict[str, Any] = {}
-                if action in ("scan", "refresh"):
-                    out["scan"] = _run_scan(conn, root_id, rc, config, rep)
-                    # ツールの外での移動・改名に、タグを追従させる（P4）
-                    moved = settings.tags(config).follow_moves(rc.name, out["scan"].pop("moves"))
-                    out["scan"]["tag_moves"] = moved
-                if action in ("hash", "refresh"):
-                    out["hash"] = _run_hash(conn, root_id, rc, rep)
-                return out
-            finally:
-                conn.close()
-
-        return start(action, f"{titles[action]}: {rc.name}", run, target=rc.name)
+        return start(action, f"{ROOT_ACTION_TITLES[action]}: {rc.name}", root_job(settings, config, rc, action), target=rc.name)
 
     # --- プラン ---
 
@@ -1052,6 +1041,77 @@ def create_app(
             ],
         }
 
+    @app.route("/api/search")
+    def api_search() -> dict[str, Any]:
+        """名前・本文・種類・タグで探す（F-SE-1・F-SE-2）。条件はどう組み合わせてもよい（どれか1つは要る）。
+
+        問い合わせ: root、q（名前・フォルダに含む語。空白区切りで、すべて含むもの）、text（本文に含む語）、
+        kind（種類: KINDS のキー）、tag・not・mode（タグ。フォルダのタグは配下にも効く）、folders=1（フォルダも出す）、limit。
+        """
+        # getall() などは値を latin-1 のまま返すので、UTF-8 に直した写しから読む（日本語の語とタグのため）
+        uq = bottle.request.query.decode()
+        config = settings.config()
+        rc = root_config(config, uq.get("root", "") or (config.roots[0].name if config.roots else ""))
+        include = [x for x in uq.getall("tag") if x]
+        exclude = [x for x in uq.getall("not") if x]
+        mode = "or" if uq.get("mode") == "or" else "and"
+        words = uq.get("q", "").split()
+        text = uq.get("text", "").strip()
+        kind = uq.get("kind", "")
+        if kind and kind not in KINDS:
+            raise fail(400, f"種類が不正です: {kind}")
+        files_only = uq.get("folders") != "1"
+        try:
+            limit = max(1, min(int(uq.get("limit", 500)), 5000))
+        except ValueError:
+            raise fail(400, "limit は数で指定してください") from None
+        if not (include or exclude or words or text or kind):
+            raise fail(400, "探す条件を入れてください")
+        terms = query_terms(text)
+        conn = open_db()
+        try:
+            rows = find_entries(conn, root_id_of(conn, rc), words=words, text=text, kind=kind, files_only=files_only)
+            info = {r["relpath"]: r for r in rows}
+            store = settings.tags(config)
+            paths = list(info)
+            if include or exclude:
+                paths = tags_search(((p, bool(info[p]["is_dir"])) for p in paths), store.tagged_paths(rc.name), include, mode, exclude)
+            shown = paths[:limit]
+            snips = snippets(conn, [info[p]["sha256"] for p in shown if info[p]["sha256"]], terms) if terms else {}
+        finally:
+            conn.close()
+        return {
+            "root": rc.name,
+            "total": len(paths),
+            "items": [
+                {
+                    "path": path,
+                    "is_dir": bool(info[path]["is_dir"]),
+                    "size": info[path]["size"],
+                    "mtime": info[path]["mtime_ns"] // 1_000_000_000,
+                    "tags": store.tags_of(rc.name, path),
+                    "snippet": snips.get(info[path]["sha256"] or "", ""),
+                }
+                for path in shown
+            ],
+        }
+
+    @app.route("/api/extract/status")
+    def api_extract_status() -> dict[str, Any]:
+        """全文検索の索引の状況（抽出済み・抽出待ち・OCR を使えるか）。"""
+        uq = bottle.request.query.decode()
+        config = settings.config()
+        rc = root_config(config, uq.get("root", "") or (config.roots[0].name if config.roots else ""))
+        conn = open_db()
+        try:
+            out = index_status(conn, root_id_of(conn, rc), config)
+        finally:
+            conn.close()
+        worker = settings.extractor
+        out["running"] = worker is not None
+        out["current"] = worker.current if worker is not None else None
+        return out
+
     @app.post("/api/tags/feedback")
     def api_tag_feedback() -> dict[str, Any]:
         """提案されたタグを付ける（accept）か、却下する（reject）。どちらも判断のログに残す。"""
@@ -1347,11 +1407,17 @@ def _root_state(conn: sqlite3.Connection, rc: RootConfig) -> dict[str, Any]:
             (row["id"],),
         ).fetchone()
         scan = last_scan(conn, row["id"])
+        # 見えなくなったが、消えたとの確定を保留しているファイル（次の走査でも見えなければ確定する）
+        (held,) = conn.execute(
+            "SELECT COUNT(*) FROM entries WHERE root_id = ? AND gone_at IS NULL AND is_dir = 0 AND missing_count > 0",
+            (row["id"],),
+        ).fetchone()
         out.update(
             files=n,
             size=size,
             hashed=hashed or 0,
             hashed_size=hashed_size,
+            held_files=held,
             scanned=scan is not None,
             last_scan=dict(scan) if scan is not None else None,
         )
@@ -1369,6 +1435,134 @@ def _plan_summary(info: Any) -> dict[str, Any]:
     d = asdict(info)
     d["file"] = str(info.file)
     return d
+
+
+# ルートに対する処理の題名（画面の英語表示は i18n.js の辞書で訳す）
+ROOT_ACTION_TITLES = {"scan": "走査", "hash": "ハッシュ計算", "refresh": "最新にする（走査とハッシュ計算）"}
+
+
+def root_job(settings: Settings, config: Config, rc: RootConfig, action: str) -> Any:
+    """ルートを走査する・ハッシュを計算する（refresh は両方）ジョブの本体を作る。
+
+    走査の後はツールの外での移動・改名にタグを追従させ（P4）、ハッシュの後は inode で結び付かなかった移動を
+    内容ハッシュで結び付ける（F-ID-1。クラウド側での移動が「削除と新規」として届いたものなど）。
+    画面のボタンと、自動で最新にする処理（AutoRefresh）の両方から使う。
+    """
+
+    def run(rep: JobReporter) -> dict[str, Any]:
+        conn = connect(settings.db_path)
+        try:
+            root_id = ensure_root(conn, rc.name, rc.path)
+            out: dict[str, Any] = {}
+            if action in ("scan", "refresh"):
+                out["scan"] = _run_scan(conn, root_id, rc, config, rep)
+                # ツールの外での移動・改名に、タグを追従させる（P4）
+                moved = settings.tags(config).follow_moves(rc.name, out["scan"].pop("moves"))
+                out["scan"]["tag_moves"] = moved
+            if action in ("hash", "refresh"):
+                out["hash"] = _run_hash(conn, root_id, rc, rep)
+                rl = relink_by_hash(conn, root_id, days=config.scan.relink_days)
+                out["relink"] = {
+                    "files": rl.files,
+                    "ambiguous": rl.ambiguous,
+                    "tag_moves": settings.tags(config).follow_moves(rc.name, rl.moves),
+                }
+                if rl.files:
+                    rep.note(f"内容ハッシュで結び付けた移動 {rl.files:,} 件")
+                # 新しくハッシュを計算したファイルの本文を、裏ですぐに抽出させる
+                if settings.extractor is not None:
+                    settings.extractor.poke()
+            return out
+        finally:
+            conn.close()
+
+    return run
+
+
+# 自動で最新にするジョブの題名
+AUTO_REFRESH_TITLE = "自動で最新にする"
+
+
+def _epoch(iso: object) -> float | None:
+    """ISO 8601 の日時を UNIX 時刻にする。読めなければ None（時差の無いものは UTC とみなす）。"""
+    if not isinstance(iso, str) or not iso:
+        return None
+    try:
+        t = datetime.fromisoformat(iso)
+    except ValueError:
+        return None
+    if t.tzinfo is None:
+        t = t.replace(tzinfo=timezone.utc)
+    return t.timestamp()
+
+
+def root_timings(settings: Settings) -> list[RootTiming]:
+    """各ルートの最後の走査と、同期の状態（自動で最新にするかの判断に使う）。"""
+    config = settings.config()
+    if config.scan.auto_refresh <= 0 and not config.scan.after_sync:
+        return []
+    conn = connect(settings.db_path)
+    try:
+        out: list[RootTiming] = []
+        for rc in config.roots:
+            row = conn.execute("SELECT id FROM roots WHERE name = ?", (rc.name,)).fetchone()
+            scan = last_scan(conn, row["id"]) if row is not None else None
+            busy, finished = False, None
+            guard = _guard(rc)
+            # 状態を読めるのは cloud-sync だけ（onedrive の常駐の同期は、間隔だけで判断する）
+            if isinstance(guard, CloudSyncGuard):
+                state = guard.read_state()
+                busy = state.get("state") in ("running", "waiting")
+                finished = _epoch(state.get("finished"))
+            out.append(
+                RootTiming(
+                    rc.name,
+                    config.scan.auto_refresh * 60.0,
+                    config.scan.after_sync,
+                    _epoch(scan["finished_at"]) if scan is not None else None,
+                    busy,
+                    finished,
+                )
+            )
+        return out
+    finally:
+        conn.close()
+
+
+def start_auto_refresh(settings: Settings, jobs: JobManager, name: str) -> bool:
+    """ルートを最新にするジョブを、自動の印を付けて始める。別のジョブが動いていれば False。"""
+    config = settings.config()
+    rc = config.find_root(name)
+    if rc is None:
+        # 設定から消えた。始めたことにして、次の機会まで飛ばす
+        return True
+    try:
+        jobs.start(
+            "refresh",
+            f"{AUTO_REFRESH_TITLE}: {rc.name}",
+            root_job(settings, config, rc, "refresh"),
+            target=rc.name,
+            auto=True,
+        )
+    except JobBusyError:
+        return False
+    return True
+
+
+def _auto_refresh_loop(auto: AutoRefresh, stop: threading.Event, first: float = 60.0, every: float = 30.0) -> None:
+    """自動で最新にするかを、一定の間隔で確かめ続ける（serve の裏のスレッド）。
+
+    起動の直後は、ネットワークなどが落ち着くまで first 秒待つ。
+    """
+    if stop.wait(first):
+        return
+    while True:
+        try:
+            auto.tick()
+        except Exception as e:  # noqa: BLE001 - 一時的な失敗（カタログのロックなど）で止めない
+            log.warning("自動で最新にするかの確認に失敗しました: %s", e)
+        if stop.wait(every):
+            return
 
 
 def _run_scan(conn: sqlite3.Connection, root_id: int, rc: RootConfig, config: Config, rep: JobReporter) -> dict[str, Any]:
@@ -1458,14 +1652,24 @@ def serve(
         )
         return 2
     settings = Settings(config_path, db_path)
-    app = create_app(settings, credentials, bind_host=host)
+    jobs = JobManager(settings.job_log_dir)
+    app = create_app(settings, credentials, bind_host=host, jobs=jobs)
     server = make_server(host, port, app, server_class=_ThreadingWSGIServer, handler_class=_QuietHandler)
     shown = f"[{host}]" if ":" in host else host
     log.info("Web の画面: http://%s:%d/（認証: %s）", shown, port, "あり" if credentials else "なし")
+    # 動かしている間は、ルートを自動で最新に保つ（[scan] の auto_refresh・after_sync）
+    stop = threading.Event()
+    auto = AutoRefresh(lambda: root_timings(settings), lambda name: start_auto_refresh(settings, jobs, name))
+    threading.Thread(target=_auto_refresh_loop, args=(auto, stop), name="auto-refresh", daemon=True).start()
+    # 裏で本文を抽出し、全文検索の索引を作る（[extract] enabled。止めていても、設定を変えれば再起動なしで始まる）
+    settings.extractor = ExtractWorker(settings.db_path, settings.config)
+    settings.extractor.start()
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         log.info("止めました")
     finally:
+        stop.set()
+        settings.extractor.stop()
         server.server_close()
     return 0

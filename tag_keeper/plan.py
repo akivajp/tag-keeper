@@ -753,7 +753,7 @@ def _relocate_in_catalog(conn: sqlite3.Connection, root_id: int, old: str, new: 
         # 移動先に残っている「存在中」の行は古い記録（移動先が空いていたことを確かめてから動かしている）
         where_new, args_new = _subtree_sql(new)
         conn.execute(
-            f"UPDATE entries SET gone_at = ? WHERE root_id = ? AND gone_at IS NULL AND {where_new}",
+            f"UPDATE entries SET gone_at = ?, gone_by = 'plan' WHERE root_id = ? AND gone_at IS NULL AND {where_new}",
             (now, root_id, *args_new),
         )
         row = conn.execute(
@@ -817,8 +817,9 @@ def _quarantine_one(
     )
     where, args = _subtree_sql(op.path)
     with conn:
+        # 隔離したもの（gone_by = 'plan'）は、内容ハッシュによる移動の推定の相手にしない（取り消しで元に戻すため）
         conn.execute(
-            f"UPDATE entries SET gone_at = ? WHERE root_id = ? AND gone_at IS NULL AND {where}",
+            f"UPDATE entries SET gone_at = ?, gone_by = 'plan' WHERE root_id = ? AND gone_at IS NULL AND {where}",
             (gone_at, root_id, *args),
         )
     return outcome
@@ -955,12 +956,12 @@ def undo_plan(
             with conn:
                 # 元の場所が空いていたので、そこに残っている「存在中」の行は古い記録。先に消えたことにする
                 conn.execute(
-                    f"UPDATE entries SET gone_at = ? WHERE root_id = ? AND gone_at IS NULL AND {where}",
+                    f"UPDATE entries SET gone_at = ?, gone_by = 'plan' WHERE root_id = ? AND gone_at IS NULL AND {where}",
                     (now, root_id, *args),
                 )
                 # 隔離のときに消えたことにした行を生き返らせる（ハッシュなどの記録を引き継ぐ）
                 conn.execute(
-                    "UPDATE entries SET gone_at = NULL, missing_count = 0, last_seen = ?"
+                    "UPDATE entries SET gone_at = NULL, gone_by = NULL, missing_count = 0, last_seen = ?"
                     f" WHERE root_id = ? AND gone_at = ? AND {where}",
                     (now, root_id, it.gone_at, *args),
                 )

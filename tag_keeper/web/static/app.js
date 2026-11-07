@@ -53,6 +53,11 @@ function dur(sec) {
   return t('{s}秒', { s: ss });
 }
 
+/** 経過時間（秒）を、2日以上なら「3日」、それより短ければ dur() の形にする。 */
+function ageText(sec) {
+  return sec >= 2 * 86400 ? t('{d}日', { d: Math.floor(sec / 86400) }) : dur(sec);
+}
+
 /** ISO 8601 の日時を、手元の時刻で読みやすくする。 */
 function when(iso) {
   if (!iso) return '-';
@@ -279,6 +284,15 @@ async function pollJob() {
 }
 
 async function onJobFinished(job) {
+  // 自動で最新にしたもの（job.auto）は知らせず、操作の途中の画面を描き直さない。
+  // 終わったら欄を閉じ、失敗したときだけ欄に残す。描き直すのはルートの一覧（数字が変わる画面）だけ
+  if (job.auto) {
+    if (job.status === 'done') { app.jobDismissed = job.id; renderJob(); }
+    await refreshState();
+    const onRoots = !location.hash || location.hash === '#' || location.hash === '#/';
+    if (onRoots && app.render) app.render();
+    return;
+  }
   if (job.status === 'failed') toast(t('失敗しました: {title}: {error}', { title: translateString(job.title), error: translateString(job.error || '') }), 'danger');
   else toast(t('終わりました: {title}', { title: translateString(job.title) }), 'info');
   if (job.kind === 'check' && job.result) app.checks[job.result.plan_id] = job.result.problems;
@@ -345,11 +359,22 @@ function jobRunning() { return app.job && app.job.status === 'running'; }
 
 // ---------- 画面: ルートの一覧 ----------
 
+/**
+ * 走査が古いか。自動で最新にしているなら間隔の2倍（同期の後にも走るので、それより古ければ止まっている）、
+ * 自動にしていなければ1日を目安にする。
+ */
+function scanIsStale(finishedAt, st) {
+  const age = (Date.now() - new Date(finishedAt).getTime()) / 1000;
+  const limit = st.auto_refresh > 0 ? Math.max(st.auto_refresh * 60 * 2, 3600) : 86400;
+  return age > limit ? age : 0;
+}
+
 async function pageRoots(main) {
   const st = await refreshState();
   const cards = st.roots.map((r) => {
     const hashedPct = r.files ? (r.hashed / r.files) * 100 : 0;
     const scan = r.last_scan;
+    const staleFor = r.scanned ? scanIsStale(scan.finished_at, st) : 0;
     return h('section', { class: 'card' },
       h('h2', {}, r.name, ' ', syncBadge(r.sync)),
       h('div', { class: 'muted mono' }, r.path),
@@ -358,8 +383,15 @@ async function pageRoots(main) {
         stat('容量', size(r.size)),
         stat('ハッシュ計算済み', `${hashedPct.toFixed(1)}%`),
         stat('最後の走査', when(scan.finished_at)),
-        scan.status === 'held' ? stat('状態', h('span', { class: 'badge warn' }, '消失の確定を保留')) : null,
+        r.held_files ? stat('状態', h('span', { class: 'badge warn', title: t('次の走査でも見えなければ、消えたと確定します。') },
+          t('消失の確定を保留（{n} 件）', { n: num(r.held_files) }))) : null,
       ) : h('p', { class: 'muted' }, 'まだ走査していません。'),
+      staleFor ? h('div', { class: 'alert warn' },
+        t('最後の走査から {age} たっています。カタログ（タグの検索・レポート・移動の追従）が今のファイルと合っていない可能性があります。', { age: ageText(staleFor) }),
+        st.auto_refresh > 0 ? null : ' ' + t('設定の [scan] auto_refresh で、自動で最新にできます。')) : null,
+      r.scanned ? h('p', { class: 'muted small' }, st.auto_refresh > 0
+        ? t('自動で最新にします（{m} 分ごと{sync}）。', { m: num(st.auto_refresh), sync: st.after_sync && r.sync && r.sync.client === 'cloud-sync' ? t('と、同期が終わるたび') : '' })
+        : t('自動では最新にしません。')) : null,
       r.sync && !r.sync.error ? h('p', { class: 'muted' }, r.sync.client === 'cloud-sync'
         ? t('同期: cloud-sync（{service}）。整理プランを実行するときは、定期の同期を止めて隔離し、削除を反映してから再開します。', { service: r.sync.service })
           + (r.sync.last_ok ? ' ' + t('最後に成功: {when}', { when: when(r.sync.last_ok) }) : '')
@@ -673,12 +705,13 @@ async function route() {
   const [hashPath, hashQuery] = (location.hash.replace(/^#/, '') || '/').split('?');
   const parts = hashPath.split('/').filter(Boolean).map(decodeURIComponent);
   const params = new URLSearchParams(hashQuery || '');
-  const navOf = { report: 'roots', browse: 'browse', organize: 'organize', tags: 'tags', plans: 'plans' };
+  // #/tags は前の版の URL（ブックマーク）のため。検索の画面を開く
+  const navOf = { report: 'roots', browse: 'browse', organize: 'organize', search: 'search', tags: 'search', plans: 'plans' };
   document.querySelectorAll('[data-nav]').forEach((a) => a.classList.toggle('active', (navOf[parts[0]] || 'roots') === a.dataset.nav));
   let render;
   if (parts[0] === 'browse') render = () => pageBrowse(main, parts[1], parts.slice(2).join('/'), params);
   else if (parts[0] === 'organize') render = () => pageOrganize(main, parts[1]);
-  else if (parts[0] === 'tags') render = () => pageTags(main, params);
+  else if (parts[0] === 'search' || parts[0] === 'tags') render = () => pageTags(main, params);
   else if (parts[0] === 'report' && parts[1]) render = () => pageReport(main, parts[1]);
   else if (parts[0] === 'plans' && parts[1]) render = () => pagePlan(main, parts[1]);
   else if (parts[0] === 'plans') render = () => pagePlans(main);

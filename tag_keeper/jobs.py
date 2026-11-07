@@ -72,6 +72,7 @@ class Job:
     kind: str
     title: str
     target: str = ""  # 対象（ルート名やプラン ID）。画面で結果を対応付けるのに使う
+    auto: bool = False  # 利用者の操作ではなく、自動で始めたもの（画面は終わっても知らせず、描き直さない）
     status: str = "running"  # running / done / failed
     phases: list[Phase] = field(default_factory=list)
     lines: deque[str] = field(default_factory=lambda: deque(maxlen=LOG_LINES))
@@ -91,6 +92,7 @@ class Job:
                 "kind": self.kind,
                 "title": self.title,
                 "target": self.target,
+                "auto": self.auto,
                 "status": self.status,
                 "phases": [p.to_dict(now) for p in self.phases],
                 "lines": list(self.lines)[-lines:],
@@ -191,6 +193,7 @@ class JobManager:
         fn: Callable[[JobReporter], Any],
         *,
         target: str = "",
+        auto: bool = False,
     ) -> Job:
         """ジョブを裏で始める。別のジョブが動いていれば JobBusyError。
 
@@ -199,13 +202,14 @@ class JobManager:
             title: 画面に出す題名。
             fn: 実際の処理。JobReporter を受け取り、画面に返す結果（JSON にできる値）を返す。
             target: 対象（ルート名やプラン ID）。
+            auto: 自動で始めたものか（AutoRefresh から始めたもの）。
         """
         with self.lock:
             if self.current is not None and self.current.status == "running":
                 raise JobBusyError(f"別の処理が動いています: {self.current.title}")
             self._seq += 1
             job_id = f"{datetime.now():%Y%m%d-%H%M%S}-{self._seq}"
-            job = Job(job_id, kind, title, target=target)
+            job = Job(job_id, kind, title, target=target, auto=auto)
             job.log_file = self.log_dir / f"{job_id}-{kind}.log"
             if self.current is not None:
                 self.history.appendleft(self.current)
@@ -258,3 +262,80 @@ class JobManager:
         while self.busy() and time.time() < deadline:
             time.sleep(0.02)
         return self.latest()
+
+
+@dataclass(frozen=True)
+class RootTiming:
+    """自動で最新にするかを決めるための、ルートの今の状態（AutoRefresh.tick に渡す）。"""
+
+    name: str
+    # 最新にする間隔（秒）。0 なら間隔では最新にしない
+    interval: float
+    # 同期が終わったら最新にするか
+    after_sync: bool
+    # 最後に走査を終えた日時（UNIX 時刻）。走査したことが無ければ None
+    last_scan: float | None
+    # 同期が動いている（または順番待ちしている）か
+    sync_busy: bool = False
+    # 最後に同期を終えた日時（UNIX 時刻）。分からなければ None
+    sync_finished: float | None = None
+
+
+class AutoRefresh:
+    """Web の画面を動かしている間、ルートを自動で最新にする（走査とハッシュ計算）時機を決める（F-SC-3・P4）。
+
+    - 一定の間隔ごとに最新にする（前回の走査を終えてからの経過で判断する）
+    - 同期が終わったら最新にする（同期を終えた日時が、前回の走査より新しければ）。クラウド側の変更をすぐに拾うため
+    - 同期が動いている間は待つ（同期の途中の状態を拾わないように）
+    - 別のジョブが動いていれば、次の機会に回す。一度に始めるのは1つだけ
+    - 始めたのに走査が記録されない（ルートが見えないなど）ときは、retry 秒のあいだ同じルートを試さない
+
+    時計と、ルートの状態の取得・ジョブの開始は差し替えられる（テストのため）。
+    """
+
+    def __init__(
+        self,
+        timings: Callable[[], list[RootTiming]],
+        start: Callable[[str], bool],
+        *,
+        retry: float = 600.0,
+        clock: Callable[[], float] = time.time,
+    ) -> None:
+        """
+        Args:
+            timings: 各ルートの今の状態を返す関数。
+            start: ルートを最新にするジョブを始める関数。始められなければ（別のジョブが動いている）False を返す。
+            retry: 始めた後、走査が記録されないときに同じルートを試し直すまでの間（秒）。
+            clock: 今の UNIX 時刻を返す関数。
+        """
+        self.timings = timings
+        self.start = start
+        self.retry = retry
+        self.clock = clock
+        self._attempted: dict[str, float] = {}
+
+    def due(self, t: RootTiming, now: float) -> bool:
+        """そのルートを今、最新にするべきか。"""
+        # 一度も走査していないルート（設定に足したばかりのもの）は、利用者が最初の走査を始めるまで待つ
+        # （初回は全ファイルのハッシュ計算になり、長くジョブの枠を占めるため）
+        if t.last_scan is None or t.sync_busy:
+            return False
+        if now - self._attempted.get(t.name, float("-inf")) < self.retry:
+            return False
+        if t.interval > 0 and now - t.last_scan >= t.interval:
+            return True
+        return t.after_sync and t.sync_finished is not None and t.sync_finished > t.last_scan
+
+    def tick(self) -> str | None:
+        """今、最新にするべきルートがあれば、1つだけジョブを始める。始めたルートの名前を返す。"""
+        now = self.clock()
+        for t in self.timings():
+            if not self.due(t, now):
+                continue
+            if not self.start(t.name):
+                # 別のジョブが動いている。次の機会に回す（他のルートも同じなので、ここで止める）
+                return None
+            self._attempted[t.name] = now
+            log.info("自動で最新にします: %s", t.name)
+            return t.name
+        return None

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import shutil
 import subprocess
@@ -27,6 +28,8 @@ NATIVE_VIDEO = frozenset({".mp4", ".m4v", ".webm", ".mov", ".ogv"})
 CONVERT_VIDEO = frozenset({".flv", ".f4v", ".mkv", ".avi", ".wmv", ".asf", ".mpg", ".mpeg", ".ts", ".m2ts", ".mts", ".3gp", ".vob", ".divx"})
 # そのまま使える音声
 COPY_AUDIO = frozenset({"aac", "mp3"})
+# 再生用の MP4 を保存しておく容量の上限（超えたら、しばらく使っていないものから消す。元のファイルには触れない）
+CACHE_MAX_BYTES = 5 * 1024**3
 
 
 class MediaError(RuntimeError):
@@ -101,12 +104,44 @@ class Conversion:
 
 
 class MediaConverter:
-    """動画の変換を裏で行い、できた MP4 を内容ハッシュで保存する。"""
+    """動画の変換を裏で行い、できた MP4 を内容ハッシュで保存する。
 
-    def __init__(self, cache_dir: Path) -> None:
+    保存した MP4 の合計が max_bytes を超えたら、しばらく使っていない（開いていない）ものから消す。
+    """
+
+    def __init__(self, cache_dir: Path, max_bytes: int = CACHE_MAX_BYTES) -> None:
         self.cache_dir = cache_dir
+        self.max_bytes = max_bytes
         self.lock = threading.Lock()
         self.jobs: dict[str, Conversion] = {}
+
+    @staticmethod
+    def _touch(path: Path) -> None:
+        """使ったことを、更新日時で記録する（容量の上限で消す順番に使う。atime は記録しない環境が多いため）。"""
+        try:
+            os.utime(path)
+        except OSError:
+            pass
+
+    def _prune(self, keep: Path) -> None:
+        """保存した MP4 の合計が上限を超えていれば、使っていない順に消す（keep と、作っている途中のものは残す）。"""
+        try:
+            files = [(p.stat().st_mtime, p.stat().st_size, p) for p in self.cache_dir.glob("*.mp4") if not p.name.endswith(".part.mp4")]
+        except OSError:
+            return
+        total = sum(size for _m, size, _p in files)
+        busy = {self.output_path(sha) for sha, job in self.jobs.items() if job.state == "running"}
+        for _mtime, size, path in sorted(files):
+            if total <= self.max_bytes:
+                break
+            if path == keep or path in busy:
+                continue
+            try:
+                path.unlink()
+            except OSError:
+                continue
+            total -= size
+            log.info("再生用の MP4 を消しました（保存の上限 %.1fGB を超えたため）: %s", self.max_bytes / 1024**3, path.name)
 
     def output_path(self, sha256: str) -> Path:
         """変換した MP4 の置き場所。"""
@@ -120,9 +155,15 @@ class MediaConverter:
         out = self.output_path(sha256)
         with self.lock:
             job = self.jobs.get(sha256)
+            if job is not None and job.state == "done" and not out.exists():
+                # 保存の上限で消したもの。作り直す
+                job = None
             if job is not None and not (retry and job.state == "error"):
+                if job.state == "done":
+                    self._touch(out)
                 return job
             if out.exists():
+                self._touch(out)
                 job = Conversion(state="done", progress=1.0, output=out)
                 self.jobs[sha256] = job
                 return job
@@ -153,6 +194,8 @@ class MediaConverter:
             tmp.replace(out)
             job.output, job.progress, job.state = out, 1.0, "done"
             log.info("動画を変換しました: %s", path.name)
+            with self.lock:
+                self._prune(keep=out)
         except (MediaError, OSError, ValueError) as e:
             job.state, job.error = "error", str(e)
             log.warning("動画を変換できませんでした: %s: %s", path.name, e)

@@ -654,13 +654,47 @@ function preview(url, name, bytes, ctx = null) {
 
 // ---------- 画面: タグ（一覧・名前の変更・削除・複数のタグでの検索） ----------
 
+/** 全文検索の索引の状況（抽出済み・抽出待ち・OCR を使えるか）を1行で出す。読めなければ何も出さない。 */
+async function indexStatus(root) {
+  let st;
+  try { st = await api(`/api/extract/status?root=${enc(root)}`); } catch (e) { return null; }
+  const parts = [t('本文の索引: {n} 件', { n: num(st.indexed) })];
+  if (st.pending) parts.push(t('抽出待ち {n} 件', { n: num(st.pending) }));
+  parts.push(st.ocr ? t('OCR: 使える（{lang}）', { lang: st.ocr })
+    : st.ocr_enabled ? t('OCR: tesseract が無いので使えません') : t('OCR: 使わない設定'));
+  if (st.waiting_ocr) parts.push(t('OCR を待っているスキャン {n} 件', { n: num(st.waiting_ocr) }));
+  if (!st.enabled) parts.push(t('裏での抽出は止めてあります（[extract] enabled）'));
+  else if (!st.running) parts.push(t('裏での抽出は Web の画面（serve）が動かします'));
+  return h('p', { class: 'muted small' }, parts.join(' ／ '));
+}
+
+/**
+ * 文の中の検索語に印（<mark>）を付けた要素の並びを返す。大文字・小文字は区別しない。
+ * 本文は索引に入れるときに NFKC でそろえてあるので、検索語も同じようにそろえてから探す。
+ * 要素は h() と文字列で組み立てる（innerHTML は使わない）。
+ */
+function highlight(text, query) {
+  const terms = query.normalize('NFKC').split(/\s+/).filter(Boolean)
+    .map((w) => w.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
+  if (!terms.length) return [text];
+  const re = new RegExp(`(${terms.join('|')})`, 'gi');
+  return text.split(re).map((part, i) => (i % 2 ? h('mark', {}, part) : part));
+}
+
+// 検索の「種類」の選択肢（値はサーバーの fulltext.KINDS のキー）
+const SEARCH_KINDS = [['', 'すべての種類'], ['document', '書類（PDF・Office・テキスト）'], ['pdf', 'PDF'], ['office', 'Office 文書'],
+  ['text', 'テキスト'], ['image', '画像'], ['video', '動画'], ['audio', '音声'], ['archive', '圧縮ファイル']];
+
 async function pageTags(main, params) {
-  // 検索の条件は URL に持つ（#/tags?t=含むタグ&not=除くタグ&mode=and|or&q=名前&folders=1）
+  // 検索の条件は URL に持つ（#/search?t=含むタグ&not=除くタグ&mode=and|or&q=名前&text=本文&kind=種類&folders=1）。
+  // #/tags は前の版の URL で、同じ画面を開く
   const state = {
     include: params.getAll('t'),
     exclude: params.getAll('not'),
     mode: params.get('mode') === 'or' ? 'or' : 'and',
     q: params.get('q') || '',
+    text: params.get('text') || '',
+    kind: params.get('kind') || '',
     folders: params.get('folders') === '1',
   };
   const go = () => {
@@ -669,8 +703,10 @@ async function pageTags(main, params) {
     state.exclude.forEach((x) => q.append('not', x));
     if (state.mode === 'or') q.set('mode', 'or');
     if (state.q) q.set('q', state.q);
+    if (state.text) q.set('text', state.text);
+    if (state.kind) q.set('kind', state.kind);
     if (state.folders) q.set('folders', '1');
-    location.hash = `#/tags${q.toString() ? '?' + q : ''}`;
+    location.hash = `#/search${q.toString() ? '?' + q : ''}`;
   };
   const root = await firstRoot();
   const { tags } = await api('/api/tags');
@@ -744,21 +780,44 @@ async function pageTags(main, params) {
   }
 
   const left = h('div', { class: 'card' },
+    h('h2', {}, 'タグ'),
     h('input', { type: 'search', placeholder: t('タグを探す'), oninput: (e) => { filter = e.target.value; renderList(); } }),
     h('p', { class: 'muted small' }, t('＋ で検索に含め、⊘ で除きます。件数は直接付いている数です。')),
     listEl);
   renderList();
 
-  // 右: 選んだタグでの検索結果と、選んだファイルの詳細
-  const right = h('div', {}, h('p', { class: 'muted' }, t('左の一覧からタグを選ぶと、そのタグの付いたファイルを探します。フォルダに付いたタグは、中のファイルにも効きます。')));
-  if (state.include.length || state.exclude.length) {
+  // 右: 探す条件（名前・本文・種類・タグ）と、結果・選んだファイルの詳細
+  const chipsOf = (list, cls) => list.map((x) => h('span', { class: `chip ${cls}`, translate: 'no' }, x));
+  const conditions = [
+    h('div', { class: 'toolbar' },
+      h('input', { type: 'search', placeholder: t('名前やフォルダで探す'), value: state.q, onchange: (e) => { state.q = e.target.value.trim(); go(); } }),
+      h('input', { type: 'search', placeholder: t('本文に含む語'), title: t('PDF・Office・テキストの本文から探します（文字の無いスキャンは OCR で読んだもの）'), value: state.text, onchange: (e) => { state.text = e.target.value.trim(); go(); } }),
+      h('select', { 'aria-label': t('種類'), onchange: (e) => { state.kind = e.target.value; go(); } },
+        SEARCH_KINDS.map(([v, label]) => h('option', { value: v, selected: state.kind === v }, t(label)))),
+      h('label', { class: 'small' }, h('input', { type: 'checkbox', checked: state.folders, onchange: (e) => { state.folders = e.target.checked; go(); } }), ' ', t('フォルダも出す')),
+      h('button', { class: 'small', onclick: () => { Object.assign(state, { include: [], exclude: [], q: '', text: '', kind: '' }); go(); } }, t('条件を消す'))),
+    state.include.length || state.exclude.length ? h('div', { class: 'toolbar' },
+      h('div', { class: 'chips' }, chipsOf(state.include, 'active'), state.exclude.length ? [h('span', { class: 'muted small' }, t('除外:')), chipsOf(state.exclude, 'excluded-chip')] : null),
+      state.include.length > 1 ? h('select', { onchange: (e) => { state.mode = e.target.value; go(); } },
+        h('option', { value: 'and', selected: state.mode === 'and' }, t('すべて含む（AND）')),
+        h('option', { value: 'or', selected: state.mode === 'or' }, t('どれかを含む（OR）'))) : null) : null,
+  ];
+  const right = h('div', {}, conditions);
+  const hasCondition = state.include.length || state.exclude.length || state.q || state.text || state.kind;
+  if (!hasCondition) {
+    right.append(h('p', { class: 'muted' }, t('名前・本文・種類で探すか、左の一覧からタグを選んでください。フォルダに付いたタグは、中のファイルにも効きます。')));
+    const st = await indexStatus(root);
+    if (st) right.append(st);
+  } else {
     const q = new URLSearchParams({ root, mode: state.mode });
     state.include.forEach((x) => q.append('tag', x));
     state.exclude.forEach((x) => q.append('not', x));
     if (state.q) q.set('q', state.q);
+    if (state.text) q.set('text', state.text);
+    if (state.kind) q.set('kind', state.kind);
     if (state.folders) q.set('folders', '1');
     let res;
-    try { res = await api(`/api/tags/search?${q}`); } catch (e) { res = null; setChildren(right, h('div', { class: 'alert danger' }, e.message)); }
+    try { res = await api(`/api/search?${q}`); } catch (e) { res = null; right.append(h('div', { class: 'alert danger' }, e.message)); }
     if (res) {
       const sort = sortState('tag-search', { field: 'path', dir: 'asc' });
       const getters = { name: (x) => x.path.split('/').pop(), path: (x) => x.path, size: (x) => (x.is_dir ? null : x.size), mtime: (x) => x.mtime };
@@ -772,7 +831,9 @@ async function pageTags(main, params) {
           const name = x.path.split('/').pop();
           const dir = x.path.split('/').slice(0, -1).join('/');
           return h('tr', { class: 'clickable', onclick: () => showDetail(x) },
-            h('td', { class: 'path' }, x.is_dir ? '📁 ' : `${fileIcon(name)} `, name),
+            h('td', { class: 'path' }, x.is_dir ? '📁 ' : `${fileIcon(name)} `, name,
+              // 本文で探したときは、一致したところの前後を見せる
+              x.snippet ? h('div', { class: 'snippet muted small' }, highlight(x.snippet, state.text)) : null),
             h('td', { class: 'path muted hide-narrow' }, h('a', { href: browseHref(root, x.is_dir ? x.path : dir), onclick: (e) => e.stopPropagation() }, dir || '/')),
             h('td', {}, h('div', { class: 'chips' },
               x.tags.direct.map((tg) => h('span', { class: 'chip' }, tg.tag)),
@@ -792,24 +853,20 @@ async function pageTags(main, params) {
         detail.scrollIntoView({ block: 'nearest' });
       };
       renderRows();
-      const chipsOf = (list, cls) => list.map((x) => h('span', { class: `chip ${cls}`, translate: 'no' }, x));
-      setChildren(right,
-        h('div', { class: 'toolbar' },
-          h('div', { class: 'chips' }, chipsOf(state.include, 'active'), state.exclude.length ? [h('span', { class: 'muted small' }, t('除外:')), chipsOf(state.exclude, 'excluded-chip')] : null),
-          state.include.length > 1 ? h('select', { onchange: (e) => { state.mode = e.target.value; go(); } },
-            h('option', { value: 'and', selected: state.mode === 'and' }, t('すべて含む（AND）')),
-            h('option', { value: 'or', selected: state.mode === 'or' }, t('どれかを含む（OR）'))) : null,
-          h('input', { type: 'search', placeholder: t('名前やフォルダで絞り込む'), value: state.q, onchange: (e) => { state.q = e.target.value.trim(); go(); } }),
-          h('label', { class: 'small' }, h('input', { type: 'checkbox', checked: state.folders, onchange: (e) => { state.folders = e.target.checked; go(); } }), ' ', t('フォルダも出す')),
-          h('button', { class: 'small', onclick: () => { state.include = []; state.exclude = []; state.q = ''; go(); } }, t('条件を消す'))),
+      right.append(
         h('p', { class: 'muted small' }, res.total > res.items.length
           ? t('{total} 件のうち {n} 件を表示', { total: num(res.total), n: num(res.items.length) })
           : t('{n} 件', { n: num(res.total) })),
         detail,
         h('div', { class: 'card table-wrap' }, h('table', {}, h('thead', {}, head), body)));
+      // 本文で探したときは、索引がどこまでできているか（抽出待ちが残っていれば、見つからないことがある）
+      if (state.text) {
+        const st = await indexStatus(root);
+        if (st) right.append(st);
+      }
     }
   }
-  setChildren(main, await tagDatalist(), h('h1', {}, t('タグ')), splitPane('tags', left, right, 30));
+  setChildren(main, await tagDatalist(), h('h1', {}, t('検索')), splitPane('tags', left, right, 30));
 }
 
 // ---------- 整理の提案の部品（受け皿の一覧とファイルブラウザで共通） ----------

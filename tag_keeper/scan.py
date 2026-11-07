@@ -14,8 +14,10 @@ import logging
 import os
 import sqlite3
 import stat
+from collections import defaultdict
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta
 from fnmatch import fnmatchcase
 from pathlib import Path
 
@@ -314,7 +316,7 @@ def scan_root(
                 gone.append((now, row["id"]))
                 if not row["is_dir"]:
                     res.gone += 1
-        conn.executemany("UPDATE entries SET gone_at = ? WHERE id = ?", gone)
+        conn.executemany("UPDATE entries SET gone_at = ?, gone_by = 'scan' WHERE id = ?", gone)
         conn.executemany(
             "UPDATE entries SET missing_count = missing_count + 1 WHERE id = ?",
             [(i,) for i in held],
@@ -337,4 +339,259 @@ def scan_root(
                 res.status,
             ),
         )
+    return res
+
+
+@dataclass
+class RelinkResult:
+    """内容ハッシュで移動を結び付けた結果（要件 F-ID-1 の2つ目の手がかり）。"""
+
+    # 結び付けたファイルの数（同じパスに戻ってきたものも含む）
+    files: int = 0
+    # 同じ内容の候補が複数あって、結び付けなかったファイルの数（F-ID-2: 自動では決めない）
+    ambiguous: int = 0
+    # 記録した移動（旧パス, 新パス）。フォルダごと動いたと推定したものは、そのフォルダだけを含む。タグの追従に使う
+    moves: list[tuple[str, str]] = field(default_factory=list)
+
+
+# 一度に IN (...) で問い合わせるハッシュの数（SQLite の変数の数の上限より十分小さく）
+_IN_CHUNK = 500
+
+
+def _basename(relpath: str) -> str:
+    return relpath.rsplit("/", 1)[-1]
+
+
+def _pair_by_hash(
+    news: list[sqlite3.Row], olds: list[sqlite3.Row]
+) -> tuple[list[tuple[sqlite3.Row, sqlite3.Row]], int]:
+    """同じ内容の「新しく現れたファイル」と「見えなくなったファイル」を、一対一に決まるものだけ組にする。
+
+    相手になれるのは、新しい側が現れる前に見えなくなったもの（old.last_seen < new.first_seen）だけ。
+    候補が複数あるときは、名前（パスの最後）が同じものが互いに1つずつなら組にする。
+
+    Returns:
+        （組の一覧, 候補はあったが決まらなかった新しいファイルの数）
+    """
+    def valid(n: sqlite3.Row, o: sqlite3.Row) -> bool:
+        return str(o["last_seen"]) < str(n["first_seen"])
+
+    pairs: list[tuple[sqlite3.Row, sqlite3.Row]] = []
+    if len(news) == 1 and len(olds) == 1:
+        if valid(news[0], olds[0]):
+            return [(news[0], olds[0])], 0
+        return [], 0
+    used: set[int] = set()
+    undecided = 0
+    for n in news:
+        cands = [o for o in olds if valid(n, o)]
+        if not cands:
+            continue
+        same_name = [o for o in cands if _basename(o["relpath"]) == _basename(n["relpath"])]
+        rivals = [m for m in news if _basename(m["relpath"]) == _basename(n["relpath"])]
+        if len(same_name) == 1 and len(rivals) == 1 and same_name[0]["id"] not in used:
+            pairs.append((n, same_name[0]))
+            used.add(int(same_name[0]["id"]))
+        else:
+            undecided += 1
+    return pairs, undecided
+
+
+def _under_dir(relpath: str, base: str) -> bool:
+    return relpath.startswith(base + "/")
+
+
+def _infer_dir_moves(
+    conn: sqlite3.Connection, root_id: int, file_moves: list[tuple[str, str]], cutoff: str
+) -> list[tuple[str, str, int, str]]:
+    """ファイルの移動から、フォルダごとの移動を推定する。
+
+    旧パスと新パスの後ろの部分（名前）がそろっている親フォルダの組（a/x/f → b/x/f なら a/x → b/x と a → b）を候補にし、
+    次のすべてを満たすものだけを採る。
+
+    - 旧フォルダが今は見えない（消えたか、走査で見えなくなった）
+    - 新フォルダが、旧フォルダが最後に見えた後に新しく現れた
+    - 旧フォルダの配下から動いたファイルが、すべて新フォルダの同じ相対パスへ動いている
+
+    Returns:
+        採ったフォルダの移動（旧, 新, 新フォルダの行 ID, 新フォルダを初めて見た日時）。浅い順で、他の移動に含まれるものは除く。
+    """
+    cands: dict[str, set[str]] = defaultdict(set)
+    for old, new in file_moves:
+        o, n = old.split("/"), new.split("/")
+        i = 1
+        while i < len(o) and i < len(n) and o[-i] == n[-i]:
+            cands["/".join(o[:-i])].add("/".join(n[:-i]))
+            i += 1
+    chosen: list[tuple[str, str, int, str]] = []
+    for od in sorted(cands, key=lambda d: (d.count("/"), d)):
+        if len(cands[od]) != 1:
+            continue
+        nd = next(iter(cands[od]))
+        if od == nd or _under_dir(nd, od) or _under_dir(od, nd):
+            continue
+        # すでに採った浅い移動に含まれるもの（a → b を採ったときの a/x → b/x）は記録しない
+        if any(_under_dir(od, c_od) for c_od, _n, _i, _f in chosen):
+            continue
+        # 旧フォルダの配下から動いたファイルが、すべて新フォルダの同じ相対パスへ動いていること
+        if any(_under_dir(old, od) and new != nd + old[len(od):] for old, new in file_moves):
+            continue
+        live_old = conn.execute(
+            "SELECT 1 FROM entries WHERE root_id = ? AND relpath = ? AND is_dir = 1"
+            " AND gone_at IS NULL AND missing_count = 0",
+            (root_id, od),
+        ).fetchone()
+        if live_old is not None:
+            continue
+        old_row = conn.execute(
+            "SELECT last_seen FROM entries WHERE root_id = ? AND relpath = ? AND is_dir = 1 ORDER BY id DESC LIMIT 1",
+            (root_id, od),
+        ).fetchone()
+        new_row = conn.execute(
+            "SELECT id, first_seen FROM entries WHERE root_id = ? AND relpath = ? AND is_dir = 1 AND gone_at IS NULL",
+            (root_id, nd),
+        ).fetchone()
+        if old_row is None or new_row is None:
+            continue
+        if not (str(new_row["first_seen"]) >= cutoff and str(old_row["last_seen"]) < str(new_row["first_seen"])):
+            continue
+        chosen.append((od, nd, int(new_row["id"]), str(new_row["first_seen"])))
+    return chosen
+
+
+def relink_by_hash(
+    conn: sqlite3.Connection,
+    root_id: int,
+    *,
+    days: int = 30,
+    now: str | None = None,
+) -> RelinkResult:
+    """inode では結び付かなかった移動を、内容ハッシュで結び付ける（要件 F-ID-1・F-ID-2）。
+
+    クラウド側での移動が同期で「削除と新規」として届いたとき（rclone bisync など）や、
+    ファイルシステムをまたいだ移動では inode が変わり、走査は「消えたものと、新しいもの」としか見られない。
+    そこで、新しく現れたファイルと、その前に見えなくなったファイルとを内容ハッシュと大きさで突き合わせ、
+    一対一に決まるものだけを移動とみなす。曖昧なものは結び付けない。
+    ツールが隔離したもの（gone_by = 'plan'）は、取り消しで元に戻すので相手にしない。
+
+    結び付けたものは、消えた側の行を新しいパスで生き返らせ（初めて見た日時などの記録を引き継ぐ）、
+    新しく足された行を消す。移動の履歴（moves 表、source = "hash"）にも残す。
+    配下のファイルがそろって動いたフォルダは、フォルダ1件の移動として記録する（タグの追従と版の履歴のため）。
+
+    ハッシュは hash_root で計算した後に呼ぶ（ハッシュの無いファイルは相手にできない）。
+
+    Args:
+        conn: カタログへの接続。
+        root_id: ルートの ID。
+        days: 何日前までに見えなくなったものを相手にするか。0 以下なら何もしない。
+        now: 現在の日時（UTC の ISO 8601。テスト用）。
+
+    Returns:
+        結び付けた件数と、タグの追従に使う移動の一覧。
+    """
+    res = RelinkResult()
+    if days <= 0:
+        return res
+    now = now or utcnow()
+    cutoff = (datetime.fromisoformat(now) - timedelta(days=days)).isoformat(timespec="seconds")
+
+    # 新しく現れたファイル（ハッシュが今の中身のもの）
+    news_rows = conn.execute(
+        "SELECT id, relpath, size, mtime_ns, inode, sha256, hashed_size, hashed_mtime_ns, first_seen, last_seen"
+        " FROM entries WHERE root_id = ? AND gone_at IS NULL AND is_dir = 0 AND missing_count = 0"
+        " AND sha256 IS NOT NULL AND hashed_size IS size AND hashed_mtime_ns IS mtime_ns AND first_seen >= ?",
+        (root_id, cutoff),
+    ).fetchall()
+    if not news_rows:
+        return res
+    news_by: dict[tuple[str, int], list[sqlite3.Row]] = defaultdict(list)
+    for r in news_rows:
+        news_by[(str(r["sha256"]), int(r["size"]))].append(r)
+
+    # 見えなくなったファイル（相手の候補）: 期間内に走査で消えたもの、または見えなくなって確定を保留しているもの
+    olds_by: dict[tuple[str, int], list[sqlite3.Row]] = defaultdict(list)
+    shas = sorted({k[0] for k in news_by})
+    for i in range(0, len(shas), _IN_CHUNK):
+        chunk = shas[i : i + _IN_CHUNK]
+        marks = ",".join("?" * len(chunk))
+        for r in conn.execute(
+            "SELECT id, relpath, size, sha256, last_seen FROM entries"
+            f" WHERE root_id = ? AND is_dir = 0 AND sha256 IN ({marks})"
+            " AND ((gone_at IS NOT NULL AND gone_at >= ? AND (gone_by IS NULL OR gone_by = 'scan'))"
+            "      OR (gone_at IS NULL AND missing_count > 0))",
+            (root_id, *chunk, cutoff),
+        ):
+            olds_by[(str(r["sha256"]), int(r["size"]))].append(r)
+
+    pairs: list[tuple[sqlite3.Row, sqlite3.Row]] = []
+    # 1巡目で一対一に決まらなかった組（新しいもの, 消えたもの）。2巡目で、推定したフォルダの移動から決める
+    unsettled: list[tuple[list[sqlite3.Row], list[sqlite3.Row]]] = []
+    for key, news in news_by.items():
+        olds = olds_by.get(key)
+        if not olds:
+            continue
+        got, undecided = _pair_by_hash(news, olds)
+        pairs.extend(got)
+        res.ambiguous += undecided
+        if undecided:
+            got_n = {int(n["id"]) for n, _o in got}
+            got_o = {int(o["id"]) for _n, o in got}
+            unsettled.append(([n for n in news if int(n["id"]) not in got_n], [o for o in olds if int(o["id"]) not in got_o]))
+    if not pairs:
+        if res.ambiguous:
+            log.info("同じ内容の候補が複数あるため、%d 件の移動を結び付けませんでした", res.ambiguous)
+        return res
+
+    file_moves = [(str(o["relpath"]), str(n["relpath"])) for n, o in pairs if o["relpath"] != n["relpath"]]
+    dir_moves = _infer_dir_moves(conn, root_id, file_moves, cutoff)
+
+    # 2巡目: 同じ内容のものが複数あっても（フォルダの中の同じファイルの写しなど）、推定したフォルダの移動の中なら、
+    # 移動元のフォルダの同じ相対パスにあったものが相手と決まる
+    if dir_moves and unsettled:
+        res.ambiguous = 0
+        deepest_first = sorted(dir_moves, key=lambda m: -len(m[1]))
+        for news, olds in unsettled:
+            by_path = {str(o["relpath"]): o for o in olds}
+            used: set[int] = set()
+            for n in news:
+                rel = str(n["relpath"])
+                mapped = next((od + rel[len(nd):] for od, nd, _i, _f in deepest_first if _under_dir(rel, nd)), None)
+                o = by_path.get(mapped) if mapped is not None else None
+                if o is not None and int(o["id"]) not in used and str(o["last_seen"]) < str(n["first_seen"]):
+                    pairs.append((n, o))
+                    used.add(int(o["id"]))
+                elif any(str(c["last_seen"]) < str(n["first_seen"]) for c in olds):
+                    res.ambiguous += 1
+
+    def covered(old: str, new: str) -> bool:
+        return any(_under_dir(old, od) and new == nd + old[len(od):] for od, nd, _i, _f in dir_moves)
+
+    with conn:
+        for n, o in pairs:
+            # 新しく足された行を消し、消えた側の行を新しいパスで生き返らせる（同じ行が同じアイテムを指し続ける）
+            conn.execute("DELETE FROM entries WHERE id = ?", (n["id"],))
+            conn.execute(
+                "UPDATE entries SET relpath = ?, size = ?, mtime_ns = ?, inode = ?, hashed_size = ?,"
+                " hashed_mtime_ns = ?, last_seen = ?, missing_count = 0, gone_at = NULL, gone_by = NULL WHERE id = ?",
+                (
+                    n["relpath"], n["size"], n["mtime_ns"], n["inode"], n["hashed_size"],
+                    n["hashed_mtime_ns"], n["last_seen"], o["id"],
+                ),
+            )
+            # 新しい行を指していた移動の記録（現れた後に inode で追った改名など）は、生き返らせた行に付け替える
+            conn.execute("UPDATE moves SET entry_id = ? WHERE entry_id = ?", (o["id"], n["id"]))
+            res.files += 1
+            old_rel, new_rel = str(o["relpath"]), str(n["relpath"])
+            if old_rel != new_rel and not covered(old_rel, new_rel):
+                record_move(conn, root_id, int(o["id"]), old_rel, new_rel, False, "hash", str(n["first_seen"]))
+                res.moves.append((old_rel, new_rel))
+        for od, nd, new_id, first_seen in dir_moves:
+            record_move(conn, root_id, new_id, od, nd, True, "hash", first_seen)
+            res.moves.append((od, nd))
+    log.info(
+        "内容ハッシュで %d 件の移動を結び付けました（フォルダごと %d 件）%s",
+        res.files,
+        len(dir_moves),
+        f"。候補が複数のため {res.ambiguous} 件は結び付けていません" if res.ambiguous else "",
+    )
     return res

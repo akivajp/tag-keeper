@@ -396,6 +396,77 @@ def test_mkdir_and_move_from_the_browser(env: dict) -> None:
     assert (root / "inbox" / "a.pdf").exists() and (root / "inbox" / "sub" / "b.pdf").exists()
 
 
+# ---------- 自動で最新にする（F-SC-3・P4） ----------
+
+
+def test_auto_refresh_decides_when_to_refresh() -> None:
+    """間隔が過ぎたら、同期が終わったら最新にする。同期中・未走査・別のジョブが動いているときは待つ。"""
+    from tag_keeper.jobs import AutoRefresh, RootTiming
+
+    now = [10_000.0]
+    timings: list[RootTiming] = []
+    started: list[str] = []
+    free = [True]
+
+    def start(name: str) -> bool:
+        if free[0]:
+            started.append(name)
+        return free[0]
+
+    auto = AutoRefresh(lambda: timings, start, retry=600, clock=lambda: now[0])
+
+    # 間隔（1時間）が過ぎていなければ、何もしない
+    timings[:] = [RootTiming("a", 3600, True, last_scan=now[0] - 100)]
+    assert auto.tick() is None
+    # 同期が終わった（前回の走査より後）なら、最新にする
+    timings[:] = [RootTiming("a", 3600, True, last_scan=now[0] - 100, sync_finished=now[0] - 10)]
+    assert auto.tick() == "a" and started == ["a"]
+    # 始めた直後は、走査がまだ記録されていなくても、retry の間は試し直さない
+    assert auto.tick() is None
+    # 同期が動いている間は、間隔が過ぎていても待つ
+    now[0] += 7200
+    timings[:] = [RootTiming("a", 3600, True, last_scan=now[0] - 7200, sync_busy=True)]
+    assert auto.tick() is None
+    # 別のジョブが動いていれば始めず、空いたら始める
+    timings[:] = [RootTiming("a", 3600, True, last_scan=now[0] - 7200)]
+    free[0] = False
+    assert auto.tick() is None
+    free[0] = True
+    assert auto.tick() == "a"
+    # 一度も走査していないルートは、自動では始めない（初回は全件のハッシュ計算になるため）
+    now[0] += 7200
+    timings[:] = [RootTiming("new", 3600, True, last_scan=None, sync_finished=now[0])]
+    assert auto.tick() is None
+    # 間隔が 0 で同期の後も無効なら、何もしない
+    timings[:] = [RootTiming("b", 0, False, last_scan=0.0, sync_finished=now[0])]
+    assert auto.tick() is None
+
+
+def test_auto_refresh_runs_a_quiet_refresh_job(env: dict, tmp_path: Path) -> None:
+    """自動で始めたジョブは auto の印が付き、走査とハッシュ計算と内容ハッシュの結び付けまで行う。"""
+    from tag_keeper.web.server import root_timings, start_auto_refresh
+
+    run_job(env, "/api/roots/data/refresh")
+    (t,) = root_timings(env["settings"])
+    assert (t.name, t.interval, t.after_sync, t.sync_busy) == ("data", 3600.0, True, False)
+    assert t.last_scan is not None
+
+    assert start_auto_refresh(env["settings"], env["jobs"], "data") is True
+    job = env["jobs"].wait()
+    assert job is not None and job.status == "done" and job.auto
+    data = env["app"].get("/api/jobs/current").json["job"]
+    assert data["auto"] is True and data["title"] == "自動で最新にする: data"
+    assert set(data["result"]) == {"scan", "hash", "relink"}
+    # 別のジョブが動いていれば始めない
+    env["jobs"].start("test", "長い処理", lambda rep: time.sleep(0.3))
+    try:
+        assert start_auto_refresh(env["settings"], env["jobs"], "data") is False
+    finally:
+        env["jobs"].wait()
+    state = env["app"].get("/api/state").json
+    assert state["auto_refresh"] == 60 and state["roots"][0]["held_files"] == 0
+
+
 # ---------- バグ調査（v0.9.1）で見つかったものの回帰テスト ----------
 
 
