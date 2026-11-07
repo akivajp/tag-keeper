@@ -11,8 +11,11 @@ async function firstRoot() {
 /** 相対パスの各部分を URL 用に符号化してつなぐ。 */
 function encPath(path) { return path.split('/').filter(Boolean).map(enc).join('/'); }
 
-function browseHref(root, path, at) {
-  return `#/browse/${enc(root)}${path ? '/' + encPath(path) : ''}${at ? `?at=${enc(at)}` : ''}`;
+function browseHref(root, path, at, file) {
+  const q = new URLSearchParams();
+  if (at) q.set('at', at);
+  if (file) q.set('file', file);
+  return `#/browse/${enc(root)}${path ? '/' + encPath(path) : ''}${q.toString() ? `?${q}` : ''}`;
 }
 
 function fileUrl(root, path, snapshot, download) {
@@ -163,7 +166,13 @@ async function pageBrowse(main, root, path, params) {
   const folderTags = h('div', { class: 'chips' },
     data.tags.direct.map((tg) => tagChip(tg.tag, live ? async () => { if (await editTags(root, [path], tg.tag, 'remove')) app.render(); } : null)),
     data.tags.inherited.map((tg) => h('span', { class: 'chip inherited', title: t('{from} から継承', { from: tg.from || root }) }, tg.tag)),
+    (data.tags.implied || []).map((tg) => h('span', { class: 'chip implied', title: t('{via} の親', { via: tg.via }) }, tg.tag)),
     !data.tags.direct.length && !data.tags.inherited.length ? h('span', { class: 'muted' }, 'タグなし') : null);
+  // このフォルダの属性（付けた値は配下が継承する）。定義が1つも無ければ出さない
+  const folderAttrs = live && path && (data.attr_defs || []).length
+    ? h('details', { class: 'folder-attrs' }, h('summary', { class: 'muted small' }, t('このフォルダの属性（配下に継承）')),
+      attrEditor(root, path, data.attrs, data.attr_defs, () => app.render()))
+    : null;
   // 今のフォルダをクラウドの Web 画面で開くリンク（あとから読み込む）
   const folderLinks = h('span', { class: 'folder-links' });
   if (live && path) {
@@ -248,9 +257,13 @@ async function pageBrowse(main, root, path, params) {
         parts.push(h('h3', {}, 'タグ'),
           h('div', { class: 'chips' },
             info.tags.direct.map((tg) => tagChip(tg.tag, async () => { if (await editTags(root, [rel], tg.tag, 'remove')) { await app.render(); showDetail(rel, entry); } })),
-            info.tags.inherited.map((tg) => h('span', { class: 'chip inherited', title: t('{from} から継承', { from: tg.from || root }) }, tg.tag))),
+            info.tags.inherited.map((tg) => h('span', { class: 'chip inherited', title: t('{from} から継承', { from: tg.from || root }) }, tg.tag)),
+            (info.tags.implied || []).map((tg) => h('span', { class: 'chip implied', title: t('{via} の親', { via: tg.via }) }, tg.tag))),
           h('form', { class: 'inline', onsubmit: async (ev) => { ev.preventDefault(); if (await editTags(root, [rel], input.value, 'add')) { await app.render(); showDetail(rel, entry); } } },
             input, h('button', {}, '付ける')));
+        if ((info.attr_defs || []).length) {
+          parts.push(h('h3', {}, '属性'), attrEditor(root, rel, info.attrs, info.attr_defs, async () => { await app.render(); showDetail(rel, entry); }));
+        }
         if (info.same_content.length) {
           parts.push(h('h3', {}, '同じ内容のファイル'), h('ul', {}, info.same_content.map((p) => h('li', { class: 'path' },
             h('a', { href: browseHref(root, p.split('/').slice(0, -1).join('/')) }, p)))));
@@ -314,7 +327,8 @@ async function pageBrowse(main, root, path, params) {
       h('input', { type: 'search', placeholder: '名前で絞り込む', oninput: (e) => { filter = e.target.value; renderRows(); } })),
     h('div', { class: 'card folder-tags' }, folderLinks, h('strong', {}, 'このフォルダのタグ: '), folderTags,
       live && path ? h('form', { class: 'inline', onsubmit: async (ev) => { ev.preventDefault(); if (await editTags(root, [path], folderTagInput.value, 'add')) app.render(); } },
-        folderTagInput, h('button', {}, '付ける')) : null),
+        folderTagInput, h('button', {}, '付ける')) : null,
+      folderAttrs),
     live ? h('form', { class: 'toolbar', onsubmit: (ev) => ev.preventDefault() },
       tagInput,
       h('button', { onclick: async () => { if (!selected.size) { toast('ファイルかフォルダを選んでください', 'warn'); return; } if (await editTags(root, [...selected], tagInput.value, 'add')) app.render(); } }, '選んだものに付ける'),
@@ -341,6 +355,10 @@ async function pageBrowse(main, root, path, params) {
       h('div', { class: 'card table-wrap' }, h('table', {}, h('thead', {}, headRow), tableBody)),
       detail));
   renderRows();
+  // ?file=名前 なら、そのファイルの詳細を開いておく（検索の結果の「フォルダを開く」から来たとき）
+  const picked = params.get('file');
+  const pickedEntry = picked ? data.entries.find((e) => e.name === picked && !e.is_dir) : null;
+  if (pickedEntry) showDetail(joinPath(path, picked), pickedEntry);
 }
 
 // ---------- フォルダの作成・移動（ファイルブラウザから） ----------
@@ -685,10 +703,60 @@ function highlight(text, query) {
 const SEARCH_KINDS = [['', 'すべての種類'], ['document', '書類（PDF・Office・テキスト）'], ['pdf', 'PDF'], ['office', 'Office 文書'],
   ['text', 'テキスト'], ['image', '画像'], ['video', '動画'], ['audio', '音声'], ['archive', '圧縮ファイル']];
 
-async function pageTags(main, params) {
-  // 検索の条件は URL に持つ（#/search?t=含むタグ&not=除くタグ&mode=and|or&q=名前&text=本文&kind=種類&folders=1）。
-  // #/tags は前の版の URL で、同じ画面を開く
-  const state = {
+// 属性の型の表示名
+const ATTR_TYPE_LABELS = { choice: '択一', flag: 'フラグ', date: '日付', number: '数', text: '文字' };
+
+/** 「5MB」「1.5G」「200k」「1234」をバイト数にする。読めなければ null。 */
+function parseSize(text) {
+  const m = String(text || '').trim().match(/^(\d+(?:\.\d+)?)\s*([kmgt]?)i?b?$/i);
+  if (!m) return null;
+  const unit = { '': 1, k: 1024, m: 1024 ** 2, g: 1024 ** 3, t: 1024 ** 4 }[m[2].toLowerCase()];
+  return Math.round(parseFloat(m[1]) * unit);
+}
+
+/** 属性の値を、札に出す文字にする（フラグは名前だけ）。 */
+function attrText(name, value) { return value === true ? name : `${name}: ${value}`; }
+
+/**
+ * 属性の編集の欄（ファイルブラウザの詳細・フォルダ・検索の結果で共通）。定義ごとに、型に合った入力を出す。
+ * 直接の値が無く、祖先のフォルダから継承しているときは、その値と元のフォルダを添える。
+ */
+function attrEditor(root, path, attrs, defs, onChange) {
+  if (!defs.length) return h('p', { class: 'muted small' }, '属性はまだ定義されていません。「検索」の画面で定義できます。');
+  const direct = Object.fromEntries(attrs.direct.map((a) => [a.name, a.value]));
+  const inherited = Object.fromEntries(attrs.inherited.map((a) => [a.name, a]));
+  const set = async (name, value) => {
+    try {
+      await api('/api/attrs', { root, paths: [path], name, value });
+      if (onChange) await onChange();
+    } catch (e) { toast(e.message, 'danger'); }
+  };
+  return h('div', { class: 'attr-editor' }, defs.map((d) => {
+    const cur = direct[d.name];
+    const inh = cur === undefined ? inherited[d.name] : undefined;
+    const hint = inh ? t('（継承: {value}）', { value: inh.value === true ? '✓' : inh.value }) : '';
+    let input;
+    if (d.type === 'choice') {
+      input = h('select', { onchange: (e) => set(d.name, e.target.value || null) },
+        h('option', { value: '' }, hint || '—'),
+        d.choices.map((c) => h('option', { value: c, selected: cur === c }, c)));
+    } else if (d.type === 'flag') {
+      input = h('input', { type: 'checkbox', checked: cur === true, onchange: (e) => set(d.name, e.target.checked ? true : null) });
+    } else {
+      input = h('input', {
+        type: d.type === 'date' ? 'date' : 'text', inputmode: d.type === 'number' ? 'decimal' : null,
+        value: cur ?? '', placeholder: hint, onchange: (e) => set(d.name, e.target.value.trim() || null),
+      });
+    }
+    return h('label', { class: 'attr-row' },
+      h('span', { class: 'attr-name', translate: 'no' }, d.name), input,
+      inh ? h('span', { class: 'muted small' }, t('{from} から継承', { from: inh.from || root })) : null);
+  }));
+}
+
+/** 検索の条件（URL の問い合わせ）を読む。保存した検索の件数を数えるときにも使う。 */
+function searchState(params) {
+  return {
     include: params.getAll('t'),
     exclude: params.getAll('not'),
     mode: params.get('mode') === 'or' ? 'or' : 'and',
@@ -696,20 +764,63 @@ async function pageTags(main, params) {
     text: params.get('text') || '',
     kind: params.get('kind') || '',
     folders: params.get('folders') === '1',
+    under: params.get('under') || '',
+    after: params.get('after') || '',
+    before: params.get('before') || '',
+    min: params.get('min') || '',
+    max: params.get('max') || '',
+    attrs: params.getAll('attr'),
+    gone: params.get('gone') === '1',
+    collapse: params.get('nocollapse') !== '1',
   };
-  const go = () => {
-    const q = new URLSearchParams();
-    state.include.forEach((x) => q.append('t', x));
-    state.exclude.forEach((x) => q.append('not', x));
-    if (state.mode === 'or') q.set('mode', 'or');
-    if (state.q) q.set('q', state.q);
-    if (state.text) q.set('text', state.text);
-    if (state.kind) q.set('kind', state.kind);
-    if (state.folders) q.set('folders', '1');
-    location.hash = `#/search${q.toString() ? '?' + q : ''}`;
-  };
+}
+
+/** 検索の条件を、画面の URL の問い合わせにする（保存した検索にもこの形で残す）。 */
+function searchQuery(state) {
+  const q = new URLSearchParams();
+  state.include.forEach((x) => q.append('t', x));
+  state.exclude.forEach((x) => q.append('not', x));
+  if (state.mode === 'or') q.set('mode', 'or');
+  for (const k of ['q', 'text', 'kind', 'under', 'after', 'before', 'min', 'max']) if (state[k]) q.set(k, state[k]);
+  state.attrs.forEach((x) => q.append('attr', x));
+  if (state.folders) q.set('folders', '1');
+  if (state.gone) q.set('gone', '1');
+  if (!state.collapse) q.set('nocollapse', '1');
+  return q;
+}
+
+/** 条件が1つでもあるか（何も無ければ探さない）。 */
+function searchHasCondition(s) {
+  return s.include.length || s.exclude.length || s.q || s.text || s.kind || s.under || s.after || s.before || s.min || s.max || s.attrs.length;
+}
+
+/** 検索の条件を、検索の API の問い合わせにする。 */
+function searchApiQuery(state, root, limit) {
+  const q = new URLSearchParams({ root, mode: state.mode });
+  state.include.forEach((x) => q.append('tag', x));
+  state.exclude.forEach((x) => q.append('not', x));
+  for (const k of ['q', 'text', 'kind', 'under', 'after', 'before']) if (state[k]) q.set(k, state[k]);
+  const min = parseSize(state.min);
+  const max = parseSize(state.max);
+  if (min !== null) q.set('min_size', String(min));
+  if (max !== null) q.set('max_size', String(max));
+  state.attrs.forEach((x) => q.append('attr', x));
+  if (state.folders) q.set('folders', '1');
+  if (state.gone) q.set('gone', '1');
+  if (state.collapse) q.set('collapse', '1');
+  if (limit) q.set('limit', String(limit));
+  return q;
+}
+
+async function pageTags(main, params) {
+  // 検索の条件は URL に持つ（#/search?t=含むタグ&not=除くタグ&mode=and|or&q=名前&text=本文&kind=種類&under=場所
+  // &after=&before=（更新日）&min=&max=（大きさ）&attr=属性の条件&gone=1&nocollapse=1&folders=1）。#/tags は前の版の URL
+  const state = searchState(params);
+  const go = () => { const q = searchQuery(state).toString(); location.hash = `#/search${q ? '?' + q : ''}`; };
   const root = await firstRoot();
-  const { tags } = await api('/api/tags');
+  const meta = await api('/api/tags');
+  const { tags } = meta;
+  const attrDefs = meta.attrs || [];
   let filter = '';
   const listEl = h('div', { class: 'tag-list' });
 
@@ -752,10 +863,41 @@ async function pageTags(main, params) {
     } catch (e) { toast(e.message, 'danger'); }
   }
 
+  /** タグの別名と親を見て、足したり外したりする（変えるたびに保存する）。 */
+  async function dictionaryDialog(x) {
+    const holder = h('div');
+    let info = x;
+    const reload = async () => {
+      const r = await api('/api/tags');
+      info = r.tags.find((y) => y.tag === x.tag) || { ...x, aliases: [], parents: [], children: [] };
+      render();
+    };
+    const call = async (path, payload) => {
+      try { await api(path, payload); await reload(); } catch (e) { toast(e.message, 'danger'); }
+    };
+    function render() {
+      const aliasIn = h('input', { placeholder: t('別名（例: 会社:ATID）') });
+      const parentIn = h('input', { list: 'tag-options', placeholder: t('親のタグ（例: 種別:経理）') });
+      setChildren(holder,
+        h('h3', {}, '別名'),
+        h('p', { class: 'muted small' }, t('別名で付けても探しても、「{tag}」として扱います。既に使われている名前を別名にすると、このタグにまとめます。', { tag: x.tag })),
+        h('div', { class: 'chips' }, (info.aliases || []).map((a) => tagChip(a, () => call('/api/tags/alias', { alias: a, op: 'remove' })))),
+        h('form', { class: 'inline', onsubmit: (e) => { e.preventDefault(); if (aliasIn.value.trim()) call('/api/tags/alias', { tag: x.tag, alias: aliasIn.value.trim() }); } }, aliasIn, h('button', {}, '足す')),
+        h('h3', {}, '親のタグ'),
+        h('p', { class: 'muted small' }, t('「{tag}」が付いたものは、親のタグで探しても見つかります。', { tag: x.tag })),
+        h('div', { class: 'chips' }, (info.parents || []).map((p) => tagChip(p, () => call('/api/tags/parent', { tag: x.tag, parent: p, op: 'remove' })))),
+        h('form', { class: 'inline', onsubmit: (e) => { e.preventDefault(); if (parentIn.value.trim()) call('/api/tags/parent', { tag: x.tag, parent: parentIn.value.trim() }); } }, parentIn, h('button', {}, '足す')),
+        (info.children || []).length ? [h('h3', {}, '子のタグ'), h('div', { class: 'chips' }, info.children.map((c) => h('span', { class: 'chip', translate: 'no' }, c)))] : null);
+    }
+    render();
+    await confirmDialog(t('タグの辞書: {tag}', { tag: x.tag }), holder, t('閉じる'));
+    app.render();
+  }
+
   // 名前空間（「種別:請求書」の「種別」）ごとにまとめる
   function renderList() {
     const f = filter.toLowerCase();
-    const shown = tags.filter((x) => !f || x.tag.toLowerCase().includes(f));
+    const shown = tags.filter((x) => !f || x.tag.toLowerCase().includes(f) || (x.aliases || []).some((a) => a.toLowerCase().includes(f)));
     const groups = new Map();
     for (const x of shown) {
       const ns = x.tag.includes(':') ? x.tag.split(':')[0] : '';
@@ -768,26 +910,114 @@ async function pageTags(main, params) {
       groups.get(ns).sort((a, b) => naturalCompare(a.tag, b.tag)).map((x) => {
         const inc = state.include.includes(x.tag);
         const exc = state.exclude.includes(x.tag);
+        const extra = [
+          (x.aliases || []).length ? t('別名: {names}', { names: x.aliases.join('、') }) : '',
+          (x.parents || []).length ? t('親: {names}', { names: x.parents.join('、') }) : '',
+        ].filter(Boolean).join(' ／ ');
         return h('div', { class: `tag-row ${inc ? 'included' : ''} ${exc ? 'excluded' : ''}` },
           h('button', { class: 'tag-pick', title: t('検索に含める'), onclick: () => { toggle(state.include, x.tag); state.exclude = state.exclude.filter((y) => y !== x.tag); go(); } },
             h('span', { class: 'mark' }, inc ? '✓' : exc ? '⊘' : '＋'),
-            h('span', { class: 'tag-name', translate: 'no' }, ns ? x.tag.slice(ns.length + 1) : x.tag)),
+            h('span', { class: 'tag-name', translate: 'no' }, ns ? x.tag.slice(ns.length + 1) : x.tag,
+              extra ? h('span', { class: 'tag-extra muted small' }, extra) : null)),
           h('span', { class: 'muted small num' }, num(x.count)),
           h('button', { class: 'chip-x', title: t('検索から除く'), onclick: () => { toggle(state.exclude, x.tag); state.include = state.include.filter((y) => y !== x.tag); go(); } }, '⊘'),
+          h('button', { class: 'chip-x', title: t('別名と親…'), onclick: () => dictionaryDialog(x) }, '⚙'),
           h('button', { class: 'chip-x', title: t('名前を変える…'), onclick: () => renameTag(x.tag) }, '✎'),
           h('button', { class: 'chip-x', title: t('タグを削除'), onclick: () => deleteTag(x.tag, x.count) }, '🗑'));
       }))) : h('p', { class: 'muted' }, tags.length ? t('当てはまるタグがありません。') : t('まだタグがありません。「ファイル」の画面で、ファイルやフォルダに付けられます。')));
   }
 
-  const left = h('div', { class: 'card' },
-    h('h2', {}, 'タグ'),
-    h('input', { type: 'search', placeholder: t('タグを探す'), oninput: (e) => { filter = e.target.value; renderList(); } }),
-    h('p', { class: 'muted small' }, t('＋ で検索に含め、⊘ で除きます。件数は直接付いている数です。')),
-    listEl);
+  // --- 属性の定義と、属性での絞り込み ---
+
+  async function defineAttrDialog() {
+    const name = h('input', { placeholder: t('名前（例: 対応状態）') });
+    const type = h('select', {}, Object.entries(ATTR_TYPE_LABELS).map(([v, label]) => h('option', { value: v }, t(label))));
+    const choices = h('input', { placeholder: t('選択肢（択一のとき。例: 未対応, 対応中, 対応済み）') });
+    const ok = await confirmDialog(t('属性を定義する'), [
+      h('label', { class: 'attr-row' }, h('span', { class: 'attr-name' }, t('名前')), name),
+      h('label', { class: 'attr-row' }, h('span', { class: 'attr-name' }, t('型')), type),
+      h('label', { class: 'attr-row' }, h('span', { class: 'attr-name' }, t('選択肢')), choices),
+      h('p', { class: 'muted small' }, t('択一は値を1つだけ持ちます（付け直すと置き換わります）。フォルダに付けた値は、中のファイルが継承します。')),
+    ], t('定義する'));
+    if (!ok) return;
+    try { await api('/api/attrs/defs', { name: name.value.trim(), type: type.value, choices: choices.value }); app.render(); }
+    catch (e) { toast(e.message, 'danger'); }
+  }
+
+  async function undefineAttr(d) {
+    const ok = await confirmDialog(t('属性の定義を消しますか？'),
+      h('p', {}, t('「{name}」の定義と、付いている {n} 件の値を外します。ファイル自体には何もしません。', { name: d.name, n: d.count })), t('削除する'), true);
+    if (!ok) return;
+    try { await api('/api/attrs/defs', { name: d.name, op: 'remove' }); state.attrs = state.attrs.filter((c) => !c.startsWith(d.name)); go(); app.render(); }
+    catch (e) { toast(e.message, 'danger'); }
+  }
+
+  /** 属性での絞り込みを足す（型に合わせて、値・大小を選ぶ）。 */
+  async function attrFilterDialog(d) {
+    if (d.type === 'flag') { state.attrs.push(d.name); go(); return; }
+    const op = h('select', {}, (d.type === 'number' || d.type === 'date'
+      ? [['=', '＝'], ['>=', '以上'], ['<=', '以下'], ['', '値が付いている']]
+      : [['=', d.type === 'text' ? '含む' : '＝'], ['', '値が付いている']]).map(([v, label]) => h('option', { value: v }, t(label))));
+    const value = d.type === 'choice'
+      ? h('select', {}, d.choices.map((c) => h('option', { value: c }, c)))
+      : h('input', { type: d.type === 'date' ? 'date' : 'text', inputmode: d.type === 'number' ? 'decimal' : null });
+    const ok = await confirmDialog(t('属性で絞り込む: {name}', { name: d.name }), [h('div', { class: 'toolbar' }, op, value)], t('絞り込む'));
+    if (!ok) return;
+    state.attrs.push(op.value ? `${d.name}${op.value}${value.value}` : d.name);
+    go();
+  }
+
+  const attrList = h('div', { class: 'tag-list' }, attrDefs.length ? attrDefs.map((d) => h('div', { class: 'tag-row' },
+    h('button', { class: 'tag-pick', title: t('この属性で絞り込む…'), onclick: () => attrFilterDialog(d) },
+      h('span', { class: 'mark' }, '＋'),
+      h('span', { class: 'tag-name', translate: 'no' }, d.name,
+        h('span', { class: 'tag-extra muted small' }, t(ATTR_TYPE_LABELS[d.type] || d.type) + (d.choices.length ? `: ${d.choices.join(' / ')}` : '')))),
+    h('span', { class: 'muted small num' }, num(d.count)),
+    h('button', { class: 'chip-x', title: t('属性の定義を消す'), onclick: () => undefineAttr(d) }, '🗑'))) : h('p', { class: 'muted small' }, t('対応状態・期限・金額などを属性として定義すると、ファイルやフォルダに付けて絞り込めます。')));
+
+  // --- 保存した検索（作業リスト。件数は後から数える） ---
+
+  async function saveSearchDialog() {
+    const input = h('input', { class: 'name-input', placeholder: t('名前（例: 要対応の書類）') });
+    setTimeout(() => input.focus(), 50);
+    const ok = await confirmDialog(t('この条件を保存する'), [input, h('p', { class: 'muted small' }, t('保存した条件は、左の一覧から何度でも開けます（件数つき）。'))], t('保存する'));
+    if (!ok || !input.value.trim()) return;
+    try { await api('/api/searches', { name: input.value.trim(), query: searchQuery(state).toString() }); app.render(); }
+    catch (e) { toast(e.message, 'danger'); }
+  }
+
+  const savedList = h('div', { class: 'tag-list' });
+  const saved = meta.searches || [];
+  setChildren(savedList, saved.length ? saved.map((sv) => {
+    const count = h('span', { class: 'muted small num' }, '…');
+    const s2 = searchState(new URLSearchParams(sv.query));
+    if (searchHasCondition(s2)) {
+      api(`/api/search?${searchApiQuery(s2, root, 1)}`).then((r) => { count.textContent = num(r.total); }).catch(() => { count.textContent = '?'; });
+    }
+    const active = searchQuery(state).toString() === new URLSearchParams(sv.query).toString();
+    return h('div', { class: `tag-row ${active ? 'included' : ''}` },
+      h('a', { class: 'tag-pick', href: `#/search?${sv.query}` }, h('span', { class: 'mark' }, '★'), h('span', { class: 'tag-name', translate: 'no' }, sv.name)),
+      count,
+      h('button', { class: 'chip-x', title: t('保存した検索を消す'), onclick: async () => { try { await api('/api/searches', { name: sv.name, op: 'delete' }); app.render(); } catch (e) { toast(e.message, 'danger'); } } }, '🗑'));
+  }) : h('p', { class: 'muted small' }, t('条件を入れて「この条件を保存」を押すと、作業リストとしてここに並びます。')));
+
+  const left = h('div', {},
+    h('div', { class: 'card' }, h('h2', {}, '保存した検索'), savedList),
+    h('div', { class: 'card' },
+      h('h2', {}, 'タグ'),
+      h('input', { type: 'search', placeholder: t('タグを探す'), oninput: (e) => { filter = e.target.value; renderList(); } }),
+      h('p', { class: 'muted small' }, t('＋ で検索に含め、⊘ で除きます。件数は直接付いている数です。')),
+      listEl),
+    h('div', { class: 'card' },
+      h('h2', {}, '属性'),
+      attrList,
+      h('div', { class: 'buttons' }, h('button', { class: 'small', onclick: defineAttrDialog }, t('属性を定義する…')))));
   renderList();
 
-  // 右: 探す条件（名前・本文・種類・タグ）と、結果・選んだファイルの詳細
+  // --- 右: 探す条件と、結果・選んだファイルの詳細 ---
   const chipsOf = (list, cls) => list.map((x) => h('span', { class: `chip ${cls}`, translate: 'no' }, x));
+  const folderList = h('datalist', { id: `folders-${enc(root)}` });
+  const narrowed = state.under || state.after || state.before || state.min || state.max || state.gone || !state.collapse;
   const conditions = [
     h('div', { class: 'toolbar' },
       h('input', { type: 'search', placeholder: t('名前やフォルダで探す'), value: state.q, onchange: (e) => { state.q = e.target.value.trim(); go(); } }),
@@ -795,29 +1025,36 @@ async function pageTags(main, params) {
       h('select', { 'aria-label': t('種類'), onchange: (e) => { state.kind = e.target.value; go(); } },
         SEARCH_KINDS.map(([v, label]) => h('option', { value: v, selected: state.kind === v }, t(label)))),
       h('label', { class: 'small' }, h('input', { type: 'checkbox', checked: state.folders, onchange: (e) => { state.folders = e.target.checked; go(); } }), ' ', t('フォルダも出す')),
-      h('button', { class: 'small', onclick: () => { Object.assign(state, { include: [], exclude: [], q: '', text: '', kind: '' }); go(); } }, t('条件を消す'))),
-    state.include.length || state.exclude.length ? h('div', { class: 'toolbar' },
-      h('div', { class: 'chips' }, chipsOf(state.include, 'active'), state.exclude.length ? [h('span', { class: 'muted small' }, t('除外:')), chipsOf(state.exclude, 'excluded-chip')] : null),
+      h('button', { class: 'small', onclick: () => { Object.assign(state, searchState(new URLSearchParams())); go(); } }, t('条件を消す')),
+      searchHasCondition(state) ? h('button', { class: 'small', onclick: saveSearchDialog }, t('この条件を保存…')) : null),
+    h('details', { class: 'narrow', open: !!narrowed },
+      h('summary', { class: 'muted small' }, t('場所・更新日・大きさ・そのほか')),
+      h('div', { class: 'toolbar' },
+        folderList,
+        h('input', { type: 'search', list: `folders-${enc(root)}`, placeholder: t('このフォルダの中だけ'), value: state.under,
+          oninput: (e) => folderSuggest(root, e.target.value), onchange: (e) => { state.under = e.target.value.trim().replace(/^\/+|\/+$/g, ''); go(); } }),
+        h('label', { class: 'small' }, t('更新日'), ' ', h('input', { type: 'date', value: state.after, onchange: (e) => { state.after = e.target.value; go(); } }),
+          ' 〜 ', h('input', { type: 'date', value: state.before, onchange: (e) => { state.before = e.target.value; go(); } })),
+        h('label', { class: 'small' }, t('大きさ'), ' ', h('input', { class: 'size-input', placeholder: t('例: 1MB'), value: state.min, onchange: (e) => { state.min = e.target.value.trim(); go(); } }),
+          ' 〜 ', h('input', { class: 'size-input', placeholder: t('例: 1GB'), value: state.max, onchange: (e) => { state.max = e.target.value.trim(); go(); } })),
+        h('label', { class: 'small' }, h('input', { type: 'checkbox', checked: state.collapse, onchange: (e) => { state.collapse = e.target.checked; go(); } }), ' ', t('同じ内容をまとめる')),
+        h('label', { class: 'small' }, h('input', { type: 'checkbox', checked: state.gone, onchange: (e) => { state.gone = e.target.checked; go(); } }), ' ', t('今は無いものも含める')))),
+    state.include.length || state.exclude.length || state.attrs.length ? h('div', { class: 'toolbar' },
+      h('div', { class: 'chips' }, chipsOf(state.include, 'active'), state.exclude.length ? [h('span', { class: 'muted small' }, t('除外:')), chipsOf(state.exclude, 'excluded-chip')] : null,
+        state.attrs.map((c) => h('span', { class: 'chip attr', translate: 'no' }, c,
+          h('button', { class: 'chip-x', title: t('この条件を外す'), onclick: () => { state.attrs = state.attrs.filter((x) => x !== c); go(); } }, '×')))),
       state.include.length > 1 ? h('select', { onchange: (e) => { state.mode = e.target.value; go(); } },
         h('option', { value: 'and', selected: state.mode === 'and' }, t('すべて含む（AND）')),
         h('option', { value: 'or', selected: state.mode === 'or' }, t('どれかを含む（OR）'))) : null) : null,
   ];
   const right = h('div', {}, conditions);
-  const hasCondition = state.include.length || state.exclude.length || state.q || state.text || state.kind;
-  if (!hasCondition) {
+  if (!searchHasCondition(state)) {
     right.append(h('p', { class: 'muted' }, t('名前・本文・種類で探すか、左の一覧からタグを選んでください。フォルダに付いたタグは、中のファイルにも効きます。')));
     const st = await indexStatus(root);
     if (st) right.append(st);
   } else {
-    const q = new URLSearchParams({ root, mode: state.mode });
-    state.include.forEach((x) => q.append('tag', x));
-    state.exclude.forEach((x) => q.append('not', x));
-    if (state.q) q.set('q', state.q);
-    if (state.text) q.set('text', state.text);
-    if (state.kind) q.set('kind', state.kind);
-    if (state.folders) q.set('folders', '1');
     let res;
-    try { res = await api(`/api/search?${q}`); } catch (e) { res = null; right.append(h('div', { class: 'alert danger' }, e.message)); }
+    try { res = await api(`/api/search?${searchApiQuery(state, root)}`); } catch (e) { res = null; right.append(h('div', { class: 'alert danger' }, e.message)); }
     if (res) {
       const sort = sortState('tag-search', { field: 'path', dir: 'asc' });
       const getters = { name: (x) => x.path.split('/').pop(), path: (x) => x.path, size: (x) => (x.is_dir ? null : x.size), mtime: (x) => x.mtime };
@@ -826,30 +1063,46 @@ async function pageTags(main, params) {
       const head = h('tr');
       const renderRows = () => {
         setChildren(head, sortHeader(t('名前'), 'name', sort, renderRows), sortHeader(t('場所'), 'path', sort, renderRows, 'hide-narrow'),
-          h('th', {}, t('タグ')), sortHeader(t('サイズ'), 'size', sort, renderRows, 'num'), sortHeader(t('更新日時'), 'mtime', sort, renderRows, 'num hide-narrow'));
+          h('th', {}, t('タグ・属性')), sortHeader(t('サイズ'), 'size', sort, renderRows, 'num'), sortHeader(t('更新日時'), 'mtime', sort, renderRows, 'num hide-narrow'));
         setChildren(body, sortItems(res.items, sort, getters, (x) => x.path).map((x) => {
           const name = x.path.split('/').pop();
           const dir = x.path.split('/').slice(0, -1).join('/');
-          return h('tr', { class: 'clickable', onclick: () => showDetail(x) },
+          return h('tr', { class: `clickable ${x.gone_at ? 'gone' : ''}`, onclick: () => showDetail(x) },
             h('td', { class: 'path' }, x.is_dir ? '📁 ' : `${fileIcon(name)} `, name,
+              x.gone_at ? [' ', h('span', { class: 'badge', title: t('{when} に見えなくなりました', { when: when(x.gone_at) }) }, '今は無い')] : null,
               // 本文で探したときは、一致したところの前後を見せる
-              x.snippet ? h('div', { class: 'snippet muted small' }, highlight(x.snippet, state.text)) : null),
+              x.snippet ? h('div', { class: 'snippet muted small' }, highlight(x.snippet, state.text)) : null,
+              x.copies.length ? h('details', { class: 'copies small', onclick: (e) => e.stopPropagation() },
+                h('summary', { class: 'muted' }, t('同じ内容があと {n} か所', { n: num(x.copies.length) })),
+                h('ul', {}, x.copies.map((p) => h('li', {}, h('a', { href: browseHref(root, p.split('/').slice(0, -1).join('/')) }, p))))) : null),
             h('td', { class: 'path muted hide-narrow' }, h('a', { href: browseHref(root, x.is_dir ? x.path : dir), onclick: (e) => e.stopPropagation() }, dir || '/')),
             h('td', {}, h('div', { class: 'chips' },
               x.tags.direct.map((tg) => h('span', { class: 'chip' }, tg.tag)),
-              x.tags.inherited.map((tg) => h('span', { class: 'chip inherited', title: t('{from} から継承', { from: tg.from || root }) }, tg.tag)))),
+              x.tags.inherited.map((tg) => h('span', { class: 'chip inherited', title: t('{from} から継承', { from: tg.from || root }) }, tg.tag)),
+              (x.tags.implied || []).map((tg) => h('span', { class: 'chip implied', title: t('{via} の親', { via: tg.via }) }, tg.tag)),
+              x.attrs.direct.map((a) => h('span', { class: 'chip attr' }, attrText(a.name, a.value))),
+              x.attrs.inherited.map((a) => h('span', { class: 'chip attr inherited', title: t('{from} から継承', { from: a.from || root }) }, attrText(a.name, a.value))))),
             h('td', { class: 'num' }, x.is_dir ? '' : size(x.size)),
             h('td', { class: 'num hide-narrow' }, when(new Date(x.mtime * 1000).toISOString())));
         }));
       };
-      const showDetail = (x) => {
+      const showDetail = async (x) => {
         const name = x.path.split('/').pop();
-        setChildren(detail, h('div', { class: 'card' },
-          h('h2', { class: 'path' }, name), h('div', { class: 'muted mono' }, x.path),
+        const parts = [h('h2', { class: 'path' }, name), h('div', { class: 'muted mono' }, x.path),
           h('div', { class: 'buttons' },
-            h('a', { class: 'button small', href: browseHref(root, x.is_dir ? x.path : x.path.split('/').slice(0, -1).join('/')) }, t('フォルダを開く')),
-            x.is_dir ? null : h('a', { class: 'button small', href: fileUrl(root, x.path), target: '_blank', rel: 'noopener' }, t('新しいタブで開く'))),
-          x.is_dir ? null : preview(fileUrl(root, x.path), name, x.size, { root, path: x.path })));
+            h('a', { class: 'button small', href: x.is_dir ? browseHref(root, x.path) : browseHref(root, x.path.split('/').slice(0, -1).join('/'), '', x.gone_at ? '' : name) }, t('フォルダを開く')),
+            x.is_dir || x.gone_at ? null : h('a', { class: 'button small', href: fileUrl(root, x.path), target: '_blank', rel: 'noopener' }, t('新しいタブで開く')))];
+        if (x.gone_at) {
+          parts.push(h('p', { class: 'muted' }, t('{when} に見えなくなりました。過去の版は、フォルダを開いて「この時点を見る」から探せます。', { when: when(x.gone_at) })));
+        } else {
+          // 属性はここでも付け替えられる（作業リストで対応状態を進めるなど）
+          try {
+            const info = await api(`/api/info?root=${enc(root)}&path=${enc(x.path)}`);
+            if (info.attr_defs.length) parts.push(h('h3', {}, '属性'), attrEditor(root, x.path, info.attrs, info.attr_defs, () => app.render()));
+          } catch (e) { /* 属性が読めなくてもプレビューは出す */ }
+          if (!x.is_dir) parts.push(preview(fileUrl(root, x.path), name, x.size, { root, path: x.path }));
+        }
+        setChildren(detail, h('div', { class: 'card' }, parts));
         detail.scrollIntoView({ block: 'nearest' });
       };
       renderRows();

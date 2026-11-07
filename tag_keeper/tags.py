@@ -14,6 +14,27 @@
     {"at": "...", "host": "zefat", "op": "move",   "root": "onedrive", "from": "a", "to": "c/a"}
     {"at": "...", "host": "zefat", "op": "rename", "from": "会社:ATID", "to": "会社:アティード"}   # タグの名前の変更（全ルート）
     {"at": "...", "host": "zefat", "op": "delete", "tag": "仮"}                                 # タグの削除（全ルート）
+
+タグの辞書（版 0.12 から。F-MD-2・3）:
+
+    {"op": "alias",    "tag": "会社:アティード", "alias": "会社:ATID"}       # 別名。付けるときと探すときに正式な名前へそろえる
+    {"op": "unalias",  "alias": "会社:ATID"}
+    {"op": "parent",   "tag": "種別:請求書", "parent": "種別:経理"}          # 親子。子が付けば親も成り立つ（探すときに広げる）
+    {"op": "unparent", "tag": "種別:請求書", "parent": "種別:経理"}
+
+型付きの属性（F-MD-4）。定義してから付ける。値はアイテムごと・名前ごとに1つ（付け直すと置き換わる）。フォルダの値は配下が継承する:
+
+    {"op": "attr-def",   "name": "対応状態", "type": "choice", "choices": ["未対応", "対応中", "対応済み"]}
+    {"op": "attr-undef", "name": "対応状態"}
+    {"op": "attr-set",   "root": "onedrive", "path": "a/b.pdf", "name": "対応状態", "value": "対応中", "source": "manual"}
+    {"op": "attr-unset", "root": "onedrive", "path": "a/b.pdf", "name": "対応状態"}
+
+保存した検索（F-SE-5）:
+
+    {"op": "search-save",   "name": "要対応", "query": "attr=要対応&kind=pdf"}
+    {"op": "search-delete", "name": "要対応"}
+
+古い版は知らない種類の行を読み飛ばす（互換を保つため、既存の行の書式は変えない）。
 """
 
 from __future__ import annotations
@@ -36,10 +57,16 @@ log = logging.getLogger(__name__)
 
 # タグの長さの上限（画面とログを壊さない程度の目安）
 MAX_TAG_LENGTH = 100
+# 属性の型: choice（択一ラベル）・flag（フラグ）・date（日付）・number（数・金額）・text（文字。取引先など）
+ATTR_TYPES = ("choice", "flag", "date", "number", "text")
+# 文字の属性の値の長さの上限
+MAX_TEXT_VALUE = 200
+# 別名・親子をたどる深さの上限（記録の誤りで循環しても止まるように）
+MAX_DEPTH = 32
 
 
 class TagError(ValueError):
-    """タグの名前が不正なときの例外。"""
+    """タグ・属性の名前や値が不正なときの例外。"""
 
 
 def normalize_tag(tag: str) -> str:
@@ -129,6 +156,84 @@ class Assignment:
     host: str
 
 
+@dataclass(frozen=True)
+class AttrDef:
+    """属性の定義（名前・型・択一の選択肢）。"""
+
+    name: str
+    type: str
+    choices: tuple[str, ...] = ()
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"name": self.name, "type": self.type, "choices": list(self.choices)}
+
+
+@dataclass(frozen=True)
+class AttrValue:
+    """アイテムに直接付いた属性の値1件。"""
+
+    name: str
+    value: Any
+    source: str
+    at: str
+
+
+def parse_attr_value(d: AttrDef, value: Any) -> Any:
+    """属性の値を型に合わせて確かめ、保存する形にする。不正なら TagError。
+
+    choice は選択肢のどれか、flag は true、date は YYYY-MM-DD、number は数（整数なら整数）、text は 200 文字まで。
+    """
+    import datetime as dt
+
+    if d.type == "flag":
+        if value in (True, "true", "1", 1, "on"):
+            return True
+        raise TagError(f"フラグの値は true だけです: {d.name}")
+    if value is None or (isinstance(value, str) and not value.strip()):
+        raise TagError(f"値が空です: {d.name}")
+    if d.type == "choice":
+        v = unicodedata.normalize("NFC", str(value)).strip()
+        if v not in d.choices:
+            raise TagError(f"{d.name} の値は {' / '.join(d.choices)} のどれかです: {v}")
+        return v
+    if d.type == "date":
+        try:
+            return dt.date.fromisoformat(str(value).strip()).isoformat()
+        except ValueError as e:
+            raise TagError(f"{d.name} の値は YYYY-MM-DD の日付です: {value}") from e
+    if d.type == "number":
+        try:
+            n = float(str(value).replace(",", "").strip())
+        except ValueError as e:
+            raise TagError(f"{d.name} の値は数です: {value}") from e
+        return int(n) if n.is_integer() else n
+    v = " ".join(unicodedata.normalize("NFC", str(value)).split())
+    if len(v) > MAX_TEXT_VALUE:
+        raise TagError(f"{d.name} の値が長すぎます（{MAX_TEXT_VALUE} 文字まで）")
+    return v
+
+
+def match_attr(d: AttrDef | None, value: Any, op: str, want: str) -> bool:
+    """属性の値が条件に合うか。op は exists・=・>=・<=・>・<（日付と数は大小、ほかは = だけ。文字は部分一致）。"""
+    if op == "exists":
+        return value is not None
+    if value is None or d is None:
+        return False
+    if d.type == "number":
+        try:
+            w: Any = float(want.replace(",", ""))
+        except ValueError:
+            return False
+        v: Any = float(value)
+    elif d.type == "date":
+        v, w = str(value), want.strip()
+    elif d.type == "text":
+        return op == "=" and want.strip().casefold() in str(value).casefold()
+    else:
+        return op == "=" and str(value) == unicodedata.normalize("NFC", want).strip()
+    return {"=": v == w, ">=": v >= w, "<=": v <= w, ">": v > w, "<": v < w}.get(op, False)
+
+
 class TagStore:
     """タグのログを読み込んで保持し、付け外しをログに追記する。
 
@@ -141,6 +246,14 @@ class TagStore:
         self.lock = threading.RLock()
         # (ルート名, 相対パス) → {タグ → Assignment}
         self.items: dict[tuple[str, str], dict[str, Assignment]] = {}
+        # 別名 → 正式な名前、タグ → 親のタグ
+        self.aliases: dict[str, str] = {}
+        self.parents: dict[str, set[str]] = {}
+        # 属性の定義と、(ルート名, 相対パス) → {属性名 → AttrValue}
+        self.attr_defs: dict[str, AttrDef] = {}
+        self.attrs: dict[tuple[str, str], dict[str, AttrValue]] = {}
+        # 保存した検索（名前 → 問い合わせの文字列）
+        self.searches: dict[str, str] = {}
         self._stamp: tuple[tuple[str, int, int], ...] = ()
 
     @property
@@ -173,6 +286,8 @@ class TagStore:
             # 端末をまたいで日時順に並べる（同じ日時ならファイル内の順を保つ）
             events.sort(key=lambda e: str(e.get("at", "")))
             self.items = {}
+            self.aliases, self.parents = {}, {}
+            self.attr_defs, self.attrs, self.searches = {}, {}, {}
             for ev in events:
                 self._apply(ev)
             self._stamp = stamp
@@ -200,12 +315,29 @@ class TagStore:
                 a = tags.pop(src, None)
                 if a is not None and dst not in tags:
                     tags[dst] = Assignment(dst, a.source, a.at, a.host)
+            # 辞書（別名・親子）の中の名前も付け替える
+            for alias, canon in list(self.aliases.items()):
+                if canon == src:
+                    self.aliases[alias] = dst
+            if src in self.parents:
+                self.parents.setdefault(dst, set()).update(self.parents.pop(src))
+            for ps in self.parents.values():
+                if src in ps:
+                    ps.discard(src)
+                    ps.add(dst)
+            self.parents.get(dst, set()).discard(dst)
         elif op == "delete":
             tag = str(ev["tag"])
             for key in [k for k, tags in self.items.items() if tag in tags]:
                 del self.items[key][tag]
                 if not self.items[key]:
                     del self.items[key]
+            # 消したタグを指す別名と親子も消す
+            for alias in [a for a, c in self.aliases.items() if c == tag]:
+                del self.aliases[alias]
+            self.parents.pop(tag, None)
+            for ps in self.parents.values():
+                ps.discard(tag)
         elif op == "move":
             src, dst = str(ev["from"]), str(ev["to"])
             moved = [k for k in self.items if k[0] == root and _under(k[1], src)]
@@ -213,6 +345,51 @@ class TagStore:
             for (r, p), tags in entries.items():
                 new = dst + p[len(src):]
                 self.items.setdefault((r, new), {}).update(tags)
+            # 属性も同じように追従させる
+            moved_attrs = {k: self.attrs.pop(k) for k in [k for k in self.attrs if k[0] == root and _under(k[1], src)]}
+            for (r, p), values in moved_attrs.items():
+                self.attrs.setdefault((r, dst + p[len(src):]), {}).update(values)
+        elif op == "alias":
+            alias, tag = str(ev["alias"]), str(ev["tag"])
+            if alias != tag:
+                self.aliases[alias] = tag
+        elif op == "unalias":
+            self.aliases.pop(str(ev["alias"]), None)
+        elif op == "parent":
+            tag, parent = str(ev["tag"]), str(ev["parent"])
+            if tag != parent:
+                self.parents.setdefault(tag, set()).add(parent)
+        elif op == "unparent":
+            ps = self.parents.get(str(ev["tag"]))
+            if ps is not None:
+                ps.discard(str(ev["parent"]))
+                if not ps:
+                    del self.parents[str(ev["tag"])]
+        elif op == "attr-def":
+            name = str(ev["name"])
+            self.attr_defs[name] = AttrDef(name, str(ev.get("type", "text")), tuple(str(c) for c in ev.get("choices") or ()))
+        elif op == "attr-undef":
+            name = str(ev["name"])
+            self.attr_defs.pop(name, None)
+            for key in [k for k, vals in self.attrs.items() if name in vals]:
+                del self.attrs[key][name]
+                if not self.attrs[key]:
+                    del self.attrs[key]
+        elif op == "attr-set":
+            key = (root, str(ev["path"]))
+            name = str(ev["name"])
+            self.attrs.setdefault(key, {})[name] = AttrValue(name, ev.get("value"), str(ev.get("source", "manual")), str(ev.get("at", "")))
+        elif op == "attr-unset":
+            key = (root, str(ev["path"]))
+            vals = self.attrs.get(key)
+            if vals is not None:
+                vals.pop(str(ev["name"]), None)
+                if not vals:
+                    del self.attrs[key]
+        elif op == "search-save":
+            self.searches[str(ev["name"])] = str(ev.get("query", ""))
+        elif op == "search-delete":
+            self.searches.pop(str(ev["name"]), None)
 
     # --- 書き込み ---
 
@@ -234,11 +411,11 @@ class TagStore:
             self._stamp = tuple((f.name, f.stat().st_mtime_ns, f.stat().st_size) for f in files)
 
     def add(self, root: str, paths: Iterable[str], tag: str, source: str = "manual") -> int:
-        """アイテムにタグを付ける。既に付いているものは飛ばす。付けた件数を返す。"""
-        tag = normalize_tag(tag)
+        """アイテムにタグを付ける（別名なら正式な名前で付ける）。既に付いているものは飛ばす。付けた件数を返す。"""
         now = utcnow()
         with self.lock:
             self.reload_if_changed()
+            tag = self._canonical(normalize_tag(tag))
             events = [
                 {"at": now, "host": self.host, "op": "add", "root": root, "path": p, "tag": tag, "source": source}
                 for p in dict.fromkeys(paths)
@@ -249,10 +426,10 @@ class TagStore:
 
     def remove(self, root: str, paths: Iterable[str], tag: str) -> int:
         """アイテムからタグを外す（直接付いたものだけ。継承したものは元のフォルダで外す）。"""
-        tag = normalize_tag(tag)
         now = utcnow()
         with self.lock:
             self.reload_if_changed()
+            tag = self._canonical(normalize_tag(tag))
             events = [
                 {"at": now, "host": self.host, "op": "remove", "root": root, "path": p, "tag": tag}
                 for p in dict.fromkeys(paths)
@@ -262,7 +439,7 @@ class TagStore:
         return len(events)
 
     def follow_moves(self, root: str, moves: Iterable[tuple[str, str]]) -> int:
-        """移動・改名に追従する。タグの付いたアイテムを含む移動だけを記録する。
+        """移動・改名に追従する。タグか属性の付いたアイテムを含む移動だけを記録する。
 
         1回の走査で見つけた移動は同時に起きたものなので、順に当てはめても同じ結果になる順に並べ直してから記録する
         （order_moves を参照）。
@@ -272,7 +449,7 @@ class TagStore:
             self.reload_if_changed()
             events = []
             for src, dst in order_moves(list(moves)):
-                if any(k[0] == root and _under(k[1], src) for k in self.items):
+                if any(k[0] == root and _under(k[1], src) for k in [*self.items, *self.attrs]):
                     events.append({"at": now, "host": self.host, "op": "move", "root": root, "from": src, "to": dst})
             self._append(events)
         return len(events)
@@ -281,7 +458,7 @@ class TagStore:
         """base とその配下に直接付いたタグを外し、外したもの（相対パス → [タグ, 出所] の一覧）を返す。
 
         隔離したアイテムのタグを、そのパスに残さないために使う（残すと、後で同じパスに来た別のファイルに付いてしまう）。
-        返したものを実行記録に残しておき、取り消しのときに attach で戻す。
+        返したものを実行記録に残しておき、取り消しのときに attach で戻す。属性は detach_attrs_under で同じように扱う。
         """
         now = utcnow()
         with self.lock:
@@ -313,30 +490,296 @@ class TagStore:
             self._append(events)
         return len(events)
 
-    def rename_tag(self, old: str, new: str) -> int:
-        """タグの名前を変える（全ルートのすべてのアイテム）。変わったアイテムの数を返す。"""
-        old, new = normalize_tag(old), normalize_tag(new)
-        if old == new:
-            return 0
+    def detach_attrs_under(self, root: str, base: str) -> dict[str, list[list[Any]]]:
+        """base とその配下の属性を外し、外したもの（相対パス → [名前, 値, 出所] の一覧）を返す（隔離のとき）。"""
+        now = utcnow()
         with self.lock:
             self.reload_if_changed()
+            detached = {
+                p: [[v.name, v.value, v.source] for v in sorted(vals.values(), key=lambda v: v.name)]
+                for (r, p), vals in self.attrs.items()
+                if r == root and _under(p, base) and vals
+            }
+            events = [
+                {"at": now, "host": self.host, "op": "attr-unset", "root": root, "path": p, "name": name}
+                for p, triples in sorted(detached.items())
+                for name, _value, _source in triples
+            ]
+            self._append(events)
+        return detached
+
+    def attach_attrs(self, root: str, detached: dict[str, list[list[Any]]]) -> int:
+        """detach_attrs_under で外した属性を付け直す（取り消しのとき）。定義が消えたものは飛ばす。"""
+        now = utcnow()
+        with self.lock:
+            self.reload_if_changed()
+            events = [
+                {"at": now, "host": self.host, "op": "attr-set", "root": root, "path": p, "name": name, "value": value, "source": source}
+                for p, triples in sorted(detached.items())
+                for name, value, source in triples
+                if name in self.attr_defs and name not in self.attrs.get((root, p), {})
+            ]
+            self._append(events)
+        return len(events)
+
+    def rename_tag(self, old: str, new: str) -> int:
+        """タグの名前を変える（全ルートのすべてのアイテム）。変わったアイテムの数を返す。
+
+        別名と親子の中の名前も付け替える。変更先が別名なら、その正式な名前にする。
+        """
+        old, new = normalize_tag(old), normalize_tag(new)
+        with self.lock:
+            self.reload_if_changed()
+            old, new = self._canonical(old), self._canonical(new)
+            if old == new:
+                return 0
             n = sum(1 for tags in self.items.values() if old in tags)
-            if n:
+            if n or self._in_dictionary(old):
                 self._append([{"at": utcnow(), "host": self.host, "op": "rename", "from": old, "to": new}])
         return n
 
     def delete_tag(self, tag: str) -> int:
-        """タグを、付いているすべてのアイテムから外す。外したアイテムの数を返す。"""
+        """タグを、付いているすべてのアイテムから外す（別名と親子も消す）。外したアイテムの数を返す。"""
         tag = normalize_tag(tag)
         with self.lock:
             self.reload_if_changed()
+            tag = self._canonical(tag)
             n = sum(1 for tags in self.items.values() if tag in tags)
-            if n:
+            if n or self._in_dictionary(tag):
                 self._append([{"at": utcnow(), "host": self.host, "op": "delete", "tag": tag}])
         return n
 
-    def tagged_paths(self, root: str) -> dict[str, set[str]]:
-        """ルートの中で、タグごとに直接付いているアイテムの相対パス（検索用）。"""
+    # --- タグの辞書（別名・親子。F-MD-2・3） ---
+
+    def _canonical(self, tag: str) -> str:
+        """別名をたどって正式な名前にする（ロックを取った状態で呼ぶ）。"""
+        seen = set()
+        while tag in self.aliases and tag not in seen and len(seen) < MAX_DEPTH:
+            seen.add(tag)
+            tag = self.aliases[tag]
+        return tag
+
+    def _in_dictionary(self, tag: str) -> bool:
+        """別名か親子に名前が出てくるか（付いているアイテムが無くても、名前の変更・削除の対象にする）。"""
+        return tag in self.aliases.values() or tag in self.parents or any(tag in ps for ps in self.parents.values())
+
+    def canonical(self, tag: str) -> str:
+        """タグの表記をそろえ、別名なら正式な名前にする（探すときに使う）。"""
+        tag = normalize_tag(tag)
+        with self.lock:
+            self.reload_if_changed()
+            return self._canonical(tag)
+
+    def _ancestors_of(self, tag: str) -> set[str]:
+        """親・親の親…（自身は含まない。ロックを取った状態で呼ぶ）。"""
+        out: set[str] = set()
+        stack = list(self.parents.get(tag, ()))
+        while stack and len(out) < 10_000:
+            t = stack.pop()
+            if t in out:
+                continue
+            out.add(t)
+            stack.extend(self.parents.get(t, ()))
+        out.discard(tag)
+        return out
+
+    def add_alias(self, tag: str, alias: str) -> None:
+        """別名を登録する。別名として既に使われているタグは、正式な名前に統合する（付いたアイテムを移す）。
+
+        Raises:
+            TagError: 別名が正式な名前と同じ。
+        """
+        tag, alias = normalize_tag(tag), normalize_tag(alias)
+        now = utcnow()
+        with self.lock:
+            self.reload_if_changed()
+            tag = self._canonical(tag)
+            if self._canonical(alias) == tag or alias == tag:
+                raise TagError(f"別名が正式な名前と同じです: {alias}")
+            events: list[dict[str, Any]] = []
+            if any(alias in tags for tags in self.items.values()) or self._in_dictionary(alias):
+                # 別名にする名前が既にタグとして使われていれば、付いたアイテム・別名・親子ごと正式な名前へまとめる
+                events.append({"at": now, "host": self.host, "op": "rename", "from": alias, "to": tag})
+            events.append({"at": now, "host": self.host, "op": "alias", "tag": tag, "alias": alias})
+            self._append(events)
+
+    def remove_alias(self, alias: str) -> bool:
+        """別名の登録を外す。外したら True。"""
+        alias = normalize_tag(alias)
+        with self.lock:
+            self.reload_if_changed()
+            if alias not in self.aliases:
+                return False
+            self._append([{"at": utcnow(), "host": self.host, "op": "unalias", "alias": alias}])
+        return True
+
+    def add_parent(self, tag: str, parent: str) -> None:
+        """親子を登録する（tag が付けば parent も成り立つ）。循環になるものは断る（TagError）。"""
+        tag, parent = normalize_tag(tag), normalize_tag(parent)
+        with self.lock:
+            self.reload_if_changed()
+            tag, parent = self._canonical(tag), self._canonical(parent)
+            if tag == parent or tag in self._ancestors_of(parent):
+                raise TagError(f"親子が循環します: {tag} → {parent}")
+            if parent in self.parents.get(tag, ()):
+                return
+            self._append([{"at": utcnow(), "host": self.host, "op": "parent", "tag": tag, "parent": parent}])
+
+    def remove_parent(self, tag: str, parent: str) -> bool:
+        """親子の登録を外す。外したら True。"""
+        tag, parent = normalize_tag(tag), normalize_tag(parent)
+        with self.lock:
+            self.reload_if_changed()
+            tag, parent = self._canonical(tag), self._canonical(parent)
+            if parent not in self.parents.get(tag, ()):
+                return False
+            self._append([{"at": utcnow(), "host": self.host, "op": "unparent", "tag": tag, "parent": parent}])
+        return True
+
+    def dictionary(self) -> dict[str, dict[str, list[str]]]:
+        """使われているか辞書に出てくるタグごとの、別名・親・子（画面の一覧用）。"""
+        with self.lock:
+            self.reload_if_changed()
+            names = {t for tags in self.items.values() for t in tags} | set(self.aliases.values()) | set(self.parents)
+            names |= {p for ps in self.parents.values() for p in ps}
+            out: dict[str, dict[str, list[str]]] = {n: {"aliases": [], "parents": [], "children": []} for n in names}
+            for alias, canon in self.aliases.items():
+                out.setdefault(canon, {"aliases": [], "parents": [], "children": []})["aliases"].append(alias)
+            for child, ps in self.parents.items():
+                for parent in ps:
+                    out[child]["parents"].append(parent)
+                    out[parent]["children"].append(child)
+            for d in out.values():
+                for k in d:
+                    d[k].sort()
+            return out
+
+    # --- 型付きの属性（F-MD-4） ---
+
+    def define_attr(self, name: str, type_: str, choices: Sequence[str] = ()) -> AttrDef:
+        """属性を定義する（同じ名前なら定義し直す）。択一は選択肢が2つ以上要る。"""
+        name = normalize_tag(name)
+        if type_ not in ATTR_TYPES:
+            raise TagError(f"属性の型は {', '.join(ATTR_TYPES)} のどれかです: {type_}")
+        opts = tuple(dict.fromkeys(" ".join(unicodedata.normalize("NFC", c).split()) for c in choices if str(c).strip()))
+        if type_ == "choice" and len(opts) < 2:
+            raise TagError(f"択一の属性には、選択肢が2つ以上要ります: {name}")
+        d = AttrDef(name, type_, opts if type_ == "choice" else ())
+        with self.lock:
+            self.reload_if_changed()
+            if self.attr_defs.get(name) == d:
+                return d
+            self._append([{"at": utcnow(), "host": self.host, "op": "attr-def", **d.to_dict()}])
+        return d
+
+    def undefine_attr(self, name: str) -> int:
+        """属性の定義を消す（付いた値もすべて外れる）。値が付いていたアイテムの数を返す。"""
+        name = normalize_tag(name)
+        with self.lock:
+            self.reload_if_changed()
+            if name not in self.attr_defs:
+                return 0
+            n = sum(1 for vals in self.attrs.values() if name in vals)
+            self._append([{"at": utcnow(), "host": self.host, "op": "attr-undef", "name": name}])
+        return n
+
+    def attr_defs_list(self) -> list[dict[str, Any]]:
+        """属性の定義の一覧（名前順）と、値が直接付いているアイテムの数。"""
+        with self.lock:
+            self.reload_if_changed()
+            counts = Counter(n for vals in self.attrs.values() for n in vals)
+            return [{**d.to_dict(), "count": counts.get(d.name, 0)} for d in sorted(self.attr_defs.values(), key=lambda d: d.name)]
+
+    def set_attr(self, root: str, paths: Iterable[str], name: str, value: Any, source: str = "manual") -> int:
+        """属性の値を付ける（同じ名前の値は置き換わる。択一に2つの値が付くことは無い）。変えた件数を返す。"""
+        name = normalize_tag(name)
+        now = utcnow()
+        with self.lock:
+            self.reload_if_changed()
+            d = self.attr_defs.get(name)
+            if d is None:
+                raise TagError(f"定義されていない属性です: {name}")
+            v = parse_attr_value(d, value)
+            events = [
+                {"at": now, "host": self.host, "op": "attr-set", "root": root, "path": p, "name": name, "value": v, "source": source}
+                for p in dict.fromkeys(paths)
+                if (cur := self.attrs.get((root, p), {}).get(name)) is None or cur.value != v
+            ]
+            self._append(events)
+        return len(events)
+
+    def unset_attr(self, root: str, paths: Iterable[str], name: str) -> int:
+        """属性の値を外す（直接付いたものだけ）。外した件数を返す。"""
+        name = normalize_tag(name)
+        now = utcnow()
+        with self.lock:
+            self.reload_if_changed()
+            events = [
+                {"at": now, "host": self.host, "op": "attr-unset", "root": root, "path": p, "name": name}
+                for p in dict.fromkeys(paths)
+                if name in self.attrs.get((root, p), {})
+            ]
+            self._append(events)
+        return len(events)
+
+    def attrs_of(self, root: str, path: str) -> dict[str, list[dict[str, Any]]]:
+        """アイテムの属性。直接付いたもの（direct）と、祖先のフォルダから継承したもの（inherited。近い方が優先）。"""
+        with self.lock:
+            self.reload_if_changed()
+            direct = {v.name: v for v in self.attrs.get((root, path), {}).values()}
+            inherited: dict[str, dict[str, Any]] = {}
+            for anc in _ancestors(path):  # ルートから近い順に上書きしていくので、最後は最も近い祖先の値
+                for v in self.attrs.get((root, anc), {}).values():
+                    if v.name not in direct:
+                        inherited[v.name] = {"name": v.name, "value": v.value, "from": anc}
+            return {
+                "direct": [{"name": v.name, "value": v.value, "source": v.source} for v in sorted(direct.values(), key=lambda v: v.name)],
+                "inherited": [inherited[k] for k in sorted(inherited)],
+            }
+
+    def attr_paths(self, root: str) -> dict[str, dict[str, Any]]:
+        """ルートの中で、属性が直接付いたアイテム（相対パス → {名前 → 値}）。検索で継承を計算するのに使う。"""
+        with self.lock:
+            self.reload_if_changed()
+            return {p: {v.name: v.value for v in vals.values()} for (r, p), vals in self.attrs.items() if r == root}
+
+    # --- 保存した検索（F-SE-5） ---
+
+    def save_search(self, name: str, query: str) -> None:
+        """検索の条件を名前を付けて保存する（同じ名前なら置き換える）。"""
+        name = normalize_tag(name)
+        query = query.strip().lstrip("?")
+        if not query:
+            raise TagError("保存する条件が空です")
+        with self.lock:
+            self.reload_if_changed()
+            if self.searches.get(name) == query:
+                return
+            self._append([{"at": utcnow(), "host": self.host, "op": "search-save", "name": name, "query": query}])
+
+    def delete_search(self, name: str) -> bool:
+        """保存した検索を消す。消したら True。"""
+        name = normalize_tag(name)
+        with self.lock:
+            self.reload_if_changed()
+            if name not in self.searches:
+                return False
+            self._append([{"at": utcnow(), "host": self.host, "op": "search-delete", "name": name}])
+        return True
+
+    def saved_searches(self) -> list[dict[str, str]]:
+        """保存した検索の一覧（名前順）。"""
+        with self.lock:
+            self.reload_if_changed()
+            return [{"name": n, "query": q} for n, q in sorted(self.searches.items())]
+
+    # --- タグでの絞り込み ---
+
+    def tagged_paths(self, root: str, implied: bool = False) -> dict[str, set[str]]:
+        """ルートの中で、タグごとに直接付いているアイテムの相対パス（検索用）。
+
+        implied なら、子のタグが付いたアイテムを親のタグにも含める（親子。F-MD-3）。
+        """
         with self.lock:
             self.reload_if_changed()
             out: dict[str, set[str]] = {}
@@ -344,12 +787,17 @@ class TagStore:
                 if r == root:
                     for tag in tags:
                         out.setdefault(tag, set()).add(path)
+            if implied:
+                for tag, paths in list(out.items()):
+                    for anc in self._ancestors_of(tag):
+                        out.setdefault(anc, set()).update(paths)
             return out
 
     # --- 問い合わせ ---
 
     def tags_of(self, root: str, path: str) -> dict[str, list[dict[str, str]]]:
-        """アイテムのタグ。直接付いたもの（direct）と、祖先のフォルダから継承したもの（inherited）。"""
+        """アイテムのタグ。直接付いたもの（direct）、祖先のフォルダから継承したもの（inherited）、
+        親子から成り立つもの（implied。どのタグからか via を添える）。"""
         with self.lock:
             self.reload_if_changed()
             direct = [
@@ -360,7 +808,13 @@ class TagStore:
             for anc in _ancestors(path):
                 for a in sorted(self.items.get((root, anc), {}).values(), key=lambda a: a.tag):
                     inherited.append({"tag": a.tag, "from": anc})
-            return {"direct": direct, "inherited": inherited}
+            have = {x["tag"] for x in direct} | {x["tag"] for x in inherited}
+            implied: dict[str, str] = {}
+            for t in sorted(have):
+                for anc in sorted(self._ancestors_of(t)):
+                    if anc not in have and anc not in implied:
+                        implied[anc] = t
+            return {"direct": direct, "inherited": inherited, "implied": [{"tag": k, "via": v} for k, v in sorted(implied.items())]}
 
     def all_tags(self) -> Counter[str]:
         """使われているタグと、直接付いている件数。"""
@@ -373,6 +827,7 @@ class TagStore:
         tag = normalize_tag(tag)
         with self.lock:
             self.reload_if_changed()
+            tag = self._canonical(tag)
             return sorted(k for k, tags in self.items.items() if tag in tags and (root is None or k[0] == root))
 
     def tagged_under(self, root: str, path: str) -> dict[str, list[str]]:

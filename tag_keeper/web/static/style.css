@@ -325,3 +325,21 @@ tr.clickable:hover td { background: var(--bg); }
 /* ドラッグで移動するときのドロップ先 */
 tr[draggable="true"] { cursor: grab; }
 .drop-over, tr.drop-over td { background: var(--ok-bg) !important; outline: 2px dashed var(--ok); outline-offset: -2px; }
+
+/* 親子から成り立つタグ（点線）と、属性の札（色違い） */
+.chip.implied { border-style: dashed; opacity: .8; }
+.chip.attr { background: var(--ok-bg); border-color: transparent; }
+.chip.attr.inherited { opacity: .75; }
+/* タグの一覧の、別名・親の補足 */
+.tag-extra { display: block; font-weight: normal; }
+/* 属性の編集の欄（名前・入力・継承の元を1行に） */
+.attr-editor { display: grid; gap: .35rem; margin: .4rem 0; }
+.attr-row { display: flex; align-items: center; gap: .5rem; flex-wrap: wrap; }
+.attr-row .attr-name { min-width: 7em; font-weight: 600; }
+.folder-attrs { margin-top: .5rem; }
+/* 検索の絞り込みの欄・大きさの入力・同じ内容の一覧・今は無いもの */
+details.narrow > summary { cursor: pointer; margin: .25rem 0; }
+.size-input { width: 6.5em; }
+details.copies { margin-top: .2rem; }
+details.copies ul { margin: .2rem 0 0 1rem; padding: 0; }
+tr.gone td { opacity: .7; }

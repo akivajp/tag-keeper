@@ -130,9 +130,116 @@ def test_detach_and_attach_keep_the_source(tmp_path: Path) -> None:
     store.add("r", ["other"], "z")
     detached = store.detach_under("r", "d")
     assert detached == {"d": [["x", "manual"]], "d/f.pdf": [["y", "suggested"]]}
-    assert store.tags_of("r", "d/f.pdf") == {"direct": [], "inherited": []}
+    assert store.tags_of("r", "d/f.pdf") == {"direct": [], "inherited": [], "implied": []}
     assert store.attach("r", detached) == 2
     assert store.tags_of("r", "d/f.pdf")["direct"] == [{"tag": "y", "source": "suggested"}]
     # ログから読み直しても同じ
     again = TagStore(tmp_path / "tags", host="a")
     assert again.tags_of("r", "d")["direct"] == [{"tag": "x", "source": "manual"}]
+
+
+# ---------- タグの辞書（別名・親子）・型付きの属性・保存した検索 ----------
+
+
+def test_aliases_are_folded_into_the_canonical_name(tmp_path: Path) -> None:
+    """別名で付けても探しても、正式な名前になる。既に使われていた名前を別名にすると、正式な名前にまとまる。"""
+    from tag_keeper.tags import search
+
+    store = TagStore(tmp_path / "tags", host="a")
+    store.add("r", ["a.pdf"], "会社:ATID")
+    store.add("r", ["b.pdf"], "会社:アティード")
+    store.add_alias("会社:アティード", "会社:ATID")  # 既に使われている名前を別名にする
+    assert store.all_tags() == {"会社:アティード": 2}
+    assert store.canonical(" 会社 : ATID ") == "会社:アティード"
+    assert store.add("r", ["c.pdf"], "会社:ATID") == 1
+    assert store.tags_of("r", "c.pdf")["direct"][0]["tag"] == "会社:アティード"
+    tagged = store.tagged_paths("r", implied=True)
+    hits = search([("a.pdf", False), ("b.pdf", False), ("c.pdf", False)], tagged, [store.canonical("会社:ATID")])
+    assert hits == ["a.pdf", "b.pdf", "c.pdf"]
+    with pytest.raises(TagError):
+        store.add_alias("会社:アティード", "会社:アティード")
+    # ログから読み直しても同じ。別名の登録は外せる
+    again = TagStore(tmp_path / "tags", host="a")
+    assert again.dictionary()["会社:アティード"]["aliases"] == ["会社:ATID"]
+    assert again.remove_alias("会社:ATID") and again.canonical("会社:ATID") == "会社:ATID"
+
+
+def test_parent_tags_are_implied_and_cycles_are_refused(tmp_path: Path) -> None:
+    from tag_keeper.tags import search
+
+    store = TagStore(tmp_path / "tags", host="a")
+    store.add_parent("種別:請求書", "種別:経理")
+    store.add_parent("種別:経理", "種別:書類")
+    store.add("r", ["inv.pdf"], "種別:請求書")
+    store.add("r", ["memo.txt"], "種別:メモ")
+    implied = store.tags_of("r", "inv.pdf")["implied"]
+    assert implied == [{"tag": "種別:書類", "via": "種別:請求書"}, {"tag": "種別:経理", "via": "種別:請求書"}]
+    entries = [("inv.pdf", False), ("memo.txt", False)]
+    assert search(entries, store.tagged_paths("r", implied=True), ["種別:書類"]) == ["inv.pdf"]
+    assert search(entries, store.tagged_paths("r"), ["種別:書類"]) == []  # 広げないとき
+    with pytest.raises(TagError):
+        store.add_parent("種別:書類", "種別:請求書")  # 循環
+    # タグの名前を変えると、親子の中の名前も変わる。消すと親子も消える
+    store.rename_tag("種別:経理", "種別:会計")
+    assert store.dictionary()["種別:請求書"]["parents"] == ["種別:会計"]
+    store.delete_tag("種別:会計")
+    assert store.tags_of("r", "inv.pdf")["implied"] == []
+
+
+def test_typed_attributes(tmp_path: Path) -> None:
+    """択一には値が1つだけ付き、型に合わない値は断る。フォルダの値は配下が継承し、移動に追従する。"""
+    store = TagStore(tmp_path / "tags", host="a")
+    store.define_attr("対応状態", "choice", ["未対応", "対応中", "対応済み"])
+    store.define_attr("要対応", "flag")
+    store.define_attr("期限", "date")
+    store.define_attr("金額", "number")
+    store.define_attr("取引先", "text")
+    store.set_attr("r", ["case/a.pdf"], "対応状態", "未対応")
+    store.set_attr("r", ["case/a.pdf"], "対応状態", "対応中")  # 置き換わる（2つの値は付かない）
+    store.set_attr("r", ["case/a.pdf"], "金額", "12,345")
+    store.set_attr("r", ["case"], "取引先", " 株式会社  アティード ")
+    store.set_attr("r", ["case"], "要対応", True)
+    attrs = store.attrs_of("r", "case/a.pdf")
+    assert attrs["direct"] == [
+        {"name": "対応状態", "value": "対応中", "source": "manual"},
+        {"name": "金額", "value": 12345, "source": "manual"},
+    ]
+    assert attrs["inherited"] == [
+        {"name": "取引先", "value": "株式会社 アティード", "from": "case"},
+        {"name": "要対応", "value": True, "from": "case"},
+    ]
+    for name, bad in (("対応状態", "保留"), ("期限", "2026/13/01"), ("金額", "たくさん"), ("要対応", "no"), ("未定義", 1)):
+        with pytest.raises(TagError):
+            store.set_attr("r", ["case/a.pdf"], name, bad)
+    with pytest.raises(TagError):
+        store.define_attr("区分", "choice", ["一つだけ"])
+    store.follow_moves("r", [("case", "done/case")])
+    assert store.attrs_of("r", "done/case/a.pdf")["direct"][0]["value"] == "対応中"
+    # ログから読み直しても同じ。定義を消すと値も外れる
+    again = TagStore(tmp_path / "tags", host="a")
+    assert {d["name"]: d["count"] for d in again.attr_defs_list()}["金額"] == 1
+    assert again.undefine_attr("金額") == 1
+    assert [v["name"] for v in again.attrs_of("r", "done/case/a.pdf")["direct"]] == ["対応状態"]
+
+
+def test_attributes_of_quarantined_items_come_back_with_undo(tmp_path: Path) -> None:
+    store = TagStore(tmp_path / "tags", host="a")
+    store.define_attr("対応状態", "choice", ["未対応", "対応済み"])
+    store.set_attr("r", ["d/x.pdf"], "対応状態", "対応済み")
+    detached = store.detach_attrs_under("r", "d")
+    assert detached == {"d/x.pdf": [["対応状態", "対応済み", "manual"]]}
+    assert store.attrs_of("r", "d/x.pdf")["direct"] == []
+    assert store.attach_attrs("r", detached) == 1
+    assert store.attrs_of("r", "d/x.pdf")["direct"][0]["value"] == "対応済み"
+
+
+def test_saved_searches(tmp_path: Path) -> None:
+    store = TagStore(tmp_path / "tags", host="a")
+    store.save_search("要対応の書類", "?attr=要対応&kind=document")
+    store.save_search("請求書", "text=請求書")
+    store.save_search("請求書", "text=請求書&kind=pdf")  # 同じ名前は置き換える
+    assert store.saved_searches() == [{"name": "要対応の書類", "query": "attr=要対応&kind=document"}, {"name": "請求書", "query": "text=請求書&kind=pdf"}]
+    assert store.delete_search("請求書") and not store.delete_search("請求書")
+    assert [s["name"] for s in TagStore(tmp_path / "tags", host="b").saved_searches()] == ["要対応の書類"]
+    with pytest.raises(TagError):
+        store.save_search("空", "  ")

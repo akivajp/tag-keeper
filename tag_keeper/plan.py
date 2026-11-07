@@ -801,6 +801,7 @@ def _quarantine_one(
         _append(journal, {"event": "skip", "path": op.path, "detail": outcome.detail})
         return outcome
     detached = tags.detach_under(plan.root, op.path) if tags is not None else {}
+    detached_attrs = tags.detach_attrs_under(plan.root, op.path) if tags is not None else {}
     _append(
         journal,
         {
@@ -813,6 +814,7 @@ def _quarantine_one(
             "dst": str(dst),
             "gone_at": gone_at,
             **({"tags": detached} if detached else {}),
+            **({"attrs": detached_attrs} if detached_attrs else {}),
         },
     )
     where, args = _subtree_sql(op.path)
@@ -840,8 +842,9 @@ class Restorable:
     quarantine: Path  # このプランの隔離先（<quarantine_dir>/<プラン ID>）
     kind: str = ACTION_QUARANTINE  # quarantine（隔離から戻す） / move（移動・改名を戻す）
     dest: str = ""  # 移動・改名の移動先（ルートからの相対パス）
-    # 隔離のときに外したタグ（相対パス → [タグ, 出所] の一覧）。戻したら付け直す
+    # 隔離のときに外したタグ（相対パス → [タグ, 出所] の一覧）と属性（相対パス → [名前, 値, 出所] の一覧）。戻したら付け直す
     tags: dict[str, list[list[str]]] = field(default_factory=dict)
+    attrs: dict[str, list[list[Any]]] = field(default_factory=dict)
 
 
 def pending_restores(journal: Path) -> list[Restorable]:
@@ -868,6 +871,7 @@ def pending_restores(journal: Path) -> list[Restorable]:
                 gone_at=rec["gone_at"],
                 quarantine=quarantine,
                 tags=rec.get("tags") or {},
+                attrs=rec.get("attrs") or {},
             )
         elif event == "move":
             moved[rec["path"]] = Restorable(
@@ -952,6 +956,8 @@ def undo_plan(
             _append(journal, {"event": "restore", "path": it.path})
             if tags is not None and it.tags:
                 tags.attach(it.root, it.tags)
+            if tags is not None and it.attrs:
+                tags.attach_attrs(it.root, it.attrs)
             where, args = _subtree_sql(it.path)
             now = utcnow()
             with conn:

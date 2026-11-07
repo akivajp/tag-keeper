@@ -273,6 +273,13 @@ def text_match_sql(conn: sqlite3.Connection, terms: list[str]) -> tuple[str, lis
     return "SELECT x.sha256 FROM extracts x WHERE " + " AND ".join(conds or ["0"]), args
 
 
+def _day_start_ns(day: str) -> int:
+    """YYYY-MM-DD の日の始まり（この端末の時刻の 0 時）を、ナノ秒の UNIX 時刻にする。不正なら ValueError。"""
+    import datetime as dt
+
+    return int(dt.datetime.combine(dt.date.fromisoformat(day.strip()), dt.time()).timestamp()) * 1_000_000_000
+
+
 def find_entries(
     conn: sqlite3.Connection,
     root_id: int,
@@ -281,8 +288,14 @@ def find_entries(
     text: str = "",
     kind: str = "",
     files_only: bool = True,
+    under: str = "",
+    after: str = "",
+    before: str = "",
+    min_size: int | None = None,
+    max_size: int | None = None,
+    gone: bool = False,
 ) -> list[sqlite3.Row]:
-    """名前・パス・本文・種類で、存在中のアイテムを探す（タグでの絞り込みは呼び出し側で行う）。
+    """名前・パス・本文・種類・場所・日付・大きさで、アイテムを探す（タグと属性での絞り込みは呼び出し側で行う）。
 
     Args:
         conn: カタログへの接続。
@@ -291,27 +304,66 @@ def find_entries(
         text: 本文に含む語（空白区切りで、すべて含むもの）。
         kind: 種類（KINDS のキー）。指定するとファイルだけを返す。
         files_only: フォルダを除くか。
+        under: このフォルダの配下だけ（ルートからの相対パス。"" はすべて）。
+        after: この日（YYYY-MM-DD、この端末の時刻）以降に更新されたものだけ。
+        before: この日（を含む）までに更新されたものだけ。
+        min_size: これ以上の大きさ（バイト）のファイルだけ。
+        max_size: これ以下の大きさのファイルだけ。
+        gone: 今は無いもの（消えた・動いた前のパス）も含める（F-VS-4）。今あるパスと同じものは除き、同じパスは最後の記録だけ。
 
     Returns:
-        relpath・is_dir・size・mtime_ns・sha256 を持つ行（パスの順）。
+        relpath・is_dir・size・mtime_ns・sha256・gone_at を持つ行（パスの順）。
     """
-    sql = "SELECT relpath, is_dir, size, mtime_ns, sha256 FROM entries WHERE root_id = ? AND gone_at IS NULL"
+    sql = "SELECT relpath, is_dir, size, mtime_ns, sha256, gone_at FROM entries WHERE root_id = ?"
     args: list[Any] = [root_id]
-    if files_only or kind or text.strip():
+    if not gone:
+        sql += " AND gone_at IS NULL"
+    if files_only or kind or text.strip() or min_size is not None or max_size is not None:
         sql += " AND is_dir = 0"
     for w in words:
         # パスの表記は NFC のまま比べる（ファイル名を NFKC にすると、元の名前と食い違うため）
         sql += " AND relpath LIKE ? ESCAPE '\\'"
         args.append(f"%{_like_escape(unicodedata.normalize('NFC', w))}%")
+    if under:
+        # LIKE は % や _ を含むフォルダ名で誤るので、先頭の部分文字列で比べる
+        sql += " AND (relpath = ? OR substr(relpath, 1, ?) = ?)"
+        args.extend([under, len(under) + 1, under + "/"])
+    if after:
+        sql += " AND mtime_ns >= ?"
+        args.append(_day_start_ns(after))
+    if before:
+        import datetime as dt
+
+        next_day = (dt.date.fromisoformat(before.strip()) + dt.timedelta(days=1)).isoformat()
+        sql += " AND mtime_ns < ?"
+        args.append(_day_start_ns(next_day))
+    if min_size is not None:
+        sql += " AND size >= ?"
+        args.append(min_size)
+    if max_size is not None:
+        sql += " AND size <= ?"
+        args.append(max_size)
     terms = query_terms(text)
     if terms:
         sub, sub_args = text_match_sql(conn, terms)
         sql += f" AND sha256 IN ({sub})"
         args.extend(sub_args)
-    rows = conn.execute(sql + " ORDER BY relpath", args).fetchall()
+    rows = conn.execute(sql + " ORDER BY relpath, gone_at", args).fetchall()
     if kind:
         exts = KINDS.get(kind, frozenset())
         rows = [r for r in rows if ext_of(r["relpath"]) in exts]
+    if gone:
+        # 今あるパスはその行だけ。今は無いパスは、最後に消えた記録だけを残す
+        live = {r["relpath"] for r in rows if r["gone_at"] is None}
+        latest: dict[str, sqlite3.Row] = {}
+        for r in rows:
+            if r["gone_at"] is None or r["relpath"] in live:
+                continue
+            cur = latest.get(r["relpath"])
+            if cur is None or str(r["gone_at"]) > str(cur["gone_at"]):
+                latest[r["relpath"]] = r
+        rows = [r for r in rows if r["gone_at"] is None] + list(latest.values())
+        rows.sort(key=lambda r: r["relpath"])
     return rows
 
 

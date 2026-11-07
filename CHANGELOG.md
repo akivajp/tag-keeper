@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Tag aliases and parents.** An alias is folded into the real name when tagging and
+  searching (making a name in use an alias merges it); a parent tag finds every item with a
+  child tag. Manage both from the ⚙ button in the tag list; cycles are refused.
+- **Typed attributes**: choice (one value at a time), flag, date, number and text. Define them
+  on the Search page and set them on files and folders from the file browser and from search
+  results. Folder values are inherited; attributes follow moves and come back with undo.
+- **More search filters**: folder, modification date, size and attributes (`=`, `>=`, `<=`,
+  or "has a value"); identical files grouped into one row; files that are gone can be
+  included. "Open folder" in search results now opens the folder with the file selected.
+- **Saved searches**: save the current conditions under a name; they are listed with their
+  current counts at the top of the Search page.
+- All of these live in the per-machine tag logs as new kinds of lines; older versions skip
+  them.
+
 ## [0.11.0] - 2026-11-08
 
 ### Added

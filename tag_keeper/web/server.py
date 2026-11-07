@@ -632,6 +632,8 @@ def create_app(
             "snapshot": snapshot or None,
             "crumbs": crumbs,
             "tags": store.tags_of(rc.name, rel),
+            "attrs": store.attrs_of(rc.name, rel),
+            "attr_defs": store.attr_defs_list(),
             "entries": entries,
         }
 
@@ -693,6 +695,8 @@ def create_app(
             "first_seen": row["first_seen"] if row is not None else None,
             "same_content": same,
             "tags": settings.tags(config).tags_of(rc.name, rel),
+            "attrs": settings.tags(config).attrs_of(rc.name, rel),
+            "attr_defs": settings.tags(config).attr_defs_list(),
             "cloud_links": links.links(path, path.is_dir()) if (links := settings.cloud_links(rc)) is not None else [],
         }
 
@@ -737,8 +741,80 @@ def create_app(
 
     @app.route("/api/tags")
     def api_tags() -> dict[str, Any]:
+        """使われているタグ（件数・別名・親・子）と、属性の定義・保存した検索。"""
         store = settings.tags()
-        return {"tags": [{"tag": t, "count": n} for t, n in sorted(store.all_tags().items())]}
+        counts = store.all_tags()
+        dictionary = store.dictionary()
+        return {
+            "tags": [{"tag": t, "count": counts.get(t, 0), **dictionary.get(t, {})} for t in sorted(set(counts) | set(dictionary))],
+            "aliases": {a: c for c, d in dictionary.items() for a in d.get("aliases", [])},
+            "attrs": store.attr_defs_list(),
+            "searches": store.saved_searches(),
+        }
+
+    @app.post("/api/tags/alias")
+    def api_tags_alias() -> dict[str, Any]:
+        """別名を登録する（op=add）・外す（op=remove）。既に使われている名前を別名にすると、正式な名前に統合する。"""
+        data = body()
+        store = settings.tags()
+        if data.get("op") == "remove":
+            return {"removed": store.remove_alias(str(data.get("alias", "")))}
+        store.add_alias(str(data.get("tag", "")), str(data.get("alias", "")))
+        return {"tag": store.canonical(str(data.get("tag", "")))}
+
+    @app.post("/api/tags/parent")
+    def api_tags_parent() -> dict[str, Any]:
+        """親子を登録する（op=add。子が付けば親も成り立つ）・外す（op=remove）。"""
+        data = body()
+        store = settings.tags()
+        tag, parent = str(data.get("tag", "")), str(data.get("parent", ""))
+        if data.get("op") == "remove":
+            return {"removed": store.remove_parent(tag, parent)}
+        store.add_parent(tag, parent)
+        return {"tag": store.canonical(tag), "parent": store.canonical(parent)}
+
+    @app.post("/api/attrs/defs")
+    def api_attr_defs() -> dict[str, Any]:
+        """属性を定義する（op=add: name・type・choices）・定義を消す（op=remove。付いた値も外れる）。"""
+        data = body()
+        store = settings.tags()
+        if data.get("op") == "remove":
+            return {"changed": store.undefine_attr(str(data.get("name", "")))}
+        choices = data.get("choices") or []
+        if isinstance(choices, str):
+            choices = [c for c in re.split(r"[,、\n]", choices)]
+        d = store.define_attr(str(data.get("name", "")), str(data.get("type", "")), [str(c) for c in choices])
+        return {"attr": d.to_dict()}
+
+    @app.post("/api/attrs")
+    def api_attrs_edit() -> dict[str, Any]:
+        """属性の値を付ける（value を渡す）・外す（value が null か op=remove）。複数のアイテムにまとめて付けられる。"""
+        data = body()
+        config = settings.config()
+        rc = root_config(config, str(data.get("root", "")))
+        paths = [clean_relpath(str(p)) for p in data.get("paths") or []]
+        for rel in paths:
+            if not resolve_within(rc.path, rel).exists():
+                raise fail(404, f"ありません: {rel}")
+        store = settings.tags(config)
+        name = str(data.get("name", ""))
+        if data.get("op") == "remove" or data.get("value") is None:
+            return {"changed": store.unset_attr(rc.name, paths, name)}
+        return {"changed": store.set_attr(rc.name, paths, name, data.get("value"))}
+
+    @app.route("/api/searches")
+    def api_searches() -> dict[str, Any]:
+        return {"searches": settings.tags().saved_searches()}
+
+    @app.post("/api/searches")
+    def api_searches_edit() -> dict[str, Any]:
+        """検索の条件を保存する（op=save: name・query）・消す（op=delete）。"""
+        data = body()
+        store = settings.tags()
+        if data.get("op") == "delete":
+            return {"removed": store.delete_search(str(data.get("name", "")))}
+        store.save_search(str(data.get("name", "")), str(data.get("query", "")))
+        return {"searches": store.saved_searches()}
 
     @app.route("/api/tags/items")
     def api_tag_items() -> dict[str, Any]:
@@ -1042,8 +1118,9 @@ def create_app(
         rc = root_config(config, q.getunicode("root", "") or (config.roots[0].name if config.roots else ""))
         # getall() は値を latin-1 のまま返すので、UTF-8 に直した写しから読む（日本語のタグのため）
         uq = q.decode()
-        include = [x for x in uq.getall("tag") if x]
-        exclude = [x for x in uq.getall("not") if x]
+        # 別名は正式な名前にそろえる（親のタグは、子のタグが付いたものも含めて探す）
+        include = [settings.tags(config).canonical(x) for x in uq.getall("tag") if x]
+        exclude = [settings.tags(config).canonical(x) for x in uq.getall("not") if x]
         mode = "or" if q.get("mode") == "or" else "and"
         word = q.getunicode("q", "").strip().lower()
         files_only = q.get("folders") != "1"
@@ -1060,7 +1137,7 @@ def create_app(
             conn.close()
         info = {r["relpath"]: r for r in rows if not (files_only and r["is_dir"]) and (not word or word in r["relpath"].lower())}
         store = settings.tags(config)
-        hits = tags_search(((p, bool(info[p]["is_dir"])) for p in info), store.tagged_paths(rc.name), include, mode, exclude)
+        hits = tags_search(((p, bool(info[p]["is_dir"])) for p in info), store.tagged_paths(rc.name, implied=True), include, mode, exclude)
         return {
             "root": rc.name,
             "total": len(hits),
@@ -1078,39 +1155,80 @@ def create_app(
 
     @app.route("/api/search")
     def api_search() -> dict[str, Any]:
-        """名前・本文・種類・タグで探す（F-SE-1・F-SE-2）。条件はどう組み合わせてもよい（どれか1つは要る）。
+        """名前・本文・種類・場所・日付・大きさ・タグ・属性で探す（F-SE-1・2・4、F-VS-4）。どれか1つの条件が要る。
 
         問い合わせ: root、q（名前・フォルダに含む語。空白区切りで、すべて含むもの）、text（本文に含む語）、
-        kind（種類: KINDS のキー）、tag・not・mode（タグ。フォルダのタグは配下にも効く）、folders=1（フォルダも出す）、limit。
+        kind（種類: KINDS のキー）、under（このフォルダの配下）、after・before（更新日 YYYY-MM-DD）、min_size・max_size（バイト）、
+        tag・not・mode（タグ。別名は正式な名前に、親のタグは子のタグが付いたものも含む。フォルダのタグは配下にも効く）、
+        attr（属性。「名前」「名前=値」「名前>=値」など。フォルダの値は配下が継承する）、
+        gone=1（今は無いものも含める）、collapse=1（同じ内容のファイルを1件にまとめる）、folders=1（フォルダも出す）、limit。
         """
         # getall() などは値を latin-1 のまま返すので、UTF-8 に直した写しから読む（日本語の語とタグのため）
         uq = bottle.request.query.decode()
         config = settings.config()
         rc = root_config(config, uq.get("root", "") or (config.roots[0].name if config.roots else ""))
-        include = [x for x in uq.getall("tag") if x]
-        exclude = [x for x in uq.getall("not") if x]
+        store = settings.tags(config)
+        include = [store.canonical(x) for x in uq.getall("tag") if x]
+        exclude = [store.canonical(x) for x in uq.getall("not") if x]
         mode = "or" if uq.get("mode") == "or" else "and"
         words = uq.get("q", "").split()
         text = uq.get("text", "").strip()
         kind = uq.get("kind", "")
         if kind and kind not in KINDS:
             raise fail(400, f"種類が不正です: {kind}")
+        under = clean_relpath(uq.get("under", ""))
+        conds = [_parse_attr_cond(x) for x in uq.getall("attr") if x.strip()]
         files_only = uq.get("folders") != "1"
-        try:
-            limit = max(1, min(int(uq.get("limit", 500)), 5000))
-        except ValueError:
-            raise fail(400, "limit は数で指定してください") from None
-        if not (include or exclude or words or text or kind):
+
+        def number(key: str) -> int | None:
+            raw = uq.get(key, "").strip()
+            if not raw:
+                return None
+            try:
+                return int(float(raw))
+            except ValueError:
+                raise fail(400, f"{key} は数で指定してください") from None
+
+        limit = number("limit") or 500
+        limit = max(1, min(limit, 5000))
+        after, before = uq.get("after", "").strip(), uq.get("before", "").strip()
+        min_size, max_size = number("min_size"), number("max_size")
+        if not (include or exclude or words or text or kind or under or after or before or min_size is not None
+                or max_size is not None or conds):
             raise fail(400, "探す条件を入れてください")
         terms = query_terms(text)
         conn = open_db()
         try:
-            rows = find_entries(conn, root_id_of(conn, rc), words=words, text=text, kind=kind, files_only=files_only)
+            try:
+                rows = find_entries(
+                    conn, root_id_of(conn, rc), words=words, text=text, kind=kind, files_only=files_only, under=under,
+                    after=after, before=before, min_size=min_size, max_size=max_size, gone=uq.get("gone") == "1",
+                )
+            except ValueError as e:
+                raise fail(400, f"日付は YYYY-MM-DD で指定してください（{e}）") from None
+            paths = [r["relpath"] for r in rows]
             info = {r["relpath"]: r for r in rows}
-            store = settings.tags(config)
-            paths = list(info)
             if include or exclude:
-                paths = tags_search(((p, bool(info[p]["is_dir"])) for p in paths), store.tagged_paths(rc.name), include, mode, exclude)
+                paths = tags_search(((p, bool(info[p]["is_dir"])) for p in paths), store.tagged_paths(rc.name, implied=True), include, mode, exclude)
+            if conds:
+                defs = {d["name"]: d for d in store.attr_defs_list()}
+                values = store.attr_paths(rc.name)
+                paths = [p for p in paths if _attrs_match(p, conds, values, defs)]
+            # 同じ内容のファイルを1件にまとめる（最初のものを代表にし、ほかの場所を copies に入れる）
+            copies: dict[str, list[str]] = {}
+            if uq.get("collapse") == "1":
+                first: dict[str, str] = {}
+                kept: list[str] = []
+                for p in paths:
+                    sha = info[p]["sha256"]
+                    if sha and not info[p]["is_dir"] and info[p]["gone_at"] is None:
+                        if sha in first:
+                            copies[first[sha]].append(p)
+                            continue
+                        first[sha] = p
+                        copies[p] = []
+                    kept.append(p)
+                paths = kept
             shown = paths[:limit]
             snips = snippets(conn, [info[p]["sha256"] for p in shown if info[p]["sha256"]], terms) if terms else {}
         finally:
@@ -1125,7 +1243,10 @@ def create_app(
                     "size": info[path]["size"],
                     "mtime": info[path]["mtime_ns"] // 1_000_000_000,
                     "tags": store.tags_of(rc.name, path),
+                    "attrs": store.attrs_of(rc.name, path),
                     "snippet": snips.get(info[path]["sha256"] or "", ""),
+                    "gone_at": info[path]["gone_at"],
+                    "copies": copies.get(path, []),
                 }
                 for path in shown
             ],
@@ -1470,6 +1591,38 @@ def _plan_summary(info: Any) -> dict[str, Any]:
     d = asdict(info)
     d["file"] = str(info.file)
     return d
+
+
+_ATTR_COND = re.compile(r"^(.+?)(>=|<=|=|>|<)(.*)$")
+
+
+def _parse_attr_cond(raw: str) -> tuple[str, str, str]:
+    """属性の条件（「名前」「名前=値」「名前>=値」など）を（名前, 演算子, 値）にする。名前だけなら「付いている」。"""
+    m = _ATTR_COND.match(raw.strip())
+    if m is None:
+        return normalize_tag(raw), "exists", ""
+    return normalize_tag(m.group(1)), m.group(2), m.group(3).strip()
+
+
+def _attrs_match(path: str, conds: list[tuple[str, str, str]], values: dict[str, dict[str, Any]], defs: dict[str, dict[str, Any]]) -> bool:
+    """アイテムの属性（自身に無ければ、近い祖先のフォルダの値を継承）が、すべての条件に合うか。"""
+    from tag_keeper.tags import AttrDef, match_attr
+
+    for name, op, want in conds:
+        value = None
+        p = path
+        while True:
+            v = values.get(p, {})
+            if name in v:
+                value = v[name]
+                break
+            if not p:
+                break
+            p = p.rsplit("/", 1)[0] if "/" in p else ""
+        d = defs.get(name)
+        if not match_attr(AttrDef(name, d["type"], tuple(d["choices"])) if d else None, value, op, want):
+            return False
+    return True
 
 
 # ルートに対する処理の題名（画面の英語表示は i18n.js の辞書で訳す）

@@ -195,10 +195,23 @@ and the theme (system, light or dark).
   works without word splitting; one- and two-letter words are searched without the index),
   and the matches are highlighted in the results. Rebuildable folders such as `node_modules`
   and application data are left out.
+- **Narrow it down** by folder, modification date, size and attributes; group identical
+  files into one row (the other places are listed under it); include files that are gone —
+  deleted, or moved away from that path — which link to the version history. **Save** any set
+  of conditions under a name: saved searches sit at the top of the page with their current
+  counts, as work lists.
 - **Find and manage tags** on the same page: filter the tag list, search with several tags
   (all of them or any of them, minus excluded ones) — tags on a folder count for everything
   inside — and rename a tag everywhere (renaming onto an existing tag merges the two) or
   delete it. Results show a preview of the picked file.
+- **Tag aliases and parents.** An alias (`company:ATID` for `company:Atid`) is folded into the
+  real name when you tag and when you search; making a name that is already in use an alias
+  merges it. A parent (`type:invoice` → `type:accounting`) makes every item with the child
+  tag show up when you search for the parent; cycles are refused.
+- **Typed attributes.** Define attributes once — a choice (`status`: to do / doing / done), a
+  flag, a date, a number or text — and set them on files and folders from the file browser or
+  from search results. A choice holds a single value, values set on a folder are inherited by
+  everything inside it, and attributes follow moves and come back with undo, like tags.
 - **Version history** comes from btrfs snapshots through
   [btrfs-timeline](https://github.com/akivajp/btrfs-timeline): the versions of a file, a
   folder as it was at any snapshot (including what has since been deleted), and restoring

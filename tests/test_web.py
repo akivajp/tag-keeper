@@ -583,3 +583,70 @@ def test_purge_from_the_web(env: dict) -> None:
     assert plan["info"]["state"] == "purged" and plan["restorable"] == 0 and plan["purgeable"] == 0
     assert plan["ops"][0]["outcome"]["event"] == "purge"
     app.post_json(f"/api/plans/{plan_id}/purge", {}, headers={"Origin": f"http://{HOST}"}, status=409)
+
+
+# ---------- タグの辞書・属性・検索の絞り込み・保存した検索（0.12） ----------
+
+
+def test_search_filters_attributes_dictionary_and_saved_searches(env: dict) -> None:
+    import os
+
+    app, root = env["app"], env["root"]
+    origin = {"Origin": f"http://{HOST}"}
+    write(root / "case" / "a.pdf", "A" * 100)
+    write(root / "case" / "copy-of-a.pdf", "A" * 100)  # 同じ内容
+    write(root / "case" / "big.bin", "B" * 5000)
+    write(root / "other" / "old.txt", "old")
+    os.utime(root / "other" / "old.txt", (1_600_000_000, 1_600_000_000))  # 2020-09-13
+    write(root / "gone.txt", "will be deleted")
+    run_job(env, "/api/roots/data/refresh")
+
+    def find(**params: object) -> list[str]:
+        return [x["path"] for x in app.get("/api/search", params).json["items"]]
+
+    # 場所・大きさ・日付
+    assert find(under="case") == ["case/a.pdf", "case/big.bin", "case/copy-of-a.pdf"]
+    assert find(under="case", min_size=1000) == ["case/big.bin"]
+    assert find(under="case", max_size=200) == ["case/a.pdf", "case/copy-of-a.pdf"]
+    assert find(before="2021-01-01") == ["other/old.txt"]
+    assert "other/old.txt" not in find(after="2021-01-01")
+    app.get("/api/search", {"after": "2021/01/01"}, status=400)
+    # 同じ内容をまとめる
+    res = app.get("/api/search", {"under": "case", "collapse": "1"}).json
+    assert [(x["path"], x["copies"]) for x in res["items"]] == [("case/a.pdf", ["case/copy-of-a.pdf"]), ("case/big.bin", [])]
+
+    # 属性: 定義して、フォルダに付けた値は配下が継承する
+    app.post_json("/api/attrs/defs", {"name": "対応状態", "type": "choice", "choices": "未対応, 対応中、対応済み"}, headers=origin)
+    app.post_json("/api/attrs/defs", {"name": "金額", "type": "number"}, headers=origin)
+    app.post_json("/api/attrs", {"root": "data", "paths": ["case"], "name": "対応状態", "value": "対応中"}, headers=origin)
+    app.post_json("/api/attrs", {"root": "data", "paths": ["case/big.bin"], "name": "金額", "value": "20000"}, headers=origin)
+    app.post_json("/api/attrs", {"root": "data", "paths": ["case/a.pdf"], "name": "対応状態", "value": "保留"}, headers=origin, status=400)
+    assert find(attr="対応状態=対応中") == ["case/a.pdf", "case/big.bin", "case/copy-of-a.pdf"]
+    assert find(attr=["対応状態=対応中", "金額>=10000"]) == ["case/big.bin"]
+    assert find(attr="金額") == ["case/big.bin"]
+    info = app.get("/api/info", {"root": "data", "path": "case/a.pdf"}).json
+    assert info["attrs"]["inherited"] == [{"name": "対応状態", "value": "対応中", "from": "case"}]
+    assert {d["name"] for d in info["attr_defs"]} == {"対応状態", "金額"}
+
+    # タグの辞書: 別名で探しても、親のタグで探しても見つかる
+    app.post_json("/api/tags", {"root": "data", "paths": ["case/a.pdf"], "tag": "種別:請求書", "op": "add"}, headers=origin)
+    app.post_json("/api/tags/alias", {"tag": "種別:請求書", "alias": "種別:invoice"}, headers=origin)
+    app.post_json("/api/tags/parent", {"tag": "種別:請求書", "parent": "種別:経理"}, headers=origin)
+    app.post_json("/api/tags/parent", {"tag": "種別:経理", "parent": "種別:請求書"}, headers=origin, status=400)
+    assert find(tag="種別:invoice") == ["case/a.pdf"]
+    assert find(tag="種別:経理") == ["case/a.pdf"]
+    tags = {t["tag"]: t for t in app.get("/api/tags").json["tags"]}
+    assert tags["種別:請求書"]["aliases"] == ["種別:invoice"] and tags["種別:経理"]["children"] == ["種別:請求書"]
+
+    # 今は無いもの（消えたパス）も探せる
+    (root / "gone.txt").unlink()
+    run_job(env, "/api/roots/data/refresh")
+    assert find(q="gone") == []
+    res = app.get("/api/search", {"q": "gone", "gone": "1"}).json
+    assert [x["path"] for x in res["items"]] == ["gone.txt"] and res["items"][0]["gone_at"]
+
+    # 検索の条件を保存して、一覧に出す
+    app.post_json("/api/searches", {"name": "対応中", "query": "attr=対応状態%3D対応中"}, headers=origin)
+    assert app.get("/api/tags").json["searches"] == [{"name": "対応中", "query": "attr=対応状態%3D対応中"}]
+    app.post_json("/api/searches", {"name": "対応中", "op": "delete"}, headers=origin)
+    assert app.get("/api/searches").json["searches"] == []
