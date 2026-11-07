@@ -107,6 +107,7 @@ const STATE_LABELS = {
   'partially-undone': ['一部を取り消し', 'warn'],
   undone: ['取り消し済み', ''],
   interrupted: ['途中で停止', 'danger'],
+  purged: ['隔離を空にした', ''],
 };
 
 function stateBadge(state) {
@@ -505,8 +506,10 @@ async function pagePlans(main) {
     h('td', { class: 'num' }, num(p.ops)),
     h('td', { class: 'num' }, size(p.size)),
     h('td', { class: 'num hide-narrow' }, p.quarantined ? t('{n} 件・{size}', { n: num(p.quarantined), size: size(p.quarantined_size) }) : '-')));
+  const quarantined = st.plans.reduce((a, p) => a + (p.quarantined_size || 0), 0);
   setChildren(main, 
     h('h1', {}, 'プラン'),
+    quarantined ? h('p', { class: 'muted' }, t('隔離フォルダには合計 {size} があります。プランを開くと、取り消すか、隔離を空にできます。', { size: size(quarantined) })) : null,
     st.plans.length ? h('div', { class: 'card table-wrap' }, h('table', {},
       h('thead', {}, h('tr', {}, h('th', {}, 'ID'), h('th', {}, 'ルート名'), h('th', {}, '状態'), h('th', { class: 'num' }, '件数'), h('th', { class: 'num' }, '容量'), h('th', { class: 'num hide-narrow' }, '隔離中'))),
       h('tbody', {}, rows)))
@@ -575,6 +578,7 @@ async function pagePlan(main, id) {
       const map = {
         quarantine: ['隔離済み', 'ok'], skip: [t('飛ばした: {detail}', { detail: translateString(o.detail) }), 'warn'],
         restore: ['元に戻した', ''], 'restore-skip': [t('戻せなかった: {detail}', { detail: translateString(o.detail) }), 'danger'],
+        purge: ['完全に削除した', ''], 'purge-skip': [t('消せなかった: {detail}', { detail: translateString(o.detail) }), 'danger'],
       };
       const [label, kind] = map[o.event] || [o.event, ''];
       return h('span', { class: `badge ${kind}` }, label);
@@ -652,6 +656,20 @@ async function pagePlan(main, id) {
     if (ok) startJob(`/api/plans/${enc(id)}/undo`);
   }
 
+  /** 隔離したものを完全に消す。元に戻せないことを示し、承認されたときだけ実行する。 */
+  async function doPurge() {
+    const body = [
+      h('p', {}, h('strong', {}, t('隔離した {n} 件（{size}）を完全に削除します。', { n: num(data.purgeable), size: size(data.purgeable_size) }))),
+      h('ul', {},
+        h('li', {}, '削除したものは、この画面からは元に戻せません。このプランの取り消しもできなくなります。'),
+        h('li', {}, t('対象: {path}', { path: `${app.state?.quarantine_dir || ''}/${id}/` })),
+        h('li', {}, app.state?.snapper_config
+          ? t('削除の前後にスナップショットを撮ります（snapper: {config}）。スナップショットが残っている間は、そこから手作業で取り出せますが、ディスクの容量もその間は戻りません。', { config: app.state.snapper_config })
+          : 'スナップショットは撮りません。削除したものは取り出せません。')),
+    ];
+    if (await confirmDialog('隔離を空にしますか？', body, '完全に削除する', true)) startJob(`/api/plans/${enc(id)}/purge`);
+  }
+
   async function doDelete() {
     if (await confirmDialog('プランを削除しますか？', h('p', {}, 'プランのファイルを消します。ファイル自体には何もしません。'), '削除する', true)) {
       try { await api(`/api/plans/${enc(id)}/delete`, {}); location.hash = '#/plans'; }
@@ -685,6 +703,7 @@ async function pagePlan(main, id) {
       editable ? h('button', { disabled: busy, onclick: () => startJob(`/api/plans/${enc(id)}/check`) }, '変わっていないか確認') : null,
       editable ? h('button', { class: 'primary', disabled: busy, onclick: doApply }, '実行する…') : null,
       data.restorable ? h('button', { disabled: busy, onclick: doUndo }, t('取り消す（{n} 件）…', { n: num(data.restorable) })) : null,
+      data.purgeable ? h('button', { class: 'danger', disabled: busy, onclick: doPurge }, t('隔離を空にする（{size}）…', { size: size(data.purgeable_size) })) : null,
       editable ? h('button', { class: 'secondary', disabled: busy, onclick: doDelete }, 'プランを削除') : null),
     syncNote,
     h('div', { class: 'toolbar' },

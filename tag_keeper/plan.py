@@ -19,7 +19,7 @@ import os
 import re
 import sqlite3
 import subprocess
-from collections.abc import Iterator, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -883,7 +883,8 @@ def pending_restores(journal: Path) -> list[Restorable]:
                 kind=ACTION_MOVE,
                 dest=rec["dest"],
             )
-        elif event == "restore":
+        elif event in ("restore", "purge"):
+            # 戻したもの・隔離を空にして消したものは、もう取り消しの対象ではない
             moved.pop(rec["path"], None)
     return list(reversed(moved.values()))
 
@@ -1043,6 +1044,134 @@ def force_resume_sync(plan_id: str, *, journal_dir: Path, sync: SyncGuard) -> No
     _append(journal, {"event": "sync-resume", "forced": True})
 
 
+# --- 隔離を空にする（F-PL-3） ---
+
+
+@dataclass
+class PurgeResult:
+    """隔離を空にした結果。"""
+
+    plan_id: str
+    removed: int = 0  # 消したもの（隔離した単位。フォルダは1件）
+    files: int = 0
+    size: int = 0
+    failed: list[tuple[str, str]] = field(default_factory=list)  # 消せなかったもの（パス, 理由）。取り消しの対象に残る
+    pre_snapshot: int | None = None
+    post_snapshot: int | None = None
+
+
+def purgeable(journal: Path) -> list[Restorable]:
+    """隔離フォルダに残っていて、空にできるもの（まだ取り消していない隔離）。実行記録が無ければ空。"""
+    if not journal.exists():
+        return []
+    return [r for r in pending_restores(journal) if r.kind == ACTION_QUARANTINE]
+
+
+def _inside(path: Path, base: Path) -> bool:
+    """path の実体（最後の要素はたどらない）が base の中にあるか。"""
+    parent = Path(os.path.realpath(path.parent))
+    base_real = Path(os.path.realpath(base))
+    return parent == base_real or base_real in parent.parents
+
+
+def _delete_tree(path: Path, on_bytes: Callable[[int], None]) -> tuple[int, int]:
+    """ファイルかフォルダを消す。シンボリックリンクはたどらず、リンクそのものを消す。消したファイルの数と容量を返す。"""
+    if path.is_symlink() or not path.is_dir():
+        st = path.lstat()
+        path.unlink()
+        on_bytes(st.st_size)
+        return 1, st.st_size
+    files = size = 0
+    for dirpath, dirnames, filenames in os.walk(path, topdown=False):
+        for name in filenames:
+            p = os.path.join(dirpath, name)
+            st = os.lstat(p)
+            os.unlink(p)
+            files += 1
+            size += st.st_size
+            on_bytes(st.st_size)
+        for name in dirnames:
+            p = os.path.join(dirpath, name)
+            # フォルダを指すシンボリックリンクは dirnames に入る（たどらない）。リンクだけを消す
+            if os.path.islink(p):
+                os.unlink(p)
+            else:
+                os.rmdir(p)
+    os.rmdir(path)
+    return files, size
+
+
+def purge_quarantine(
+    plan_id: str,
+    *,
+    journal_dir: Path,
+    snapshot: SnapshotTaker | None,
+    reporter: Reporter | None = None,
+) -> PurgeResult:
+    """プランで隔離したものを完全に消す（隔離を空にする。F-PL-3）。消したものは取り消せなくなる。
+
+    消すのは、実行記録にある隔離先（<quarantine_dir>/<プラン ID>/）の中の、まだ取り消していないものだけ。
+    シンボリックリンクはたどらない。前後にスナップショットを撮り（撮れなければ何も消さない）、
+    1件消すたびに実行記録に残す（途中で止まっても、消したものと残っているものが分かるように）。
+
+    Raises:
+        PlanError: 空にするものが無い・隔離先が不正。何も消していない。
+        SnapshotError: 実行前のスナップショットを撮れなかった。何も消していない。
+    """
+    rep = reporter or Reporter()
+    journal = journal_path(journal_dir, plan_id)
+    items = purgeable(journal)
+    if not items:
+        raise PlanError(f"隔離フォルダに残っているものがありません: {plan_id}")
+    quarantine = items[0].quarantine
+    if quarantine.name != plan_id:
+        raise PlanError(f"実行記録の隔離先がプランと合いません: {quarantine}")
+    for it in items:
+        if not _inside(it.dst, quarantine):
+            raise PlanError(f"隔離先の外を指しているので消しません: {it.dst}")
+
+    result = PurgeResult(plan_id)
+    rep.phase("実行前のスナップショット")
+    result.pre_snapshot = _take_pre(snapshot, f"tag-keeper purge {plan_id}")
+    _append(journal, {"event": "purge-start", "items": len(items), "pre_snapshot": result.pre_snapshot})
+    rep.phase("隔離を空にする", total=sum(it.size for it in items), unit="B")
+    for it in items:
+        if not os.path.lexists(it.dst):
+            # 手作業で消したものなど。もう無いので、空にしたものとして記録する
+            _append(journal, {"event": "purge", "path": it.path, "files": 0, "size": 0, "detail": "隔離先に見つからない"})
+            result.removed += 1
+            rep.advance(it.size)
+            continue
+        try:
+            files, size = _delete_tree(it.dst, rep.advance)
+        except OSError as e:
+            detail = f"消せなかった（{e.strerror or e}）"
+            log.warning("隔離から消せませんでした: %s（%s）", it.path, detail)
+            _append(journal, {"event": "purge-skip", "path": it.path, "detail": detail})
+            result.failed.append((it.path, detail))
+            continue
+        _append(journal, {"event": "purge", "path": it.path, "files": files, "size": size})
+        _remove_empty_parents(it.dst.parent, quarantine)
+        result.removed += 1
+        result.files += files
+        result.size += size
+    rep.phase("実行後のスナップショット")
+    result.post_snapshot = _take_post(snapshot, result.pre_snapshot, f"tag-keeper purge {plan_id}")
+    _append(
+        journal,
+        {
+            "event": "purge-finish",
+            "removed": result.removed,
+            "files": result.files,
+            "size": result.size,
+            "failed": len(result.failed),
+            "post_snapshot": result.post_snapshot,
+        },
+    )
+    log.info("隔離を空にしました: %s  %d 件（ファイル %d、%d バイト）", plan_id, result.removed, result.files, result.size)
+    return result
+
+
 # --- プランの一覧と状態 ---
 
 
@@ -1059,7 +1188,7 @@ class PlanInfo:
     size: int
     skipped: int
     # draft: 未実行 / applied: 実行済み / partially-undone: 一部を取り消し済み / undone: 取り消し済み
-    # interrupted: 実行が途中で止まった
+    # interrupted: 実行が途中で止まった / purged: 隔離を空にした（もう取り消せない）
     state: str
     sync_paused: str | None = None
     quarantined: int = 0
@@ -1070,7 +1199,7 @@ def plan_state(journal: Path) -> tuple[str, int, int]:
     """実行記録から、プランの状態と、隔離中の件数・容量を求める。"""
     if not journal.exists():
         return "draft", 0, 0
-    applied = finished = restored = False
+    applied = finished = restored = purged = False
     ops_since_apply = 0
     for rec in read_journal(journal):
         event = rec.get("event")
@@ -1085,12 +1214,16 @@ def plan_state(journal: Path) -> tuple[str, int, int]:
             finished = True
         elif event == "restore":
             restored = True
+        elif event == "purge":
+            purged = True
     pending = pending_restores(journal)
     n, size = len(pending), sum(r.size for r in pending)
     if not applied:
         return "draft", n, size
     if not finished:
         return "interrupted", n, size
+    if purged and not pending:
+        return "purged", n, size
     if restored:
         return ("partially-undone" if pending else "undone"), n, size
     return "applied", n, size

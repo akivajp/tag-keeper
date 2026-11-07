@@ -62,6 +62,16 @@ const I18N_EN = {
   'まだプランがありません。ルートの「レポートとプランの作成」から作れます。': 'No plans yet. Create one from “Report and plans” on a root.',
   '隔離中': 'Quarantined', '未実行': 'Not run', '実行済み': 'Applied', '一部を取り消し': 'Partly undone', '取り消し済み': 'Undone',
   '途中で停止': 'Interrupted', '同期停止中': 'Sync stopped', 'ID': 'ID',
+  '隔離を空にした': 'Quarantine emptied', '完全に削除した': 'Deleted for good', '消せなかった: {detail}': 'Could not delete: {detail}',
+  '隔離した {n} 件（{size}）を完全に削除します。': 'This permanently deletes the {n} quarantined items ({size}).',
+  '削除したものは、この画面からは元に戻せません。このプランの取り消しもできなくなります。': 'Deleted items cannot be brought back from this page, and this plan can no longer be undone.',
+  '対象: {path}': 'Target: {path}',
+  '削除の前後にスナップショットを撮ります（snapper: {config}）。スナップショットが残っている間は、そこから手作業で取り出せますが、ディスクの容量もその間は戻りません。':
+    'Snapshots are taken before and after (snapper: {config}). While they are kept you can still copy items out of them by hand, but the disk space is not freed until they expire.',
+  'スナップショットは撮りません。削除したものは取り出せません。': 'No snapshots are taken. Deleted items cannot be recovered.',
+  '隔離を空にしますか？': 'Empty the quarantine?', '完全に削除する': 'Delete for good', '隔離を空にする（{size}）…': 'Empty quarantine ({size})…',
+  '隔離フォルダには合計 {size} があります。プランを開くと、取り消すか、隔離を空にできます。': 'The quarantine folder holds {size} in total. Open a plan to undo it or to empty its quarantine.',
+  '隔離フォルダに残っているものがありません': 'Nothing is left in quarantine',
   '変わっていないか確認': 'Check for changes', '実行する…': 'Run…', 'プランを削除': 'Delete plan',
   'パスで絞り込む': 'Filter by path', 'チェックを外したものは実行しません（自動で保存）': 'Unticked items are skipped (saved automatically)',
   '大量の削除になります。': 'This is a big deletion.', 'プランを実行しますか？': 'Run this plan?',
@@ -241,16 +251,16 @@ const I18N_EN = {
   'プランで除外': 'excluded in the plan', '名前の変更': 'rename', 'ファイルブラウザから削除': 'deleted from the file browser',
   '走査': 'Scan', 'ハッシュ計算': 'Hashing', '大量削除の確認': 'Checking for big deletions', '実行前のスナップショット': 'Snapshot before',
   '実行後のスナップショット': 'Snapshot after', '常駐の同期を一時停止': 'Pausing the resident sync', '実行（隔離・移動）': 'Applying (quarantine / move)',
-  '削除をクラウドに反映': 'Reflecting deletions in the cloud', '常駐の同期を再開': 'Restarting the resident sync', '元に戻す ': 'Undo',
+  '削除をクラウドに反映': 'Reflecting deletions in the cloud', '隔離を空にする': 'Emptying the quarantine', '常駐の同期を再開': 'Restarting the resident sync', '元に戻す ': 'Undo',
   'レポートの作成': 'Building the report', '対象の状態の記録': 'Recording the current state', '変わっていないかの確認': 'Checking for changes',
   '対象の確認': 'Finding the files', '内容の読み取りと提案': 'Reading and suggesting',
 };
 
 // サーバーから来る、変数を含む文（正規表現 → 英語）
 const I18N_PATTERNS = [
-  [/^(走査|ハッシュ計算|最新にする（走査とハッシュ計算）|自動で最新にする|プランの作成|整理の提案|実行|取り消し|確認|削除の反映の再試行|常駐の同期の再開): (.+)$/, (m) => `${{
+  [/^(走査|ハッシュ計算|最新にする（走査とハッシュ計算）|自動で最新にする|プランの作成|整理の提案|実行|取り消し|隔離を空にする|確認|削除の反映の再試行|常駐の同期の再開): (.+)$/, (m) => `${{
     '走査': 'Scan', 'ハッシュ計算': 'Hash', '最新にする（走査とハッシュ計算）': 'Refresh (scan and hash)', '自動で最新にする': 'Auto refresh',
-    'プランの作成': 'Create plan',
+    'プランの作成': 'Create plan', '隔離を空にする': 'Empty quarantine',
     '整理の提案': 'Inbox suggestions', '実行': 'Apply', '取り消し': 'Undo', '確認': 'Check', '削除の反映の再試行': 'Retry reflecting deletions',
     '常駐の同期の再開': 'Restart resident sync',
   }[m[1]]}: ${m[2]}`],

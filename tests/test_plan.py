@@ -470,3 +470,72 @@ def test_move_onto_a_name_that_differs_only_in_case_is_refused(
     # 大文字・小文字だけの改名（自分自身）は許す
     assert rules.case_conflict(root, "A/report.pdf", "A/Report.pdf") is None
     assert rules.case_conflict(root, "b/new.pdf") == "B"
+
+
+# ---------- 隔離を空にする（F-PL-3） ----------
+
+
+def test_purge_deletes_quarantined_items_for_good(
+    conn: sqlite3.Connection, root_id: int, tree: Path, tmp_path: Path
+) -> None:
+    """隔離したものを完全に消す。前後のスナップショットを撮り、消したものは取り消しの対象から外れる。"""
+    from tag_keeper.plan import plan_state, purge_quarantine, purgeable
+
+    plan, _ = make_plan(conn, root_id, tree, tmp_path)
+    run_apply(conn, plan, tmp_path)
+    journal = journal_path(tmp_path / "journal", plan.id)
+    quarantine = tmp_path / "quarantine" / plan.id
+    assert quarantine.exists() and len(purgeable(journal)) == len(plan.ops)
+    # 隔離先の中のリンクは、たどらずにリンクだけを消す
+    outside = write(tmp_path / "outside" / "keep.txt", "must survive")
+    (quarantine / "Documents" / "DMMGames" / "link").symlink_to(outside.parent)
+
+    snaps = FakeSnapshots()
+    result = purge_quarantine(plan.id, journal_dir=tmp_path / "journal", snapshot=snaps)
+
+    assert result.removed == len(plan.ops) and not result.failed
+    assert not quarantine.exists() and outside.exists()
+    assert [c[0] for c in snaps.calls] == ["pre", "post"]
+    assert purgeable(journal) == [] and plan_state(journal)[0] == "purged"
+    with pytest.raises(PlanError):
+        undo_plan(conn, plan.id, journal_dir=tmp_path / "journal", snapshot=None)
+    with pytest.raises(PlanError):  # 2回目は空にするものが無い
+        purge_quarantine(plan.id, journal_dir=tmp_path / "journal", snapshot=None)
+
+
+def test_purge_after_a_partial_undo_keeps_the_restored_items(
+    conn: sqlite3.Connection, root_id: int, tree: Path, tmp_path: Path
+) -> None:
+    """一部を元に戻した後に空にしても、戻したものには触れない。手で消した隔離も、空にしたものとして記録する。"""
+    from tag_keeper.plan import purge_quarantine, purgeable
+
+    plan, _ = make_plan(conn, root_id, tree, tmp_path)
+    run_apply(conn, plan, tmp_path)
+    quarantine = tmp_path / "quarantine" / plan.id
+    (quarantine / "docs" / "Thumbs.db").unlink()  # 利用者が手で消した
+    write(tree / "docs" / "~$report.docx", "new lock")  # 元の場所に新しいものができて、戻せないもの
+    undo_plan(conn, plan.id, journal_dir=tmp_path / "journal", snapshot=None)
+    assert (tree / "Documents" / "DMMGames" / "a.dat").exists()  # これは戻った
+    left = purgeable(journal_path(tmp_path / "journal", plan.id))
+    assert {i.path for i in left} == {"docs/~$report.docx", "docs/Thumbs.db"}
+    result = purge_quarantine(plan.id, journal_dir=tmp_path / "journal", snapshot=None)
+    assert result.removed == 2
+    assert (tree / "Documents" / "DMMGames" / "a.dat").exists() and (tree / "docs" / "~$report.docx").read_text() == "new lock"
+
+
+def test_cli_purge_needs_yes(tmp_path: Path, tree: Path) -> None:
+    cfg = write(
+        tmp_path / "config.toml",
+        f'[[roots]]\nname = "t"\npath = "{tree}"\n[hygiene]\ndevice_names = []\n'
+        f'[plan]\nquarantine_dir = "{tmp_path / "q"}"\nsnapper_config = ""\n[tags]\ndir = "{tmp_path / "tags"}"\n',
+    )
+    db = tmp_path / "data" / "catalog.db"
+    base = ["--config", str(cfg), "--db", str(db)]
+    assert main([*base, "scan"]) == 0
+    assert main([*base, "plan", "t", "--category", "os-junk", "-o", str(tmp_path / "p.toml")]) == 0
+    assert main([*base, "apply", str(tmp_path / "p.toml"), "--yes"]) == 0
+    plan_id = load_plan(tmp_path / "p.toml").id
+    assert main([*base, "purge", plan_id]) == 0
+    assert (tmp_path / "q" / plan_id / "docs" / "Thumbs.db").exists()  # 確認だけ
+    assert main([*base, "purge", plan_id, "--yes"]) == 0
+    assert not (tmp_path / "q" / plan_id).exists()

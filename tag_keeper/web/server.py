@@ -74,6 +74,8 @@ from tag_keeper.plan import (
     new_plan_id,
     pending_restores,
     plan_info,
+    purge_quarantine,
+    purgeable,
     read_journal,
     retry_sync,
     set_skips,
@@ -336,7 +338,7 @@ def create_app(
         if journal.exists():
             for rec in read_journal(journal):
                 ev = rec.get("event")
-                if ev in ("quarantine", "skip", "restore", "restore-skip"):
+                if ev in ("quarantine", "skip", "restore", "restore-skip", "purge", "purge-skip"):
                     outcomes[rec["path"]] = {"event": ev, "detail": rec.get("detail", "")}
                 else:
                     events.append(rec)
@@ -357,6 +359,9 @@ def create_app(
             ],
             "events": events,
             "restorable": len(pending_restores(journal)) if journal.exists() else 0,
+            # 隔離フォルダに残っていて、空にできるもの（件数・容量）
+            "purgeable": len(purge_items := purgeable(journal)),
+            "purgeable_size": sum(it.size for it in purge_items),
             "sync": sync,
             "category_order": rules.CATEGORY_ORDER,
         }
@@ -532,6 +537,36 @@ def create_app(
             return _run_result(result)
 
         return start("undo", f"取り消し: {plan.id}", run, target=plan.id)
+
+    @app.post("/api/plans/<plan_id>/purge")
+    def api_plan_purge(plan_id: str) -> dict[str, Any]:
+        """隔離したものを完全に消す（隔離を空にする。F-PL-3）。消したものは取り消せなくなる。
+
+        画面は、元に戻せないことを示して利用者が承認したときだけ呼ぶ。
+        """
+        plan = load_plan(plan_file(plan_id))
+        config = settings.config()
+        if not purgeable(journal_path(settings.journal_dir, plan.id)):
+            raise fail(409, f"隔離フォルダに残っているものがありません: {plan.id}")
+
+        def run(rep: JobReporter) -> dict[str, Any]:
+            result = purge_quarantine(
+                plan.id,
+                journal_dir=settings.journal_dir,
+                snapshot=Snapper(config.plan.snapper_config) if config.plan.snapper_config else None,
+                reporter=rep,
+            )
+            return {
+                "plan_id": plan.id,
+                "removed": result.removed,
+                "files": result.files,
+                "size": result.size,
+                "failed": [{"path": p, "detail": d} for p, d in result.failed],
+                "pre_snapshot": result.pre_snapshot,
+                "post_snapshot": result.post_snapshot,
+            }
+
+        return start("purge", f"隔離を空にする: {plan.id}", run, target=plan.id)
 
     @app.post("/api/plans/<plan_id>/sync/<action:re:retry|resume>")
     def api_plan_sync(plan_id: str, action: str) -> dict[str, Any]:

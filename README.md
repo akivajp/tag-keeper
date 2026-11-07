@@ -85,6 +85,7 @@ $ $EDITOR ~/.local/share/tag-keeper/plans/<plan-id>.toml   # delete the lines yo
 $ tag-keeper apply <plan file>              # preview only
 $ tag-keeper apply <plan file> --yes        # move them to the quarantine folder
 $ tag-keeper undo <plan-id> --yes           # put everything back
+$ tag-keeper purge <plan-id> --yes          # or: delete the quarantined items for good
 ```
 
 - **plan** writes one line per item, grouped by category. `--category` limits it to some
@@ -103,7 +104,12 @@ $ tag-keeper undo <plan-id> --yes           # put everything back
 - The catalog is updated as items move, so the next scan does not mistake a large
   quarantine for a mass disappearance.
 - Items leave the cloud when the sync client notices they are gone, but they stay on this
-  disk until you empty the quarantine folder yourself.
+  disk, in the quarantine folder, until you empty it.
+- **purge** (or *Empty quarantine* on the plan page, after a confirmation that says it cannot
+  be undone) deletes a plan's quarantined items for good, with snapshots before and after;
+  the plan can no longer be undone. Symlinks are deleted, never followed. If the quarantine
+  folder is inside a snapper-managed subvolume, the space only comes back once the
+  snapshots that still hold the items expire.
 
 ### Big deletions without stopping your sync client
 

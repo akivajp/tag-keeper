@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Empty the quarantine.** A plan's quarantined items can be deleted for good from the plan
+  page — after a confirmation that says they cannot be brought back from the page and the
+  plan can no longer be undone — or with `tag-keeper purge <plan> --yes`. Snapshots are
+  taken before and after, each deletion is journaled, symlinks are deleted rather than
+  followed, and the plans page shows how much the quarantine holds in total.
+
 ## [0.10.0] - 2026-11-08
 
 ### Added

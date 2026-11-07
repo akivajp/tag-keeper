@@ -9,6 +9,7 @@
     tag-keeper plan ROOT             整理候補を隔離するプラン（TOML）を書き出す
     tag-keeper apply PLAN [--yes]    プランを確認する。--yes で実行する（隔離フォルダへ移す）
     tag-keeper undo PLAN_ID [--yes]  実行したプランを取り消す
+    tag-keeper purge PLAN_ID [--yes] 隔離したものを完全に消す（隔離を空にする）
     tag-keeper sync PLAN_ID          止めたままの同期を再試行・再開する
     tag-keeper serve                 Web の画面を開く
 
@@ -69,6 +70,8 @@ from tag_keeper.plan import (
     journal_path,
     load_plan,
     pending_restores,
+    purge_quarantine,
+    purgeable,
     read_journal,
     retry_sync,
     sync_paused,
@@ -653,6 +656,42 @@ def cmd_undo(args: argparse.Namespace, config: Config) -> int:
     return 1 if result.skipped else 0
 
 
+def cmd_purge(args: argparse.Namespace, config: Config) -> int:
+    """プランで隔離したものを完全に消す（隔離を空にする）。消したものは取り消せなくなる。"""
+    plan_id = _plan_id_of(args.plan)
+    items = purgeable(journal_path(_journal_dir(args), plan_id))
+    if not items:
+        log.info("隔離フォルダに残っているものはありません: %s", plan_id)
+        return 0
+    if not args.yes:
+        render_outcomes(
+            f"隔離を空にする確認: {plan_id}",
+            [OpOutcome(i.path, i.is_dir, i.files, i.size, True) for i in items],
+            args.limit,
+        )
+        out_console.print(
+            "[bold]確認だけで、何も消していません。[/bold]"
+            "--yes を付けると完全に削除し、このプランは取り消せなくなります"
+            "（スナップショットが残っている間は、そこから手作業で取り出せます）。"
+        )
+        return 0
+    with _rich_progress() as progress:
+        result = purge_quarantine(
+            plan_id, journal_dir=_journal_dir(args), snapshot=_snapper(args, config), reporter=RichReporter(progress)
+        )
+    log.info(
+        "隔離を空にしました: %s  %s 件（ファイル %s、%s）%s",
+        plan_id,
+        f"{result.removed:,}",
+        f"{result.files:,}",
+        human_size(result.size),
+        f"。消せなかったもの {len(result.failed):,} 件" if result.failed else "",
+    )
+    for path, detail in result.failed:
+        log.warning("消せませんでした: %s（%s）", path, detail)
+    return 1 if result.failed else 0
+
+
 def cmd_sync(args: argparse.Namespace, config: Config) -> int:
     """削除の反映に失敗して止まったままの同期を、再試行するか再開する。"""
     plan_id = _plan_id_of(args.plan)
@@ -782,6 +821,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-snapshot", action="store_true", help="設定があっても、前後のスナップショットを撮らない")
     p.add_argument("--limit", type=int, default=30, help="表に載せる件数")
     p.set_defaults(func=cmd_undo)
+
+    p = sub.add_parser("purge", help="プランで隔離したものを完全に消す（隔離を空にする。取り消せなくなる）")
+    p.add_argument("plan", metavar="PLAN", help="プラン ID か、プランのファイル")
+    p.add_argument("--yes", action="store_true", help="確認だけでなく、実際に完全に削除する")
+    p.add_argument("--no-snapshot", action="store_true", help="設定があっても、前後のスナップショットを撮らない")
+    p.add_argument("--limit", type=int, default=30, help="表に載せる件数")
+    p.set_defaults(func=cmd_purge)
 
     p = sub.add_parser("sync", help="削除の反映に失敗して止まったままの同期を、再試行するか再開する")
     p.add_argument("plan", metavar="PLAN", help="プラン ID か、プランのファイル")

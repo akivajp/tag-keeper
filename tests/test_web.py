@@ -567,3 +567,19 @@ def test_names_that_differ_only_in_case_are_refused(env: dict) -> None:
     res = app.post_json("/api/fileops", {"root": "data", "op": "rename", "items": [{"path": "C/draft.pdf", "new_name": "Draft.pdf"}]}, headers=origin).json
     env["jobs"].wait()
     assert res["ops"] == 1 and (root / "C" / "Draft.pdf").exists()
+
+
+def test_purge_from_the_web(env: dict) -> None:
+    """プランの隔離を、画面から空にできる。空にした後は取り消せず、もう一度は空にできない。"""
+    app = env["app"]
+    run_job(env, "/api/roots/data/refresh")
+    plan_id = run_job(env, "/api/plans", {"root": "data", "categories": ["os-junk"]})["result"]["plan_id"]
+    run_job(env, f"/api/plans/{plan_id}/apply")
+    plan = app.get(f"/api/plans/{plan_id}").json
+    assert plan["purgeable"] == 1 and plan["purgeable_size"] == len("junk")
+    job = run_job(env, f"/api/plans/{plan_id}/purge")
+    assert job["result"]["removed"] == 1 and job["title"] == f"隔離を空にする: {plan_id}"
+    plan = app.get(f"/api/plans/{plan_id}").json
+    assert plan["info"]["state"] == "purged" and plan["restorable"] == 0 and plan["purgeable"] == 0
+    assert plan["ops"][0]["outcome"]["event"] == "purge"
+    app.post_json(f"/api/plans/{plan_id}/purge", {}, headers={"Origin": f"http://{HOST}"}, status=409)
