@@ -559,7 +559,7 @@ function mediaPreview(ctx, name) {
     try { st = await api(`/api/media/status?${q}${retry ? '&retry=1' : ''}`); }
     catch (e) { setChildren(holder, h('p', { class: 'muted' }, t('この種類はプレビューできません。'), ' ', e.message)); return; }
     if (st.state === 'done') {
-      setChildren(holder, h('video', { class: 'preview', src: `/api/media?${q}`, controls: true, preload: 'metadata' }),
+      setChildren(holder, wheelSeek(h('video', { class: 'preview', src: `/api/media?${q}`, controls: true, preload: 'metadata' })),
         h('p', { class: 'muted small' }, t('再生用に MP4 にしたものを再生しています（元のファイルはそのまま）')));
       return;
     }
@@ -670,6 +670,27 @@ function fileIcon(name) {
   return '📄';
 }
 
+/**
+ * 動画の上での横スクロール（チルトホイール・トラックパッド・Shift＋ホイール）で、再生位置を前後に動かす。
+ * 縦スクロールはページのスクロールのままにする。横の操作はブラウザに渡さない（「戻る・進む」の操作にさせない）。
+ */
+function wheelSeek(video) {
+  // 横に 100px 動かすと 5 秒（チルトホイールの1ノッチがおおむねこのくらい）
+  const SECONDS_PER_PIXEL = 5 / 100;
+  video.addEventListener('wheel', (e) => {
+    let dx = e.deltaX;
+    // Shift＋縦ホイールを横として扱わないブラウザもあるので、縦の量を使う
+    if (e.shiftKey && !dx) dx = e.deltaY;
+    if (!dx || (!e.shiftKey && Math.abs(dx) <= Math.abs(e.deltaY))) return;
+    e.preventDefault();
+    if (!Number.isFinite(video.duration)) return; // 長さがまだ分からない（読み込み中）
+    // 行・ページ単位の量（Firefox など）は、画素に直す
+    const px = dx * (e.deltaMode === 1 ? 16 : e.deltaMode === 2 ? video.clientWidth : 1);
+    video.currentTime = Math.min(video.duration, Math.max(0, video.currentTime + px * SECONDS_PER_PIXEL));
+  }, { passive: false });
+  return video;
+}
+
 /** ファイルの種類に合わせたプレビュー（PDF・画像・音声・動画・テキスト）。 */
 function preview(url, name, bytes, ctx = null) {
   const ext = name.split('.').pop().toLowerCase();
@@ -680,7 +701,7 @@ function preview(url, name, bytes, ctx = null) {
   if (['mp4', 'webm', 'mov', 'm4v'].includes(ext)) {
     // 中が HEVC などでブラウザが再生できなければ、変換して再生に切り替える
     // 詳細の欄が組み上がる前にエラーになることもあるので、入れ物の中身を替える（要素そのものは差し替えない）
-    const video = h('video', { class: 'preview', src: url, controls: true, preload: 'metadata' });
+    const video = wheelSeek(h('video', { class: 'preview', src: url, controls: true, preload: 'metadata' }));
     const box = h('div', {}, video);
     if (ctx) video.addEventListener('error', () => setChildren(box, mediaPreview(ctx, name)), { once: true });
     return box;
