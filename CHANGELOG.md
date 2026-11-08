@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.21.0] - 2026-11-08
+
 ### Added
 
 - `[organize] fallback` (default on): when the main model does not answer — ollama's cloud
@@ -15,6 +17,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the next 10 minutes. The result records the model actually used, and the inbox screen shows
   those suggestions when the main model has none. Before, readings failed and were stored as
   errors that were not retried.
+
+### Changed
+
+- `[organize] model` now defaults to `gemma4:12b` (was `gemma3:12b`). In a comparison on
+  zefat, `gemma4:31b-cloud` was slightly better (no invented dates, steadier destinations) at
+  the same speed, so a cloud model with `fallback` is a good setup where sending content to
+  ollama's cloud is acceptable; the default stays local so nothing leaves the machine unasked.
 
 ### Fixed
 
@@ -400,7 +409,8 @@ First release. The web UI and messages are in Japanese.
 - **Decision log.** Accepted suggestions, tag accept and reject, and undone plans are
   appended per machine; the closest past decisions are given to the model as examples.
 
-[Unreleased]: https://github.com/akivajp/tag-keeper/compare/v0.20.0...HEAD
+[Unreleased]: https://github.com/akivajp/tag-keeper/compare/v0.21.0...HEAD
+[0.21.0]: https://github.com/akivajp/tag-keeper/compare/v0.20.0...v0.21.0
 [0.20.0]: https://github.com/akivajp/tag-keeper/compare/v0.19.0...v0.20.0
 [0.19.0]: https://github.com/akivajp/tag-keeper/compare/v0.18.0...v0.19.0
 [0.18.0]: https://github.com/akivajp/tag-keeper/compare/v0.17.0...v0.18.0
