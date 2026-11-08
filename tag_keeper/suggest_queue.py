@@ -19,7 +19,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from tag_keeper import organize, rules
+from tag_keeper import dirtypes, organize, rules
 from tag_keeper.catalog import connect
 from tag_keeper.config import Config
 from tag_keeper.decisions import DecisionLog
@@ -165,7 +165,13 @@ class SuggestQueue:
         assert rc is not None
         report = build_report(conn, root_id, rc.name, config.hygiene)
         excluded = [f.relpath for f in report.findings if f.is_dir and f.category in (rules.CAT_APP_DATA, rules.CAT_REGENERABLE)]
-        ctx = organize.build_context(conn, root_id, rc.name, oc, excluded, decisions=decisions, tag_counts=tags.all_tags())
+        # ディレクトリの型（まとまり・アプリ管理・除外の中は移動先にしない。受け皿の型のフォルダは受け皿にする）とカード
+        types = tags.dir_types_of(rc.name)
+        excluded += dirtypes.closed_dirs(conn, root_id, types)
+        ctx = organize.build_context(
+            conn, root_id, rc.name, oc, excluded, decisions=decisions, tag_counts=tags.all_tags(),
+            inbox_dirs=dirtypes.inbox_dirs(types), cards=tags.dir_cards_of(rc.name),
+        )
         self._contexts[root_name] = (time.time(), stamp, ctx)
         return ctx
 

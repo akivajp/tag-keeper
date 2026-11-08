@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Folder types** (bundle, app-managed, dated, numbered, inbox, archive, excluded, normal):
+  set from the file browser, inherited by the folders inside (normal stops it), otherwise
+  guessed from the contents. Bundles and app-managed folders are not offered as
+  destinations, inbox-typed folders join the Inbox page, excluded folders are not scanned.
+- **Directory cards**: what belongs in a folder and how files there are named, written by
+  hand or drafted by the model; inbox suggestions pass them to the model with the candidate
+  folders (a folder with a card is a candidate even while empty).
+- **Replicas and nested roots** are left out of scanning: `replicas` in `[[roots]]`, and any
+  folder that is configured as another root. The Roots page lists what is not scanned.
+
 ## [0.13.0] - 2026-11-08
 
 ### Added

@@ -392,6 +392,9 @@ async function pageRoots(main) {
       staleFor ? h('div', { class: 'alert warn' },
         t('最後の走査から {age} たっています。カタログ（タグの検索・レポート・移動の追従）が今のファイルと合っていない可能性があります。', { age: ageText(staleFor) }),
         st.auto_refresh > 0 ? null : ' ' + t('設定の [scan] auto_refresh で、自動で最新にできます。')) : null,
+      (r.excluded || []).length ? h('p', { class: 'muted small' }, t('走査しないフォルダ: {list}', {
+        list: r.excluded.map((x) => t('{path}（{reason}）', { path: x.path, reason: translateString(x.reason) })).join('、'),
+      })) : null,
       r.scanned ? h('p', { class: 'muted small' }, st.auto_refresh > 0
         ? t('自動で最新にします（{m} 分ごと{sync}）。', { m: num(st.auto_refresh), sync: st.after_sync && r.sync && r.sync.client === 'cloud-sync' ? t('と、同期が終わるたび') : '' })
         : t('自動では最新にしません。')) : null,

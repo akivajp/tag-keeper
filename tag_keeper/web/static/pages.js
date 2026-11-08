@@ -173,6 +173,8 @@ async function pageBrowse(main, root, path, params) {
     ? h('details', { class: 'folder-attrs' }, h('summary', { class: 'muted small' }, t('このフォルダの属性（配下に継承）')),
       attrEditor(root, path, data.attrs, data.attr_defs, () => app.render()))
     : null;
+  // 今のフォルダの型（付けた・継承・推定）とディレクトリカード
+  const folderMeta = live && data.dir && data.dir.type ? dirMetaBlock(root, path, data) : null;
   // 今のフォルダをクラウドの Web 画面で開くリンク（あとから読み込む）
   const folderLinks = h('span', { class: 'folder-links' });
   if (live && path) {
@@ -215,7 +217,8 @@ async function pageBrowse(main, root, path, params) {
       const row = h('tr', { class: e.exists_now === false ? 'gone' : '' },
         h('td', {}, box),
         h('td', { class: 'path' }, name,
-          e.inbox ? [' ', h('span', { class: 'badge warn' }, '受け皿')] : null,
+          e.inbox && !(e.dir_type && e.dir_type.type === 'inbox') ? [' ', h('span', { class: 'badge warn' }, '受け皿')] : null,
+          e.dir_type ? [' ', h('span', { class: `badge ${e.dir_type.how === 'set' ? 'info' : ''}`, title: e.dir_type.how === 'set' ? t('付けた型') : t('推定: {why}', { why: e.dir_type.source }) }, t(e.dir_type.label))] : null,
           e.exists_now === false ? [' ', h('span', { class: 'badge danger' }, '今は無い')] : null),
         h('td', { class: 'hide-narrow' }, h('div', { class: 'chips' }, e.tags.map((tg) => h('span', { class: 'chip' }, tg)))),
         h('td', { class: 'num' }, e.is_dir ? '' : size(e.size)),
@@ -329,7 +332,7 @@ async function pageBrowse(main, root, path, params) {
     h('div', { class: 'card folder-tags' }, folderLinks, h('strong', {}, 'このフォルダのタグ: '), folderTags,
       live && path ? h('form', { class: 'inline', onsubmit: async (ev) => { ev.preventDefault(); if (await editTags(root, [path], folderTagInput.value, 'add')) app.render(); } },
         folderTagInput, h('button', {}, '付ける')) : null,
-      folderAttrs),
+      folderAttrs, folderMeta),
     live ? h('form', { class: 'toolbar', onsubmit: (ev) => ev.preventDefault() },
       tagInput,
       h('button', { onclick: async () => { if (!selected.size) { toast('ファイルかフォルダを選んでください', 'warn'); return; } if (await editTags(root, [...selected], tagInput.value, 'add')) app.render(); } }, '選んだものに付ける'),
@@ -793,6 +796,75 @@ function relationEditor(root, path, info, onChange) {
       : h('p', { class: 'muted small' }, '関係はまだありません。'),
     h('form', { class: 'inline', onsubmit: (e) => { e.preventDefault(); if (target.value.trim()) call({ from: path, to: target.value.trim(), kind: kind.value.trim() || '関連' }); } },
       kind, target, h('button', {}, '関係を足す')));
+}
+
+/** ディレクトリの型の説明（選択肢の下に出す）。 */
+const DIR_TYPE_HELP = {
+  normal: '特別な扱いなし。上のフォルダから継承した型も、ここで止まります。',
+  bundle: '全体で1つのまとまり（リポジトリ・行事の写真など）。中は移動先の候補にしません。',
+  app: 'アプリが管理するフォルダ（Vault・ライブラリなど）。中を移動・改名の候補にしません。',
+  dated: '年・月などの日付で分けたフォルダ。構造の見直しで、名前の書式のずれを調べます。',
+  numbered: '01_xxx のような番号付きのフォルダ。番号の重複・欠番を調べます。',
+  inbox: '受け皿。名前に関係なく「整理」の画面の対象にします。',
+  archive: '完了したものの保管場所。構造の見直しの対象から外します。',
+  exclude: '走査しません（キャッシュなど）。次の走査から、カタログでは消えた扱いになります。',
+};
+
+/**
+ * 今のフォルダの型とディレクトリカードの欄（ファイルブラウザ）。型は選ぶとすぐ保存し、カードは編集の画面で書く。
+ */
+function dirMetaBlock(root, path, data) {
+  const cur = data.dir.type;
+  const how = { set: t('付けた型'), inherited: t('{from} から継承', { from: cur.source || root }), inferred: t('推定: {why}', { why: cur.source }), none: '' }[cur.how];
+  const select = h('select', {
+    'aria-label': t('このフォルダの型'),
+    onchange: async (e) => {
+      try { await api('/api/dirtype', { root, path, type: e.target.value }); app.render(); }
+      catch (err) { toast(err.message, 'danger'); }
+    },
+  }, h('option', { value: '', selected: cur.how !== 'set' }, cur.how === 'set' ? t('推定に任せる') : t('（{label}）', { label: t(cur.label) })),
+  data.dir_types.map((dt) => h('option', { value: dt.type, selected: cur.how === 'set' && cur.type === dt.type }, t(dt.label))));
+  const card = data.dir.card;
+  return h('div', { class: 'dir-meta' },
+    h('div', { class: 'toolbar' },
+      h('strong', {}, t('このフォルダの型: ')), select,
+      how ? h('span', { class: 'muted small' }, how) : null,
+      h('span', { class: 'muted small' }, t(DIR_TYPE_HELP[cur.type] || ''))),
+    h('div', { class: 'toolbar' },
+      h('strong', {}, t('ディレクトリカード: ')),
+      card ? h('span', {}, card.description, card.naming ? h('span', { class: 'muted small' }, t('（命名: {naming}）', { naming: card.naming })) : null)
+        : h('span', { class: 'muted small' }, t('何を置く場所かを書いておくと、整理の提案が移動先を選ぶときに使います。')),
+      h('button', { class: 'small', onclick: () => dirCardDialog(root, path, card) }, card ? t('編集…') : t('書く…'))));
+}
+
+/** ディレクトリカードを書く画面。モデルに下書きさせることもできる（保存は「保存する」を押したときだけ）。 */
+async function dirCardDialog(root, path, card) {
+  const desc = h('textarea', { rows: 3, placeholder: t('何を置く場所か（例: 取引先ごとの請求書。発行月のフォルダに置く）') }, card ? card.description : '');
+  const naming = h('input', { value: card ? card.naming : '', placeholder: t('命名規則（例: YYYYMMDD_相手_件名）') });
+  const status = h('span', { class: 'muted small' });
+  const draft = h('button', {
+    type: 'button', class: 'small',
+    onclick: async () => {
+      draft.disabled = true;
+      status.textContent = t('下書きを作っています…');
+      try {
+        const r = await api('/api/dircard/draft', { root, path, model: models.current() });
+        if (r.description) desc.value = r.description;
+        if (r.naming) naming.value = r.naming;
+        status.textContent = r.note ? t('モデルを使えませんでした（{note}）。命名規則だけを推定しました。', { note: r.note }) : t('下書きしました（{model}）。直してから保存してください。', { model: r.model });
+      } catch (e) { status.textContent = e.message; }
+      draft.disabled = false;
+    },
+  }, t('モデルに下書きさせる'));
+  const ok = await confirmDialog(t('ディレクトリカード: {path}', { path: path || root }), [
+    h('label', { class: 'attr-row' }, h('span', { class: 'attr-name' }, t('説明')), desc),
+    h('label', { class: 'attr-row' }, h('span', { class: 'attr-name' }, t('命名規則')), naming),
+    h('div', { class: 'toolbar' }, draft, status),
+    h('p', { class: 'muted small' }, t('両方を空にして保存すると、カードを外します。')),
+  ], t('保存する'));
+  if (!ok) return;
+  try { await api('/api/dircard', { root, path, description: desc.value, naming: naming.value }); app.render(); }
+  catch (e) { toast(e.message, 'danger'); }
 }
 
 /** 検索の条件（URL の問い合わせ）を読む。保存した検索の件数を数えるときにも使う。 */

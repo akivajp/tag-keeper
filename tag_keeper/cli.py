@@ -55,6 +55,7 @@ from tag_keeper.config import (
     default_db_path,
     load_config,
 )
+from tag_keeper.dirtypes import scan_exclusions
 from tag_keeper.fulltext import KINDS, Pending, find_entries, query_terms, run_pending, snippets
 from tag_keeper.hashing import hash_root
 from tag_keeper.plan import (
@@ -197,6 +198,9 @@ def cmd_scan(args: argparse.Namespace, config: Config) -> int:
             transient=True,
         ) as progress:
             task = progress.add_task(f"走査中: {rc.name}", total=None)
+            skip = scan_exclusions(config, rc, TagStore(config.tags.dir).dir_types_of(rc.name))
+            for p, why in sorted(skip.items()):
+                log.info("走査しないフォルダ: %s（%s）", p, why)
             try:
                 res = scan_root(
                     conn,
@@ -206,6 +210,7 @@ def cmd_scan(args: argparse.Namespace, config: Config) -> int:
                     exclude=rc.exclude,
                     accept_missing=args.accept_missing,
                     on_progress=lambda n: progress.update(task, completed=n),
+                    exclude_paths=skip,
                 )
             except RootUnavailableError as e:
                 log.error("%s", e)

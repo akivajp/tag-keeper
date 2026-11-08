@@ -189,6 +189,18 @@ and the theme (system, light or dark).
   and never conflict when synced. When a tagged item is moved — by you or by a plan — the
   log records the move and the tags follow. Paths are matched as NFC, so a name written in
   NFC or NFD (the two Unicode spellings of Japanese characters) points at the same item.
+- **Folder types and directory cards.** Each folder can have a type that tells the tool how to
+  treat it: *bundle* (a repository, an event's photos), *app-managed* (an Obsidian vault, a
+  Zotero or Calibre library), *dated*, *numbered*, *inbox*, *archive*, *excluded* or *normal*.
+  Folders without a type are guessed from their contents (`.git`, `.obsidian`, child names
+  like `2025` or `01_…`, inbox-like names); a type you set is inherited by the folders inside
+  (*normal* stops it). Bundles and app-managed folders are never offered as destinations,
+  inbox folders join the Inbox page whatever their name, and excluded folders are not scanned.
+  A directory card says what belongs in a folder and how files there are named; a model can
+  draft it, and inbox suggestions show it to the model when choosing a destination.
+- **Replicas and nested roots.** A folder inside a root that is a copy of another root
+  (`replicas = { "OneDrive" = "onedrive" }`) is left out of scanning, duplicates and plans, and
+  so is a folder that is itself configured as another root.
 - **Relations between two items** (previous version, derived from, attached to, …; you can add
   your own kinds) can be linked from the file browser's details. They follow moves and come
   back with undo.
@@ -340,6 +352,7 @@ path = "~/CloudSync/OneDrive"
 sync_client = "onedrive"             # "" (default) = no coordination / "cloud-sync" = rclone bisync timer
 sync_service = "onedrive.service"    # the systemd --user unit running `onedrive --monitor`
 sync_guard = "auto"                  # "auto": only for big deletions / "always": every run
+replicas = { "OneDrive" = "onedrive" }  # folders inside that copy another root: not scanned
 ```
 
 Tags and inbox suggestions:

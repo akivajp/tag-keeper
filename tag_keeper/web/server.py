@@ -38,7 +38,8 @@ from wsgiref.simple_server import WSGIRequestHandler, WSGIServer, make_server
 
 import bottle
 
-from tag_keeper import __version__, history, media, officeview, organize, rules
+from tag_keeper import __version__, dirtypes, history, media, officeview, organize, rules
+from tag_keeper.dirtypes import scan_exclusions
 from tag_keeper.catalog import connect, ensure_root, last_scan, utcnow
 from tag_keeper.cloudlinks import OneDriveLinks
 from tag_keeper.config import (
@@ -288,7 +289,10 @@ def create_app(
         conn = open_db()
         try:
             store = settings.tags(config)
-            roots = [_root_state(conn, rc, config.scan.relink_days, store.relink_skipped(rc.name)) for rc in config.roots]
+            roots = [
+                _root_state(conn, rc, config.scan.relink_days, store.relink_skipped(rc.name), config, store.dir_types_of(rc.name))
+                for rc in config.roots
+            ]
         finally:
             conn.close()
         plans = [_plan_summary(p) for p in list_plans(settings.plans_dir, settings.journal_dir)]
@@ -619,6 +623,28 @@ def create_app(
             entries = list_live(path)
         store = settings.tags(config)
         tagged = store.tagged_under(rc.name, rel)
+        types = store.dir_types_of(rc.name)
+        dir_info: dict[str, Any] = {"type": None, "card": None}
+        if not snapshot:
+            conn = open_db()
+            try:
+                row = conn.execute("SELECT id FROM roots WHERE name = ?", (rc.name,)).fetchone()
+                if row is not None:
+                    pats = config.organize.inbox_patterns
+                    dir_info["type"] = dirtypes.effective_type(conn, row["id"], rel, types, pats).to_dict()
+                    # 子のフォルダの型（付けた・継承・推定）。多すぎるフォルダでは、付けたものだけ
+                    child_dirs = [e for e in entries if e["is_dir"]]
+                    for e in child_dirs:
+                        child = f"{rel}/{e['name']}" if rel else e["name"]
+                        if len(child_dirs) <= 200:
+                            t = dirtypes.effective_type(conn, row["id"], unicodedata.normalize("NFC", child), types, pats)
+                        else:
+                            t = dirtypes.explicit_type(unicodedata.normalize("NFC", child), types) or dirtypes.DirType("normal", "none")
+                        # 継承した型は札にしない（親と同じなので、見ればわかる）
+                        e["dir_type"] = t.to_dict() if t.how in ("set", "inferred") and t.type != "normal" else None
+            finally:
+                conn.close()
+            dir_info["card"] = store.dir_cards_of(rc.name).get(unicodedata.normalize("NFC", rel))
         for e in entries:
             child = f"{rel}/{e['name']}" if rel else e["name"]
             # タグはパスを NFC にそろえて持つ（F-ID-4）。ディスクの名前が NFD でも引けるようにそろえて引く
@@ -637,6 +663,8 @@ def create_app(
             "tags": store.tags_of(rc.name, rel),
             "attrs": store.attrs_of(rc.name, rel),
             "attr_defs": store.attr_defs_list(),
+            "dir": dir_info,
+            "dir_types": [{"type": k, "label": v} for k, v in dirtypes.DIR_TYPES.items()],
             "entries": entries,
         }
 
@@ -850,6 +878,69 @@ def create_app(
         moved = store.follow_moves(rc.name, [(old_rel, new_rel)])
         return {"from": old_rel, "to": new_rel, "tag_moves": moved}
 
+    @app.post("/api/dirtype")
+    def api_dirtype() -> dict[str, Any]:
+        """フォルダの型を付ける（type が "" なら外して推定に任せる）。F-DR-1・3。"""
+        data = body()
+        config = settings.config()
+        rc = root_config(config, str(data.get("root", "")))
+        rel = clean_relpath(str(data.get("path", "")))
+        t = str(data.get("type", ""))
+        if t and t not in dirtypes.DIR_TYPES:
+            raise fail(400, f"型が不正です: {t}")
+        if not resolve_within(rc.path, rel).is_dir():
+            raise fail(404, f"フォルダがありません: {rel}")
+        return {"changed": settings.tags(config).set_dir_type(rc.name, rel, t)}
+
+    @app.post("/api/dircard")
+    def api_dircard() -> dict[str, Any]:
+        """ディレクトリカード（何を置く場所か・命名規則）を書く。両方空なら外す。F-DR-4。"""
+        data = body()
+        config = settings.config()
+        rc = root_config(config, str(data.get("root", "")))
+        rel = clean_relpath(str(data.get("path", "")))
+        if not resolve_within(rc.path, rel).is_dir():
+            raise fail(404, f"フォルダがありません: {rel}")
+        changed = settings.tags(config).set_dir_card(rc.name, rel, str(data.get("description", "")), str(data.get("naming", "")))
+        return {"changed": changed}
+
+    @app.post("/api/dircard/draft")
+    def api_dircard_draft() -> dict[str, Any]:
+        """ディレクトリカードの下書きを、中のフォルダ名・ファイル名からモデルに書かせる（保存はしない）。
+
+        モデルに使えなければ、命名規則だけを中のファイル名から推定して返す。
+        """
+        data = body()
+        config = settings.config()
+        rc = root_config(config, str(data.get("root", "")))
+        rel = clean_relpath(str(data.get("path", "")))
+        path = resolve_within(rc.path, rel)
+        if not path.is_dir():
+            raise fail(404, f"フォルダがありません: {rel}")
+        entries = list_live(path)
+        dirs = [e["name"] for e in entries if e["is_dir"] and not e["name"].startswith(".")][:40]
+        files = [e["name"] for e in entries if not e["is_dir"] and not e["name"].startswith(".")][:60]
+        style = organize.naming_style(files)
+        prompt = (
+            "次のフォルダの「ディレクトリカード」を書いてください。何を置く場所か（description）と、"
+            "中のファイルの名前の付け方（naming。例: YYYYMMDD_相手_件名）を、フォルダの中身の言語で短く書きます。"
+            "推測で断定せず、中身から読み取れることだけを書いてください。\n"
+            f"フォルダ: {rel or '（ルート）'}\n子のフォルダ: {' / '.join(dirs) or '（なし）'}\n"
+            f"ファイル名の例: {' / '.join(files) or '（なし）'}\n日付の付け方の多数派: {style}\n"
+            'JSON で {"description": "...", "naming": "..."} の形で答えてください。'
+        )
+        model = str(data.get("model", "") or config.organize.model)
+        try:
+            answer = organize.ollama_generate(config.organize, prompt, model=model)
+        except OllamaError as e:
+            return {"description": "", "naming": style if files else "", "model": "", "note": str(e)}
+        return {
+            "description": " ".join(str(answer.get("description", "")).split())[:1000],
+            "naming": " ".join(str(answer.get("naming", "")).split())[:200],
+            "model": model,
+            "note": "",
+        }
+
     @app.post("/api/relations")
     def api_relations() -> dict[str, Any]:
         """2つのアイテムの間に関係を張る（op=add）・外す（op=remove）。from から to へ（例: 新しい版 → 前の版）。"""
@@ -930,9 +1021,15 @@ def create_app(
     # --- 受け皿の整理の提案 ---
 
     def excluded_dirs(conn: sqlite3.Connection, root_id: int, rc: RootConfig, config: Config) -> list[str]:
-        """提案の対象と移動先から外すフォルダ（アプリのデータ・作り直せる生成物）。"""
+        """提案の対象と移動先から外すフォルダ（アプリのデータ・作り直せる生成物・まとまり・アプリ管理・除外の型）。"""
         report = build_report(conn, root_id, rc.name, config.hygiene)
-        return [f.relpath for f in report.findings if f.is_dir and f.category in (rules.CAT_APP_DATA, rules.CAT_REGENERABLE)]
+        out = [f.relpath for f in report.findings if f.is_dir and f.category in (rules.CAT_APP_DATA, rules.CAT_REGENERABLE)]
+        return out + dirtypes.closed_dirs(conn, root_id, settings.tags(config).dir_types_of(rc.name))
+
+    def inbox_hints(rc: RootConfig, config: Config) -> dict[str, Any]:
+        """整理の提案に渡す、型で受け皿にしたフォルダとディレクトリカード。"""
+        store = settings.tags(config)
+        return {"inbox_dirs": dirtypes.inbox_dirs(store.dir_types_of(rc.name)), "cards": store.dir_cards_of(rc.name)}
 
     @app.route("/api/organize/<root>")
     def api_organize(root: str) -> dict[str, Any]:
@@ -943,7 +1040,7 @@ def create_app(
         try:
             root_id = root_id_of(conn, rc)
             excluded = excluded_dirs(conn, root_id, rc, config)
-            inbox, files = organize.find_inbox(conn, root_id, config.organize.inbox_patterns, excluded)
+            inbox, files = organize.find_inbox(conn, root_id, config.organize.inbox_patterns, excluded, inbox_hints(rc, config)["inbox_dirs"])
             cached = organize.cached_suggestions(conn, files, model)
             # 同じ内容のファイルが受け皿の外にあれば示す（その場合は移動より隔離が向く）
             dups: dict[str, list[str]] = {}
@@ -1017,6 +1114,7 @@ def create_app(
                     root_name=rc.name,
                     decisions=settings.decision_log,
                     tag_counts=settings.tags(config).all_tags(),
+                    **inbox_hints(rc, config),
                     only=only,
                     force=force,
                     on_start=on_start,
@@ -1627,7 +1725,12 @@ def _log_accepts(
 
 
 def _root_state(
-    conn: sqlite3.Connection, rc: RootConfig, relink_days: int = 0, skipped: set[tuple[str, str]] | None = None
+    conn: sqlite3.Connection,
+    rc: RootConfig,
+    relink_days: int = 0,
+    skipped: set[tuple[str, str]] | None = None,
+    config: Config | None = None,
+    types: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """ルートの概要（ファイル数・容量・ハッシュの計算状況・最後の走査・移動の確認待ち・同期クライアントの状態）。"""
     skipped = skipped or set()
@@ -1658,6 +1761,7 @@ def _root_state(
             scanned=scan is not None,
             last_scan=dict(scan) if scan is not None else None,
         )
+    out["excluded"] = [{"path": p, "reason": why} for p, why in sorted(scan_exclusions(config, rc, types or {}).items())] if config else []
     guard = _guard(rc)
     if guard is not None:
         try:
@@ -1840,7 +1944,10 @@ def _run_scan(conn: sqlite3.Connection, root_id: int, rc: RootConfig, config: Co
         "SELECT COUNT(*) FROM entries WHERE root_id = ? AND gone_at IS NULL", (root_id,)
     ).fetchone()
     rep.phase("走査", total=previous or None)
-    res = scan_root(conn, root_id, rc.path, config.safety, exclude=rc.exclude, on_progress=rep.set_done)
+    skip = scan_exclusions(config, rc, TagStore(config.tags.dir).dir_types_of(rc.name))
+    if skip:
+        rep.note("走査しないフォルダ: " + "、".join(f"{p}（{why}）" for p, why in sorted(skip.items())))
+    res = scan_root(conn, root_id, rc.path, config.safety, exclude=rc.exclude, on_progress=rep.set_done, exclude_paths=skip)
     rep.set_total(res.seen)
     rep.set_done(res.seen)
     return {**asdict(res), "status": res.status}

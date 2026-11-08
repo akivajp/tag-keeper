@@ -803,6 +803,7 @@ def _quarantine_one(
     detached = tags.detach_under(plan.root, op.path) if tags is not None else {}
     detached_attrs = tags.detach_attrs_under(plan.root, op.path) if tags is not None else {}
     detached_rels = tags.detach_relations_under(plan.root, op.path) if tags is not None else []
+    detached_meta = tags.detach_dirmeta_under(plan.root, op.path) if tags is not None else {}
     _append(
         journal,
         {
@@ -817,6 +818,7 @@ def _quarantine_one(
             **({"tags": detached} if detached else {}),
             **({"attrs": detached_attrs} if detached_attrs else {}),
             **({"relations": detached_rels} if detached_rels else {}),
+            **({"dirmeta": detached_meta} if detached_meta else {}),
         },
     )
     where, args = _subtree_sql(op.path)
@@ -847,8 +849,9 @@ class Restorable:
     # 隔離のときに外したタグ（相対パス → [タグ, 出所] の一覧）と属性（相対パス → [名前, 値, 出所] の一覧）。戻したら付け直す
     tags: dict[str, list[list[str]]] = field(default_factory=dict)
     attrs: dict[str, list[list[Any]]] = field(default_factory=dict)
-    # 隔離のときに外した関係（[元, 先, 種類] の一覧）
+    # 隔離のときに外した関係（[元, 先, 種類] の一覧）と、ディレクトリの型・カード
     relations: list[list[str]] = field(default_factory=list)
+    dirmeta: dict[str, dict[str, Any]] = field(default_factory=dict)
 
 
 def pending_restores(journal: Path) -> list[Restorable]:
@@ -877,6 +880,7 @@ def pending_restores(journal: Path) -> list[Restorable]:
                 tags=rec.get("tags") or {},
                 attrs=rec.get("attrs") or {},
                 relations=rec.get("relations") or [],
+                dirmeta=rec.get("dirmeta") or {},
             )
         elif event == "move":
             moved[rec["path"]] = Restorable(
@@ -965,6 +969,8 @@ def undo_plan(
                 tags.attach_attrs(it.root, it.attrs)
             if tags is not None and it.relations:
                 tags.attach_relations(it.root, it.relations)
+            if tags is not None and it.dirmeta:
+                tags.attach_dirmeta(it.root, it.dirmeta)
             where, args = _subtree_sql(it.path)
             now = utcnow()
             with conn:

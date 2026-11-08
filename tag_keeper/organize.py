@@ -87,6 +87,7 @@ def find_inbox(
     root_id: int,
     patterns: Sequence[str],
     excluded: Iterable[str] = (),
+    inbox_dirs: Iterable[str] = (),
 ) -> tuple[list[str], list[InboxFile]]:
     """受け皿のフォルダと、その配下のファイルを返す。
 
@@ -95,8 +96,10 @@ def find_inbox(
         root_id: ルートの ID。
         patterns: 受け皿とみなすフォルダ名のパターン。
         excluded: 対象から外すフォルダ（アプリのデータ・作り直せる生成物など、レポートの候補のフォルダ）。
+        inbox_dirs: 名前に関係なく受け皿とするフォルダ（ディレクトリの型で「受け皿」にしたもの）。
     """
     excluded = list(excluded)
+    extra = set(inbox_dirs)
     dirs = [
         r["relpath"]
         for r in conn.execute("SELECT relpath FROM entries WHERE root_id = ? AND gone_at IS NULL AND is_dir = 1", (root_id,))
@@ -104,7 +107,7 @@ def find_inbox(
     inbox = sorted(
         d
         for d in dirs
-        if is_inbox_name(d.rsplit("/", 1)[-1], patterns) and not _hidden_or_vcs(d) and not _under_any(d, excluded)
+        if (is_inbox_name(d.rsplit("/", 1)[-1], patterns) or d in extra) and not _hidden_or_vcs(d) and not _under_any(d, excluded)
     )
     # 受け皿の中の受け皿（99_Inbox/未整理のドキュメント など）は、上のものに含める
     top = [d for d in inbox if not any(d.startswith(o + "/") for o in inbox if o != d)]
@@ -134,6 +137,7 @@ class Folder:
 
     relpath: str
     names: list[str]  # 中のファイル名（命名規則の判定と、モデルに見せる実例）
+    card: str = ""  # ディレクトリカード（何を置く場所か・命名規則）。モデルに見せる
 
 
 class FolderIndex:
@@ -148,6 +152,9 @@ class FolderIndex:
             # パスの語は中のファイル名より重く見る（フォルダの意味はまず名前に表れる）
             c = Counter(bigrams(f.relpath.replace("/", " ")) * 3)
             c.update(bigrams(" ".join(Path(n).stem for n in f.names)))
+            # カードに書いた説明も、フォルダの意味として重く見る
+            if f.card:
+                c.update(bigrams(f.card) * 2)
             docs.append(c)
         self.tfidf = TfIdf(docs)
 
@@ -167,6 +174,7 @@ def build_folder_index(
     root_id: int,
     inbox: Iterable[str],
     excluded: Iterable[str] = (),
+    cards: dict[str, dict[str, str]] | None = None,
 ) -> FolderIndex:
     """移動先の候補になる既存のフォルダ（中にファイルがあるもの）の索引を作る。受け皿と除外の配下は含めない。"""
     skip = list(inbox) + list(excluded)
@@ -181,7 +189,20 @@ def build_folder_index(
             continue
         if len(names[parent]) < PROFILE_NAMES:
             names[parent].append(name)
-    return FolderIndex([Folder(d, sorted(ns)) for d, ns in sorted(names.items())], all_dirs)
+    cards = cards or {}
+
+    def card_text(d: str) -> str:
+        c = cards.get(d)
+        if not c:
+            return ""
+        return "／".join(x for x in (c.get("description", ""), f"命名: {c['naming']}" if c.get("naming") else "") if x)
+
+    # カードを書いたフォルダは、中にまだファイルが無くても候補にする（これから使い始める置き場所）
+    known = set(all_dirs)
+    for d in cards:
+        if d in known and d not in names and not _under_any(d, skip) and not _hidden_or_vcs(d):
+            names[d] = []
+    return FolderIndex([Folder(d, sorted(ns), card_text(d)) for d, ns in sorted(names.items())], all_dirs)
 
 
 def adjust_dated_folder(dest: str, date: str | None, known: set[str]) -> tuple[str, str]:
@@ -469,11 +490,13 @@ def build_context(
     *,
     decisions: DecisionLog | None = None,
     tag_counts: Counter[str] | None = None,
+    inbox_dirs: Iterable[str] = (),
+    cards: dict[str, dict[str, str]] | None = None,
 ) -> SuggestContext:
     """提案の材料（移動先の候補の索引・過去の例・既存のタグ）を作る。"""
     excluded = list(excluded)
-    inbox, _files = find_inbox(conn, root_id, config.inbox_patterns, excluded)
-    index = build_folder_index(conn, root_id, inbox, excluded)
+    inbox, _files = find_inbox(conn, root_id, config.inbox_patterns, excluded, inbox_dirs)
+    index = build_folder_index(conn, root_id, inbox, excluded, cards)
     ctx = SuggestContext(index, inbox)
     if decisions is not None:
         ctx.examples, ctx.rejected_tags = load_examples(decisions, conn, root_name, root_id, inbox)
@@ -492,7 +515,7 @@ def _format_candidates(cands: Sequence[tuple[Folder, float]]) -> str:
     lines = []
     for i, (f, _score) in enumerate(cands, 1):
         examples = " / ".join(f.names[:4])
-        lines.append(f"{i}: {f.relpath} ／ {naming_style(f.names)} ／ {examples}")
+        lines.append(f"{i}: {f.relpath} ／ {naming_style(f.names)} ／ {examples}" + (f" ／ 説明: {f.card[:160]}" if f.card else ""))
     return "\n".join(lines) or "（候補なし）"
 
 
@@ -703,6 +726,8 @@ def run_suggestions(
     force: bool = False,
     on_start: Callable[[int], None] | None = None,
     on_done: Callable[[Suggestion], None] | None = None,
+    inbox_dirs: Iterable[str] = (),
+    cards: dict[str, dict[str, str]] | None = None,
 ) -> list[Suggestion]:
     """受け皿のファイルについて、まとめて提案を作る（保存済みのものは使い回す）。
 
@@ -721,7 +746,8 @@ def run_suggestions(
         on_done: 1件終わるたびに呼ぶ。
     """
     excluded = list(excluded)
-    _inbox, files = find_inbox(conn, root_id, config.inbox_patterns, excluded)
+    inbox_dirs = list(inbox_dirs)
+    _inbox, files = find_inbox(conn, root_id, config.inbox_patterns, excluded, inbox_dirs)
     if only is not None:
         wanted = set(only)
         files = [f for f in files if f.relpath in wanted]
@@ -733,7 +759,9 @@ def run_suggestions(
         nonlocal ctx
         if ctx is None:
             check_ollama(config)
-            ctx = build_context(conn, root_id, root_name, config, excluded, decisions=decisions, tag_counts=tag_counts)
+            ctx = build_context(
+                conn, root_id, root_name, config, excluded, decisions=decisions, tag_counts=tag_counts, inbox_dirs=inbox_dirs, cards=cards
+            )
         return ctx
 
     out: list[Suggestion] = []

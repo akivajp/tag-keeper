@@ -40,6 +40,11 @@
     {"op": "unrelate",    "root": "onedrive", "from": "a/v2.docx", "to": "a/v1.docx", "kind": "前の版"}
     {"op": "relink-skip", "root": "onedrive", "path": "new/x.pdf", "sha256": "..."}
 
+ディレクトリの型とディレクトリカード（F-DR-1〜4）:
+
+    {"op": "dir-type", "root": "onedrive", "path": "archive", "type": "archive"}       # type が "" なら設定を外す（推定に任せる）
+    {"op": "dir-card", "root": "onedrive", "path": "経理/請求書", "description": "...", "naming": "YYYYMMDD_相手_件名"}  # 両方空なら外す
+
 古い版は知らない種類の行を読み飛ばす（互換を保つため、既存の行の書式は変えない）。
 
 パスは Unicode の NFC にそろえて扱う（F-ID-4。同じ名前でも NFC と NFD でバイト列が違うことがあるため）。
@@ -276,6 +281,9 @@ class TagStore:
         # アイテム間の関係（ルート名 → {(元, 先, 種類)}）と、結び付けを見送った移動（ルート名, 新しいパス, 内容ハッシュ）
         self.relations: dict[str, set[tuple[str, str, str]]] = {}
         self.relink_skips: set[tuple[str, str, str]] = set()
+        # ディレクトリの型（(ルート名, 相対パス) → 型）と、ディレクトリカード（(ルート名, 相対パス) → {description, naming}）
+        self.dir_types: dict[tuple[str, str], str] = {}
+        self.dir_cards: dict[tuple[str, str], dict[str, str]] = {}
         self._stamp: tuple[tuple[str, int, int], ...] = ()
 
     @property
@@ -311,6 +319,7 @@ class TagStore:
             self.aliases, self.parents = {}, {}
             self.attr_defs, self.attrs, self.searches = {}, {}, {}
             self.relations, self.relink_skips = {}, set()
+            self.dir_types, self.dir_cards = {}, {}
             for ev in events:
                 self._apply(ev)
             self._stamp = stamp
@@ -379,6 +388,10 @@ class TagStore:
                     return dst + path[len(src):] if _under(path, src) else path
 
                 self.relations[root] = {(moved_path(a), moved_path(b), k) for a, b, k in rels}
+            # ディレクトリの型とカードも追従させる
+            for table in (self.dir_types, self.dir_cards):
+                for k in [k for k in table if k[0] == root and _under(k[1], src)]:
+                    table[(root, dst + k[1][len(src):])] = table.pop(k)
         elif op == "alias":
             alias, tag = str(ev["alias"]), str(ev["tag"])
             if alias != tag:
@@ -428,6 +441,19 @@ class TagStore:
             self.relations.get(root, set()).discard((_nk(str(ev["from"])), _nk(str(ev["to"])), str(ev.get("kind") or "関連")))
         elif op == "relink-skip":
             self.relink_skips.add((root, _nk(str(ev["path"])), str(ev.get("sha256", ""))))
+        elif op == "dir-type":
+            key = (root, _nk(str(ev["path"])))
+            if ev.get("type"):
+                self.dir_types[key] = str(ev["type"])
+            else:
+                self.dir_types.pop(key, None)
+        elif op == "dir-card":
+            key = (root, _nk(str(ev["path"])))
+            card = {"description": str(ev.get("description") or ""), "naming": str(ev.get("naming") or "")}
+            if card["description"] or card["naming"]:
+                self.dir_cards[key] = card
+            else:
+                self.dir_cards.pop(key, None)
 
     # --- 書き込み ---
 
@@ -487,6 +513,7 @@ class TagStore:
             self.reload_if_changed()
             events = []
             rel_paths = {p for a, b, _k in self.relations.get(root, ()) for p in (a, b)}
+            rel_paths |= {k[1] for k in [*self.dir_types, *self.dir_cards] if k[0] == root}
             for src, dst in order_moves([(_nk(a), _nk(b)) for a, b in moves]):
                 if any(k[0] == root and _under(k[1], src) for k in [*self.items, *self.attrs]) or any(
                     _under(p, src) for p in rel_paths
@@ -901,6 +928,72 @@ class TagStore:
             self.reload_if_changed()
             return {(p, sha) for r, p, sha in self.relink_skips if r == root}
 
+    # --- ディレクトリの型とディレクトリカード（F-DR-1〜4） ---
+
+    def set_dir_type(self, root: str, path: str, type_: str) -> bool:
+        """フォルダの型を設定する（"" で外して推定に任せる）。変えたら True。型の名前の検査は呼び出し側（dirtypes）で行う。"""
+        path = _nk(path)
+        with self.lock:
+            self.reload_if_changed()
+            if self.dir_types.get((root, path), "") == type_:
+                return False
+            self._append([{"at": utcnow(), "host": self.host, "op": "dir-type", "root": root, "path": path, "type": type_}])
+        return True
+
+    def dir_types_of(self, root: str) -> dict[str, str]:
+        """ルートの中で、型を設定したフォルダ（相対パス → 型）。"""
+        with self.lock:
+            self.reload_if_changed()
+            return {p: t for (r, p), t in self.dir_types.items() if r == root}
+
+    def set_dir_card(self, root: str, path: str, description: str, naming: str) -> bool:
+        """ディレクトリカード（何を置く場所か・命名規則）を書く（両方空なら外す）。変えたら True。"""
+        path = _nk(path)
+        card = {"description": " ".join(description.split())[:1000], "naming": " ".join(naming.split())[:200]}
+        with self.lock:
+            self.reload_if_changed()
+            cur = self.dir_cards.get((root, path), {"description": "", "naming": ""})
+            if cur == card:
+                return False
+            self._append([{"at": utcnow(), "host": self.host, "op": "dir-card", "root": root, "path": path, **card}])
+        return True
+
+    def dir_cards_of(self, root: str) -> dict[str, dict[str, str]]:
+        """ルートの中のディレクトリカード（相対パス → {description, naming}）。"""
+        with self.lock:
+            self.reload_if_changed()
+            return {p: dict(c) for (r, p), c in self.dir_cards.items() if r == root}
+
+    def detach_dirmeta_under(self, root: str, base: str) -> dict[str, dict[str, Any]]:
+        """base とその配下の型とカードを外し、外したもの（相対パス → {type, card}）を返す（隔離のとき）。"""
+        base = _nk(base)
+        now = utcnow()
+        with self.lock:
+            self.reload_if_changed()
+            out: dict[str, dict[str, Any]] = {}
+            events: list[dict[str, Any]] = []
+            for (r, p), t in sorted(self.dir_types.items()):
+                if r == root and _under(p, base):
+                    out.setdefault(p, {})["type"] = t
+                    events.append({"at": now, "host": self.host, "op": "dir-type", "root": root, "path": p, "type": ""})
+            for (r, p), c in sorted(self.dir_cards.items()):
+                if r == root and _under(p, base):
+                    out.setdefault(p, {})["card"] = dict(c)
+                    events.append({"at": now, "host": self.host, "op": "dir-card", "root": root, "path": p, "description": "", "naming": ""})
+            self._append(events)
+        return out
+
+    def attach_dirmeta(self, root: str, detached: dict[str, dict[str, Any]]) -> int:
+        """detach_dirmeta_under で外した型とカードを戻す（取り消しのとき）。"""
+        n = 0
+        for p, meta in detached.items():
+            if meta.get("type"):
+                n += self.set_dir_type(root, p, str(meta["type"]))
+            card = meta.get("card")
+            if card:
+                n += self.set_dir_card(root, p, str(card.get("description", "")), str(card.get("naming", "")))
+        return n
+
     # --- 書き出しと読み込み（F-MD-9） ---
 
     def export_events(self) -> list[dict[str, Any]]:
@@ -921,6 +1014,8 @@ class TagStore:
             for r, rels in sorted(self.relations.items()):
                 out += [{"op": "relate", "root": r, "from": a, "to": b, "kind": k} for a, b, k in sorted(rels)]
             out += [{"op": "search-save", "name": n, "query": q} for n, q in sorted(self.searches.items())]
+            out += [{"op": "dir-type", "root": r, "path": p, "type": t} for (r, p), t in sorted(self.dir_types.items())]
+            out += [{"op": "dir-card", "root": r, "path": p, **c} for (r, p), c in sorted(self.dir_cards.items())]
             return out
 
     def import_events(self, events: Iterable[dict[str, Any]]) -> Counter[str]:
@@ -953,6 +1048,10 @@ class TagStore:
                 elif op == "search-save":
                     changed = str(ev["name"]) not in self.searches or self.searches[str(ev["name"])] != str(ev["query"])
                     self.save_search(str(ev["name"]), str(ev["query"]))
+                elif op == "dir-type":
+                    changed = self.set_dir_type(str(ev["root"]), str(ev["path"]), str(ev.get("type") or ""))
+                elif op == "dir-card":
+                    changed = self.set_dir_card(str(ev["root"]), str(ev["path"]), str(ev.get("description") or ""), str(ev.get("naming") or ""))
                 else:
                     raise TagError(f"読み込めない種類です: {op}")
             except (KeyError, TypeError) as e:

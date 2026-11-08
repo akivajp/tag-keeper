@@ -347,3 +347,8 @@ tr.gone td { opacity: .7; }
 /* 関係の欄 */
 .relations ul { margin: .25rem 0; padding-left: 1rem; }
 .relations .kind-input { width: 7em; }
+
+/* フォルダの型とディレクトリカード */
+.dir-meta { margin-top: .5rem; display: grid; gap: .25rem; }
+.dir-meta .toolbar { margin: 0; }
+textarea { width: 100%; font: inherit; }

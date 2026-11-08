@@ -9,6 +9,7 @@
     sync_client = "onedrive"         # 同期クライアント（大量に隔離するとき、同期を止めずに削除を反映する）。"cloud-sync"（rclone bisync の定期実行）も可
     sync_service = "onedrive.service"  # 常駐の同期の systemd --user ユニット（cloud-sync なら "cloud-sync-onedrive.service" か項目名）
     sync_guard = "auto"              # auto: 大量削除になるときだけ連携する / always: 実行のたびに連携する
+    replicas = { "OneDrive" = "onedrive" }  # 中のフォルダが別のルートの複製なら登録する（走査・重複検出・プランから外す）
 
     [hygiene]
     allow = ["archive/**"]           # 報告しないパス（「残す」と判断したもの）
@@ -95,6 +96,8 @@ class RootConfig:
     sync_service: str = "onedrive.service"
     # 同期クライアントと連携する条件。"auto": 大量削除とみなされるときだけ / "always": 実行のたびに
     sync_guard: str = "auto"
+    # 複製（バックアップ）として登録した中のフォルダ（ルートからの相対パス → 元のルート名）。走査・重複検出・プランから外す（F-SC-6）
+    replicas: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -229,6 +232,19 @@ def _expand(path: str) -> Path:
     return Path(os.path.expandvars(os.path.expanduser(path))).resolve()
 
 
+def _replicas(path: Path, i: int, raw: object) -> dict[str, str]:
+    """[[roots]] の replicas（{"中のフォルダ" = "元のルート名"}）を読む。"""
+    if not isinstance(raw, dict):
+        raise ConfigError(f"{path}: roots[{i}] の replicas は {{\"フォルダ\" = \"元のルート名\"}} の形で書いてください")
+    out: dict[str, str] = {}
+    for k, v in raw.items():
+        rel = str(k).strip("/")
+        if not rel or any(part in ("", ".", "..") for part in rel.split("/")):
+            raise ConfigError(f"{path}: roots[{i}] の replicas のフォルダが不正です: {k!r}")
+        out[rel] = str(v)
+    return out
+
+
 def load_config(path: Path | None = None) -> Config:
     """設定ファイルを読み込む。ファイルが無ければ既定値の設定を返す。
 
@@ -259,6 +275,7 @@ def load_config(path: Path | None = None) -> Config:
                 sync_client=sync_client,
                 sync_service=str(item.get("sync_service", "onedrive.service")),
                 sync_guard=sync_guard,
+                replicas=_replicas(path, i, item.get("replicas", {})),
             )
         )
     names = [r.name for r in roots]

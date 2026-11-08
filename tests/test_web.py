@@ -774,3 +774,48 @@ def test_cli_tag_attr_relate_export_import(tmp_path: Path, root: Path, capsys: p
     assert main([*base, "tag", "data", "case/v2.docx", "--remove", "種別:見積"]) == 0
     assert main([*base, "attr", "unset", "data", "対応状態", "case"]) == 0
     assert main([*base, "relate", "data", "case/v2.docx", "case/v1.docx", "--kind", "前の版", "--remove"]) == 0
+
+
+# ---------- ディレクトリの型・カード・複製（0.14） ----------
+
+
+def test_dir_type_card_and_draft_api(env: dict, monkeypatch: pytest.MonkeyPatch) -> None:
+    from tag_keeper import organize
+
+    app, root = env["app"], env["root"]
+    origin = {"Origin": f"http://{HOST}"}
+    write(root / "repo" / ".git" / "HEAD", "ref")
+    write(root / "repo" / "README.md", "x")
+    write(root / "cache" / "c.bin", "c")
+    run_job(env, "/api/roots/data/refresh")
+    browse = app.get("/api/browse", {"root": "data", "path": ""}).json
+    by_name = {e["name"]: e for e in browse["entries"]}
+    assert by_name["repo"]["dir_type"]["type"] == "bundle" and by_name["repo"]["dir_type"]["how"] == "inferred"
+    assert browse["dir"]["type"]["type"] == "normal" and {d["type"] for d in browse["dir_types"]} >= {"bundle", "exclude"}
+
+    # 型を付けると、配下に継承し、除外は次の走査から外れる
+    app.post_json("/api/dirtype", {"root": "data", "path": "cache", "type": "exclude"}, headers=origin)
+    app.post_json("/api/dirtype", {"root": "data", "path": "cache", "type": "bogus"}, headers=origin, status=400)
+    assert app.get("/api/browse", {"root": "data", "path": "cache"}).json["dir"]["type"] == {"type": "exclude", "label": "除外", "how": "set", "source": ""}
+    state = app.get("/api/state").json["roots"][0]
+    assert state["excluded"] == [{"path": "cache", "reason": "除外の型"}]
+    run_job(env, "/api/roots/data/refresh")
+    assert not app.get("/api/search", {"q": "c.bin"}).json["items"]
+
+    # カードを書く・外す
+    app.post_json("/api/dircard", {"root": "data", "path": "docs", "description": "大事な書類", "naming": "YYYYMMDD_件名"}, headers=origin)
+    assert app.get("/api/browse", {"root": "data", "path": "docs"}).json["dir"]["card"] == {"description": "大事な書類", "naming": "YYYYMMDD_件名"}
+    app.post_json("/api/dircard", {"root": "data", "path": "docs", "description": "", "naming": ""}, headers=origin)
+    assert app.get("/api/browse", {"root": "data", "path": "docs"}).json["dir"]["card"] is None
+
+    # 下書き: モデルの答えを返す。使えなければ命名規則だけ
+    monkeypatch.setattr(organize, "ollama_generate", lambda cfg, prompt, **kw: {"description": "書類の置き場所", "naming": "YYYYMMDD_件名"})
+    draft = app.post_json("/api/dircard/draft", {"root": "data", "path": "docs"}, headers=origin).json
+    assert draft["description"] == "書類の置き場所" and draft["note"] == ""
+
+    def unavailable(*a: object, **kw: object) -> dict:
+        raise organize.OllamaError("ollama に問い合わせられません")
+
+    monkeypatch.setattr(organize, "ollama_generate", unavailable)
+    draft = app.post_json("/api/dircard/draft", {"root": "data", "path": "docs"}, headers=origin).json
+    assert draft["description"] == "" and "ollama" in draft["note"]

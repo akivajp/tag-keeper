@@ -103,6 +103,7 @@ def walk_tree(
     root: Path,
     exclude: Iterable[str] = (),
     on_progress: Callable[[int], None] | None = None,
+    exclude_paths: Iterable[str] = (),
 ) -> WalkResult:
     """ルート配下を lstat でたどり、相対パスごとの観測結果を返す。
 
@@ -112,8 +113,10 @@ def walk_tree(
         root: ルートの絶対パス。
         exclude: 除外パターン（is_excluded を参照）。
         on_progress: フォルダを1つ読み終えるたびに、それまでの観測件数を渡して呼ぶ。
+        exclude_paths: 走査しないフォルダ（ルートからの相対パスそのもの。glob ではない。配下ごと飛ばす）。
     """
     patterns = list(exclude)
+    skip_paths = {unicodedata.normalize("NFC", p) for p in exclude_paths}
     result = WalkResult()
     stack: list[tuple[str, str]] = [("", str(root))]
     while stack:
@@ -134,6 +137,8 @@ def walk_tree(
                     result.undecodable += 1
                     continue
                 if patterns and is_excluded(rel, de.name, patterns):
+                    continue
+                if skip_paths and unicodedata.normalize("NFC", rel) in skip_paths:
                     continue
                 try:
                     st = de.stat(follow_symlinks=False)
@@ -183,6 +188,7 @@ def scan_root(
     exclude: Iterable[str] = (),
     accept_missing: bool = False,
     on_progress: Callable[[int], None] | None = None,
+    exclude_paths: Iterable[str] = (),
 ) -> ScanResult:
     """ルートを走査し、カタログを差分で更新する。
 
@@ -200,7 +206,7 @@ def scan_root(
     """
     check_root_available(root)
     started_at = utcnow()
-    walk = walk_tree(root, exclude, on_progress)
+    walk = walk_tree(root, exclude, on_progress, exclude_paths)
     observed = walk.observed
     now = utcnow()
     res = ScanResult(seen=len(observed), unreadable=len(walk.unreadable))
