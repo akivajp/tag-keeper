@@ -414,7 +414,7 @@ dir = "~/.local/share/tag-keeper/tags"   # where the per-machine tag logs live
 [organize]
 inbox_patterns = ["tmp", "temp", "*未整理*", "*inbox*"]  # case-insensitive globs on folder names
 ollama_url = "http://127.0.0.1:11434"
-model = "gemma3:12b"                     # e.g. "gemma4:31b-cloud" (content is sent to ollama's cloud)
+model = "gemma4:12b"                     # e.g. "gemma4:31b-cloud" (content is sent to ollama's cloud)
 vision_model = ""                        # model for images when `model` cannot read them
 model_choices = ["gemma4:31b-cloud"]     # extra models offered on the page
 local_model = "gemma4:12b"               # used instead of a cloud model for roots with allow_cloud = false

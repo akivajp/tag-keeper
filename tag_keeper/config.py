@@ -49,7 +49,7 @@
     [organize]
     inbox_patterns = ["tmp", "temp", "*未整理*", "*inbox*"]  # 受け皿とみなすフォルダ名（大文字・小文字を区別しない glob）
     ollama_url = "http://127.0.0.1:11434"
-    model = "gemma3:12b"             # 名前と移動先の提案に使うモデル（":cloud" などのクラウドのモデルも可。内容がクラウドに送られる）
+    model = "gemma4:12b"             # 名前と移動先の提案に使うモデル（":cloud" などのクラウドのモデルも可。内容がクラウドに送られる）
     vision_model = ""                # 画像を読むモデル（空なら model）
     model_choices = ["glm-5.3-flash:cloud", "gemma4:31b-cloud"]  # 画面で選べるモデルの候補
     use_images = true                # 画像と、文字の無いスキャン PDF をモデルに見せる
@@ -255,7 +255,7 @@ class OrganizeConfig:
     ollama_url: str = "http://127.0.0.1:11434"
     # 名前と移動先の提案に使うモデル（既定は手元のモデル）。
     # ollama のクラウドのモデル（例: "glm-5.3-flash:cloud"）も使えるが、その場合はファイルの内容が ollama のクラウドに送られる
-    model: str = "gemma3:12b"
+    model: str = "gemma4:12b"
     # 画像を読むモデル。空なら model を使う（model が画像を読めなければ、画像は見せずに名前と場所から判断する）
     vision_model: str = ""
     # 画面でモデルを選ぶときの候補（ollama の手元のモデルに加えて出す。クラウドのモデルは手元の一覧に出ないため）

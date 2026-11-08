@@ -249,8 +249,8 @@ def test_models_endpoint(env: dict, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(organize, "cached_capabilities", lambda oc, name: ["completion", "vision"] if name != "bad" else ["embedding"])
     monkeypatch.setattr(server, "_local_models", lambda oc: ["x:cloud", "bad"])
     data = env["app"].get("/api/models").json
-    assert data["default"] == "gemma3:12b"
-    assert [(m["name"], m["cloud"]) for m in data["models"]] == [("gemma3:12b", False), ("x:cloud", True)]
+    assert data["default"] == "gemma4:12b"
+    assert [(m["name"], m["cloud"]) for m in data["models"]] == [("gemma4:12b", False), ("x:cloud", True)]
 
 
 def test_rename_and_delete_from_the_browser(env: dict) -> None:

@@ -332,7 +332,7 @@ dir = "~/.local/share/tag-keeper/tags"   # 端末ごとのタグのログの置�
 [organize]
 inbox_patterns = ["tmp", "temp", "*未整理*", "*inbox*"]  # フォルダ名に照合する（大文字・小文字を区別しない）
 ollama_url = "http://127.0.0.1:11434"
-model = "gemma3:12b"                     # 例: "gemma4:31b-cloud"（内容が ollama のクラウドに送られる）
+model = "gemma4:12b"                     # 例: "gemma4:31b-cloud"（内容が ollama のクラウドに送られる）
 vision_model = ""                        # model が画像を読めないときに、画像を読むモデル
 model_choices = ["gemma4:31b-cloud"]     # 画面で選べるモデルの候補
 local_model = "gemma4:12b"               # allow_cloud = false のルートで、クラウドのモデルの代わりに使う
