@@ -247,6 +247,11 @@ and the theme (system, light or dark).
   flag, a date, a number or text — and set them on files and folders from the file browser or
   from search results. A choice holds a single value, values set on a folder are inherited by
   everything inside it, and attributes follow moves and come back with undo, like tags.
+- **Snapshot watch.** While the server runs, each new snapshot is compared with the one before
+  for every root; if many files vanished or were rewritten (a sync accident, ransomware), the
+  Roots page warns and offers to keep the snapshot from before the change out of snapper's
+  automatic cleanup (`tag-keeper snapwatch --protect N` does the same). It can also list large
+  files that remain only in snapshots, to help decide how long snapshots are kept.
 - **Version history** comes from btrfs snapshots through
   [btrfs-timeline](https://github.com/akivajp/btrfs-timeline): the versions of a file, a
   folder as it was at any snapshot (including what has since been deleted), and restoring
@@ -266,6 +271,13 @@ from a file's details; with `[ai] auto = true` new items are read in the backgro
 Set `allow_cloud = false` on a root whose content must not leave the machine (work files):
 cloud models (`…:cloud`) are then replaced by `[organize] local_model` for that root, for
 inbox suggestions, directory-card drafts and reading alike.
+
+### Digest
+
+`tag-keeper digest` writes a Markdown summary: new files in inboxes, candidates by category,
+structure suggestions, items waiting for review or move confirmation, the snapshot watch and
+what the quarantine holds. With `[digest] path` set, the web UI rewrites that file every
+`every_hours` (point it into an Obsidian vault to read it there).
 
 ### Transcripts of audio and video
 
@@ -418,6 +430,11 @@ device = "auto"                          # auto (GPU when possible) / cuda / cpu
 language = ""                            # "" = detect automatically
 vad_threshold = 0.2                      # lower catches quieter voices; too low invents text over noise
 max_minutes = 240                        # longer recordings are skipped
+
+[digest]
+path = ""                                # rewrite a Markdown digest here while the web UI runs ("" = off)
+every_hours = 24
+days = 7                                 # what counts as new
 
 [ai]
 auto = false                             # read new documents and images in the background

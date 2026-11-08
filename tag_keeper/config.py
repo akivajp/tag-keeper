@@ -222,6 +222,18 @@ class TranscribeConfig:
 
 
 @dataclass
+class DigestConfig:
+    """定期レポート（要件 F-UI-3）の設定。"""
+
+    # Web の画面（serve）を動かしている間、このファイルにレポートを書き直す（空なら書かない）
+    path: str = ""
+    # 書き直す間隔（時間）
+    every_hours: int = 24
+    # 「新着」とする日数
+    days: int = 7
+
+
+@dataclass
 class AiConfig:
     """書類の構造化抽出と画像の内容推定（要件 F-AI-1〜3・F-EX-3）の設定。モデルは [organize] のものを使う。"""
 
@@ -278,6 +290,7 @@ class Config:
     organize: OrganizeConfig = field(default_factory=OrganizeConfig)
     ai: AiConfig = field(default_factory=AiConfig)
     transcribe: TranscribeConfig = field(default_factory=TranscribeConfig)
+    digest: DigestConfig = field(default_factory=DigestConfig)
 
     def find_root(self, name: str) -> RootConfig | None:
         """名前でルートを探す。見つからなければ None を返す。"""
@@ -442,7 +455,14 @@ def load_config(path: Path | None = None) -> Config:
             setattr(transcribe, key, conv(tr[key]))
     if transcribe.device not in ("auto", "cuda", "cpu"):
         raise ConfigError(f"{path}: [transcribe] の device は auto・cuda・cpu のどれかにしてください: {transcribe.device}")
+    dg = data.get("digest", {})
+    digest = DigestConfig()
+    if "path" in dg:
+        digest.path = str(_expand(str(dg["path"]))) if str(dg["path"]) else ""
+    for key in ("every_hours", "days"):
+        if key in dg:
+            setattr(digest, key, int(dg[key]))
     return Config(
         roots=roots, hygiene=hygiene, safety=safety, scan=scan, plan=plan, tags=tags, extract=extract, organize=organize, ai=ai,
-        transcribe=transcribe,
+        transcribe=transcribe, digest=digest,
     )

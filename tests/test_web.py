@@ -837,3 +837,13 @@ def test_keep_from_the_report(env: dict) -> None:
     assert app.get(f"/api/plans/{plan_id}").json["ops"] == []
     app.post_json("/api/keep", {"root": "data", "path": "docs/Thumbs.db", "op": "remove"}, headers=origin)
     assert "docs/Thumbs.db" in {f["relpath"] for f in app.get("/api/report/data").json["findings"]}
+
+
+def test_digest_and_snapwatch_api(env: dict) -> None:
+    app = env["app"]
+    run_job(env, "/api/roots/data/refresh")
+    res = app.get("/api/digest")
+    assert res.content_type == "text/markdown" and "## data" in res.text
+    d = app.get("/api/snapwatch/data").json
+    assert set(d) == {"latest", "alerts", "snapshot_only", "snapper"}
+    app.post_json("/api/snapwatch/data/protect", {"snapshot": "x; rm"}, headers={"Origin": f"http://{HOST}"}, status=400)

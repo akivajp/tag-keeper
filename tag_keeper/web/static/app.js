@@ -392,6 +392,7 @@ async function pageRoots(main) {
       staleFor ? h('div', { class: 'alert warn' },
         t('最後の走査から {age} たっています。カタログ（タグの検索・レポート・移動の追従）が今のファイルと合っていない可能性があります。', { age: ageText(staleFor) }),
         st.auto_refresh > 0 ? null : ' ' + t('設定の [scan] auto_refresh で、自動で最新にできます。')) : null,
+      r.scanned ? snapwatchBlock(r.name) : null,
       (r.excluded || []).length ? h('p', { class: 'muted small' }, t('走査しないフォルダ: {list}', {
         list: r.excluded.map((x) => t('{path}（{reason}）', { path: x.path, reason: translateString(x.reason) })).join('、'),
       })) : null,
@@ -419,6 +420,46 @@ async function pageRoots(main) {
     ...cards,
     h('p', { class: 'muted' }, t('設定: {config} ／ 隔離先: {quarantine} ／ スナップショット: {snapper} ／ v{version}', { config: st.config_path, quarantine: st.quarantine_dir, snapper: st.snapper_config || t('撮らない'), version: st.version })),
   );
+}
+
+/**
+ * スナップショットの見張りの欄（ルートの画面）。最新の比較・警告（守る・消す）・スナップショットにだけ残る大きなファイル。
+ * 読み込みはあとから行う（btrfs でなければ何も出さない）。
+ */
+function snapwatchBlock(root) {
+  const holder = h('div', { class: 'snapwatch' });
+  const load = async () => {
+    let d;
+    try { d = await api(`/api/snapwatch/${enc(root)}`); } catch { return; }
+    if (!d.latest && !d.alerts.length && !d.snapshot_only) return;
+    const call = async (action, body, label) => {
+      try { await api(`/api/snapwatch/${enc(root)}/${action}`, body); if (label) toast(label); load(); } catch (e) { toast(e.message, 'danger'); }
+    };
+    const only = d.snapshot_only;
+    setChildren(holder,
+      d.latest ? h('p', { class: 'muted small' }, t('スナップショットの見張り: #{older} → #{newer} で 消えた {deleted}・変わった {changed}・増えた {added}', {
+        older: d.latest.older, newer: d.latest.newer, deleted: num(d.latest.deleted), changed: num(d.latest.changed), added: num(d.latest.added),
+      })) : null,
+      d.alerts.filter((a) => !(a.protected || []).length).map((a) => h('div', { class: 'alert danger' },
+        h('strong', {}, t('スナップショット #{older} → #{newer} のあいだで大きな変化: {alert}', { older: a.older, newer: a.newer, alert: a.alert })),
+        h('p', { class: 'small' }, '同期の事故やランサムウェアのおそれがあります。変化の前のスナップショットを、snapper の自動削除の対象から外して残せます。'),
+        a.examples.length ? h('div', { class: 'muted small path' }, a.examples.join('、')) : null,
+        h('div', { class: 'buttons' },
+          d.snapper ? h('button', { class: 'small primary', onclick: () => call('protect', { snapshot: a.older }, t('#{n} を残すようにしました', { n: a.older })) }, t('#{n} を残す（自動削除しない）', { n: a.older })) : null,
+          h('button', { class: 'small', onclick: () => call('dismiss', { newer: a.newer }) }, '問題ないので消す')))),
+      h('details', { class: 'small' },
+        h('summary', { class: 'muted' }, only ? t('スナップショットにだけ残る大きなファイル: {n} 件・{size}（{when} に調べた）', { n: num(only.total), size: size(only.total_bytes), when: when(only.checked_at) })
+          : t('スナップショットにだけ残る大きなファイルを調べる')),
+        only && only.items.length ? h('div', { class: 'table-wrap' }, h('table', {},
+          h('thead', {}, h('tr', {}, h('th', {}, 'パス'), h('th', { class: 'num' }, 'サイズ'), h('th', { class: 'num' }, '残っている数'), h('th', {}, '最も新しいもの'))),
+          h('tbody', {}, only.items.slice(0, 100).map((x) => h('tr', {},
+            h('td', { class: 'path' }, x.relpath), h('td', { class: 'num' }, size(x.size)), h('td', { class: 'num' }, num(x.snapshots)),
+            h('td', {}, h('a', { href: browseHref(root, x.relpath.split('/').slice(0, -1).join('/'), x.newest) }, `#${x.newest} ${when(x.newest_at)}`))))))) : null,
+        h('p', { class: 'muted small' }, '今のツリーに無い（パスと大きさで比べて）100MB 以上のファイルです。スナップショットの保持期間を見直す材料になります。'),
+        h('button', { class: 'small', disabled: jobRunning(), onclick: () => startJob(`/api/snapwatch/${enc(root)}/snapshot-only`, { min_mb: 100 }) }, '調べる')));
+  };
+  load();
+  return holder;
 }
 
 // ---------- 画面: 移動の確認（内容ハッシュでは決められなかったもの。F-ID-2） ----------

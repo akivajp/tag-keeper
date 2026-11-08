@@ -5,6 +5,8 @@
     tag-keeper hash [ROOT ...]       変わったファイルだけ内容ハッシュを計算する
     tag-keeper extract [ROOT ...]    本文を抽出して、全文検索の索引に入れる
     tag-keeper transcribe [ROOT ...] 音声・動画を書き起こして、全文検索の索引に入れる
+    tag-keeper digest [-o FILE]      今の状況を Markdown のレポートにまとめる
+    tag-keeper snapwatch [ROOT ...]  最新の2つのスナップショットを比べ、大きな変化を警告する
     tag-keeper tags / tag / alias / parent / attr / relate   タグ・辞書・属性・関係を見る・付ける
     tag-keeper export / import       管理情報の全量を JSONL で書き出す・読み込む
     tag-keeper search [WORD ...]     名前・本文（--text）・種類・タグで探す
@@ -351,6 +353,49 @@ def cmd_transcribe(args: argparse.Namespace, config: Config) -> int:
 
             transcribe.run_pending(conn, root_id, rc.path, opts, limit=args.limit, paths=args.path or None, force=bool(args.path),
                                    app_data=app_data_names(config), on_start=on_start, on_item=on_item)
+    return status
+
+
+def cmd_digest(args: argparse.Namespace, config: Config) -> int:
+    """今の状況を Markdown のレポートにまとめる（定期レポート）。"""
+    from tag_keeper import digest
+    from tag_keeper.snapwatch import Watch
+
+    conn = connect(args.db)
+    data_dir = args.db.parent
+    text = digest.build(conn, config, TagStore(config.tags.dir), plans_dir=data_dir / "plans", journal_dir=data_dir / "journal",
+                        watch=Watch(data_dir / "snapwatch.json"), days=args.days)
+    if args.output:
+        digest.write(args.output, text)
+        log.info("レポートを書きました: %s", args.output)
+    else:
+        sys.stdout.write(text)
+    return 0
+
+
+def cmd_snapwatch(args: argparse.Namespace, config: Config) -> int:
+    """最新の2つのスナップショットを比べる。--protect で、そのスナップショットを自動削除の対象から外す。"""
+    from tag_keeper import snapwatch
+
+    data_dir = args.db.parent
+    watch = snapwatch.Watch(data_dir / "snapwatch.json")
+    if args.protect:
+        snapwatch.protect(config.plan.snapper_config, args.protect)
+        for rc in config.roots:
+            watch.mark_protected(rc.name, args.protect)
+        log.info("スナップショット #%s を自動削除の対象から外しました", args.protect)
+        return 0
+    status = 0
+    for rc in resolve_roots(config, args.roots):
+        skip = scan_exclusions(config, rc, TagStore(config.tags.dir).dir_types_of(rc.name))
+        c = watch.check(rc.name, rc.path, exclude=rc.exclude, exclude_paths=skip, force=True)
+        if c is None:
+            log.info("%s: 比べられるスナップショットがありません（btrfs のスナップショットが2つ以上要る）", rc.name)
+            continue
+        log.info("%s: #%s → #%s  消えた %s・変わった %s・増えた %s%s", rc.name, c["older"], c["newer"], f"{c['deleted']:,}",
+                 f"{c['changed']:,}", f"{c['added']:,}", f"  ⚠ {c['alert']}" if c["alert"] else "")
+        if c["alert"]:
+            status = 1
     return status
 
 
@@ -999,6 +1044,16 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--path", action="append", metavar="PATH", help="このファイルだけを書き起こす（ルートからの相対パス。複数指定可。書き起こし済みでもやり直す）")
     p.add_argument("--model", default=None, help="この回に使うモデル（既定は [transcribe] model）")
     p.set_defaults(func=cmd_transcribe)
+
+    p = sub.add_parser("digest", help="今の状況を Markdown のレポートにまとめる（定期レポート）")
+    p.add_argument("-o", "--output", type=Path, default=None, help="書き出すファイル（省略時は標準出力）")
+    p.add_argument("--days", type=int, default=7, help="「新着」とする日数")
+    p.set_defaults(func=cmd_digest)
+
+    p = sub.add_parser("snapwatch", help="最新の2つのスナップショットを比べ、大きな変化を警告する")
+    p.add_argument("roots", nargs="*", metavar="ROOT", help="ルート名かフォルダのパス（省略時は全ルート）")
+    p.add_argument("--protect", metavar="NUMBER", default=None, help="このスナップショットを snapper の自動削除の対象から外す")
+    p.set_defaults(func=cmd_snapwatch)
 
     p = sub.add_parser("search", help="名前・本文・種類・タグで探す")
     p.add_argument("words", nargs="*", metavar="WORD", help="名前やフォルダに含む語（すべて含むもの）")

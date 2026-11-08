@@ -49,6 +49,7 @@ from tag_keeper.config import (
     load_config,
 )
 from tag_keeper.analyze import AnalyzeWorker
+from tag_keeper.snapwatch import Watch
 from tag_keeper.decisions import DecisionLog
 from tag_keeper.fulltext import KINDS, ExtractWorker, find_entries, index_status, query_terms, snippets
 from tag_keeper.hashing import hash_root, sha256_file
@@ -139,6 +140,8 @@ class Settings:
         self.extractor: ExtractWorker | None = None
         self.analyzer: AnalyzeWorker | None = None
         self.transcriber: Any = None
+        # スナップショットの見張りの結果（ルートごとの最新の比較と警告）
+        self.snapwatch = Watch(data_dir / "snapwatch.json")
 
     def sha256_of(self, path: Path) -> str:
         """ファイルの内容ハッシュ（大きさと更新日時が同じあいだは、計算し直さない）。"""
@@ -1019,6 +1022,75 @@ def create_app(
             store.record_review(rc.name, rel, str(it.get("sha256", "")), decision)
             done[decision] = done.get(decision, 0) + 1
         return done
+
+    @app.route("/api/snapwatch/<root>")
+    def api_snapwatch(root: str) -> dict[str, Any]:
+        """スナップショットの見張り: 最新の比較・警告・スナップショットにだけ残る大きなファイル（調べてあれば）。"""
+        config = settings.config()
+        rc = root_config(config, root)
+        only_file = settings.plans_dir.parent / f"snapshot-only-{rc.name}.json"
+        only = json.loads(only_file.read_text(encoding="utf-8")) if only_file.exists() else None
+        return {"latest": settings.snapwatch.latest(rc.name), "alerts": settings.snapwatch.alerts(rc.name), "snapshot_only": only,
+                "snapper": bool(config.plan.snapper_config)}
+
+    @app.post("/api/snapwatch/<root>/<action:re:check|protect|dismiss|snapshot-only>")
+    def api_snapwatch_action(root: str, action: str) -> dict[str, Any]:
+        """見張りの操作。check: 今すぐ比べる / protect: スナップショットを自動削除の対象から外す /
+        dismiss: 警告を消す / snapshot-only: スナップショットにだけ残る大きなファイルを調べる（ジョブ）。"""
+        from tag_keeper import snapwatch
+
+        data = body()
+        config = settings.config()
+        rc = root_config(config, root)
+        skip = scan_exclusions(config, rc, settings.tags(config).dir_types_of(rc.name))
+        if action == "check":
+            return {"latest": settings.snapwatch.check(rc.name, rc.path, exclude=rc.exclude, exclude_paths=skip, force=True)}
+        if action == "protect":
+            sid = str(data.get("snapshot", ""))
+            if not re.fullmatch(r"\d+", sid):
+                raise fail(400, f"スナップショットの番号が不正です: {sid}")
+            try:
+                snapwatch.protect(config.plan.snapper_config, sid)
+            except RuntimeError as e:
+                raise fail(409, str(e)) from e
+            settings.snapwatch.mark_protected(rc.name, sid)
+            return {"protected": sid}
+        if action == "dismiss":
+            settings.snapwatch.dismiss(rc.name, str(data.get("newer", "")))
+            return {"dismissed": True}
+        min_mb = max(1, int(data.get("min_mb") or 100))
+
+        def run(rep: JobReporter) -> dict[str, Any]:
+            conn = open_db()
+            try:
+                live = {r["relpath"]: r["size"] for r in conn.execute(
+                    "SELECT relpath, size FROM entries WHERE root_id = ? AND gone_at IS NULL AND is_dir = 0", (root_id_of(conn, rc),))}
+            finally:
+                conn.close()
+            rep.phase("スナップショットを読む")
+            res = snapwatch.snapshot_only_files(rc.path, live, min_bytes=min_mb * 1024 * 1024, exclude=rc.exclude, exclude_paths=skip,
+                                                on_progress=lambda i, n: (rep.set_total(n), rep.set_done(i)))
+            out = {"checked_at": utcnow(), "min_mb": min_mb, "items": [asdict(x) for x in res[:500]], "total": len(res),
+                   "total_bytes": sum(x.size for x in res)}
+            only_file = settings.plans_dir.parent / f"snapshot-only-{rc.name}.json"
+            only_file.write_text(json.dumps(out, ensure_ascii=False), encoding="utf-8")
+            return {"total": len(res), "total_bytes": out["total_bytes"]}
+
+        return start("snapshot-only", f"スナップショットにだけ残るファイル: {rc.name}", run, target=rc.name)
+
+    @app.route("/api/digest")
+    def api_digest() -> Any:
+        """定期レポートの Markdown（今の状況）。"""
+        from tag_keeper import digest
+
+        config = settings.config()
+        conn = open_db()
+        try:
+            text = digest.build(conn, config, settings.tags(config), plans_dir=settings.plans_dir, journal_dir=settings.journal_dir,
+                                watch=settings.snapwatch, days=config.digest.days)
+        finally:
+            conn.close()
+        return bottle.HTTPResponse(body=text, headers={"Content-Type": "text/markdown; charset=utf-8"})
 
     @app.post("/api/keep")
     def api_keep() -> dict[str, Any]:
@@ -2079,20 +2151,53 @@ def start_auto_refresh(settings: Settings, jobs: JobManager, name: str) -> bool:
     return True
 
 
-def _auto_refresh_loop(auto: AutoRefresh, stop: threading.Event, first: float = 60.0, every: float = 30.0) -> None:
-    """自動で最新にするかを、一定の間隔で確かめ続ける（serve の裏のスレッド）。
+def _auto_refresh_loop(
+    auto: AutoRefresh, stop: threading.Event, first: float = 60.0, every: float = 30.0, extra: list[Any] | None = None
+) -> None:
+    """自動で最新にするかを、一定の間隔で確かめ続ける（serve の裏のスレッド）。extra の関数も毎回呼ぶ（見張り・定期レポート）。
 
     起動の直後は、ネットワークなどが落ち着くまで first 秒待つ。
     """
     if stop.wait(first):
         return
     while True:
-        try:
-            auto.tick()
-        except Exception as e:  # noqa: BLE001 - 一時的な失敗（カタログのロックなど）で止めない
-            log.warning("自動で最新にするかの確認に失敗しました: %s", e)
+        for fn in [auto.tick, *(extra or [])]:
+            try:
+                fn()
+            except Exception as e:  # noqa: BLE001 - 一時的な失敗（カタログのロックなど）で止めない
+                log.warning("裏の定期の処理に失敗しました: %s", e)
         if stop.wait(every):
             return
+
+
+def watch_snapshots(settings: Settings) -> None:
+    """各ルートの最新の2つのスナップショットを比べる（同じ組は保存した結果を使うので、ふだんは何もしない）。F-VS-5。"""
+    config = settings.config()
+    for rc in config.roots:
+        skip = scan_exclusions(config, rc, TagStore(config.tags.dir).dir_types_of(rc.name))
+        settings.snapwatch.check(rc.name, rc.path, exclude=rc.exclude, exclude_paths=skip)
+
+
+def write_digest_if_due(settings: Settings) -> None:
+    """[digest] path があり、前に書いてから every_hours 以上たっていれば、定期レポートを書き直す。F-UI-3。"""
+    import time as _time
+
+    from tag_keeper import digest
+
+    config = settings.config()
+    if not config.digest.path:
+        return
+    path = Path(config.digest.path)
+    if path.exists() and _time.time() - path.stat().st_mtime < config.digest.every_hours * 3600:
+        return
+    conn = connect(settings.db_path)
+    try:
+        text = digest.build(conn, config, settings.tags(config), plans_dir=settings.plans_dir, journal_dir=settings.journal_dir,
+                            watch=settings.snapwatch, days=config.digest.days)
+    finally:
+        conn.close()
+    digest.write(path, text)
+    log.info("定期レポートを書きました: %s", path)
 
 
 def _run_scan(conn: sqlite3.Connection, root_id: int, rc: RootConfig, config: Config, rep: JobReporter) -> dict[str, Any]:
@@ -2193,7 +2298,8 @@ def serve(
     # 動かしている間は、ルートを自動で最新に保つ（[scan] の auto_refresh・after_sync）
     stop = threading.Event()
     auto = AutoRefresh(lambda: root_timings(settings), lambda name: start_auto_refresh(settings, jobs, name))
-    threading.Thread(target=_auto_refresh_loop, args=(auto, stop), name="auto-refresh", daemon=True).start()
+    extra = [lambda: watch_snapshots(settings), lambda: write_digest_if_due(settings)]
+    threading.Thread(target=_auto_refresh_loop, args=(auto, stop), kwargs={"extra": extra}, name="auto-refresh", daemon=True).start()
     # 裏で本文を抽出し、全文検索の索引を作る（[extract] enabled。止めていても、設定を変えれば再起動なしで始まる）
     settings.extractor = ExtractWorker(settings.db_path, settings.config)
     settings.extractor.start()

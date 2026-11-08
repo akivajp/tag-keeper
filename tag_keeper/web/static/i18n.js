@@ -258,6 +258,17 @@ const I18N_EN = {
   // --- 書き起こし（0.17） ---
   '書き起こし': 'Transcript', '書き起こしを始めました': 'Transcription started', '（声がありませんでした）': '(no speech)',
   '書き起こし直す': 'Transcribe again', 'もう一度書き起こす': 'Try again', '書き起こす（文字にして検索できるようにする）': 'Transcribe (make it searchable)',
+  // --- スナップショットの見張り・定期レポート（0.18） ---
+  'スナップショットの見張り: #{older} → #{newer} で 消えた {deleted}・変わった {changed}・増えた {added}': 'Snapshot watch: #{older} → #{newer}: {deleted} gone, {changed} changed, {added} added',
+  'スナップショット #{older} → #{newer} のあいだで大きな変化: {alert}': 'Big change between snapshots #{older} and #{newer}: {alert}',
+  '同期の事故やランサムウェアのおそれがあります。変化の前のスナップショットを、snapper の自動削除の対象から外して残せます。':
+    'This may be a sync accident or ransomware. You can keep the snapshot from before the change out of snapper’s automatic cleanup.',
+  '#{n} を残すようにしました': 'Snapshot #{n} will be kept', '#{n} を残す（自動削除しない）': 'Keep #{n} (no automatic cleanup)', '問題ないので消す': 'It is fine, dismiss',
+  'スナップショットにだけ残る大きなファイル: {n} 件・{size}（{when} に調べた）': 'Large files only in snapshots: {n}, {size} (checked {when})',
+  'スナップショットにだけ残る大きなファイルを調べる': 'Find large files that only remain in snapshots', '残っている数': 'In snapshots', '最も新しいもの': 'Newest',
+  '今のツリーに無い（パスと大きさで比べて）100MB 以上のファイルです。スナップショットの保持期間を見直す材料になります。':
+    'Files of 100 MB or more that are not in the current tree (by path and size): material for reviewing how long snapshots are kept.',
+  '調べる': 'Check', 'スナップショットを読む': 'Reading snapshots',
   // --- 検索（名前・本文・種類・タグ） ---
   '検索': 'Search', '名前やフォルダで探す': 'Search names and folders', '本文に含む語': 'Words in the text', 'PDF・Office・テキストの本文から探します（文字の無いスキャンは OCR で読んだもの）': 'Searches the text of PDF, Office and text files (scans without text are read by OCR)',
   '種類': 'Kind', 'すべての種類': 'All kinds', '書類（PDF・Office・テキスト）': 'Documents (PDF, Office, text)', 'Office 文書': 'Office documents',
@@ -354,9 +365,10 @@ const I18N_EN = {
 
 // サーバーから来る、変数を含む文（正規表現 → 英語）
 const I18N_PATTERNS = [
-  [/^(走査|ハッシュ計算|最新にする（走査とハッシュ計算）|自動で最新にする|プランの作成|整理の提案|実行|取り消し|隔離を空にする|書類の読み取り|書き起こし|確認|削除の反映の再試行|常駐の同期の再開): (.+)$/, (m) => `${{
+  [/^(走査|ハッシュ計算|最新にする（走査とハッシュ計算）|自動で最新にする|プランの作成|整理の提案|実行|取り消し|隔離を空にする|書類の読み取り|書き起こし|スナップショットにだけ残るファイル|確認|削除の反映の再試行|常駐の同期の再開): (.+)$/, (m) => `${{
     '走査': 'Scan', 'ハッシュ計算': 'Hash', '最新にする（走査とハッシュ計算）': 'Refresh (scan and hash)', '自動で最新にする': 'Auto refresh',
     'プランの作成': 'Create plan', '隔離を空にする': 'Empty quarantine', '書類の読み取り': 'Read documents', '書き起こし': 'Transcribe',
+    'スナップショットにだけ残るファイル': 'Files only in snapshots',
     '整理の提案': 'Inbox suggestions', '実行': 'Apply', '取り消し': 'Undo', '確認': 'Check', '削除の反映の再試行': 'Retry reflecting deletions',
     '常駐の同期の再開': 'Restart resident sync',
   }[m[1]]}: ${m[2]}`],
@@ -367,6 +379,8 @@ const I18N_PATTERNS = [
   [/^(\.\S+) は一時ファイルや自動バックアップに使われる$/, (m) => `${m[1]} is used for temporary files and automatic backups`],
   [/^端末名（(.+)）付きの競合コピー$/, (m) => `conflict copy with device name (${m[1]})`],
   [/^後継版: (.+)$/, (m) => `superseded by ${m[1]}`],
+  [/^([\d,]+) 件（(\d+%)）が消えた$/, (m) => `${m[1]} (${m[2]}) gone`],
+  [/^([\d,]+) 件（(\d+%)）が書き換わった$/, (m) => `${m[1]} (${m[2]}) rewritten`],
   [/^([\d,]+) 日触れていない。保管先の見直しの候補$/, (m) => `untouched for ${m[1]} days; consider other storage`],
   [/^直下にファイルが ([\d,]+) 件$/, (m) => `${m[1]} files directly inside`],
 ];

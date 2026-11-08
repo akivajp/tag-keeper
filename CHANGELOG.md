@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Snapshot watch**: each new snapshot is compared with the previous one per root; mass
+  deletions or rewrites raise a warning on the Roots page with a button that keeps the earlier
+  snapshot out of snapper's cleanup (`tag-keeper snapwatch`, `--protect`). Large files that
+  remain only in snapshots can be listed.
+- **Digest**: `tag-keeper digest` (and `GET /api/digest`) writes a Markdown summary; with
+  `[digest] path` the web UI rewrites it every `every_hours`.
+
 ## [0.17.0] - 2026-11-08
 
 ### Added
