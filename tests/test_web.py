@@ -819,3 +819,21 @@ def test_dir_type_card_and_draft_api(env: dict, monkeypatch: pytest.MonkeyPatch)
     monkeypatch.setattr(organize, "ollama_generate", unavailable)
     draft = app.post_json("/api/dircard/draft", {"root": "data", "path": "docs"}, headers=origin).json
     assert draft["description"] == "" and "ollama" in draft["note"]
+
+
+def test_keep_from_the_report(env: dict) -> None:
+    app = env["app"]
+    origin = {"Origin": f"http://{HOST}"}
+    run_job(env, "/api/roots/data/refresh")
+    rep = app.get("/api/report/data").json
+    assert "docs/Thumbs.db" in {f["relpath"] for f in rep["findings"]} and "structure" in rep
+    app.post_json("/api/keep", {"root": "data", "path": "docs/Thumbs.db", "reason": ""}, headers=origin, status=400)
+    app.post_json("/api/keep", {"root": "data", "path": "docs/Thumbs.db", "reason": "サムネイルを使う"}, headers=origin)
+    rep = app.get("/api/report/data").json
+    assert "docs/Thumbs.db" not in {f["relpath"] for f in rep["findings"]}
+    assert rep["kept"] == [{"path": "docs/Thumbs.db", "reason": "サムネイルを使う"}]
+    # 残したものはプランにも入らない
+    plan_id = run_job(env, "/api/plans", {"root": "data", "categories": ["os-junk"]})["result"]["plan_id"]
+    assert app.get(f"/api/plans/{plan_id}").json["ops"] == []
+    app.post_json("/api/keep", {"root": "data", "path": "docs/Thumbs.db", "op": "remove"}, headers=origin)
+    assert "docs/Thumbs.db" in {f["relpath"] for f in app.get("/api/report/data").json["findings"]}

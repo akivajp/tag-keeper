@@ -15,6 +15,10 @@
     allow = ["archive/**"]           # 報告しないパス（「残す」と判断したもの）
     device_names = ["zefat", "hermon"]  # 競合コピーの名前に付く端末名
     app_data_names = ["MyGameLauncher"] # 既定に加えて、アプリのデータとみなすフォルダ名
+    disabled = ["stale-large"]       # 使わない検出ルール（カテゴリの短い名前）
+    stale_min_mb = 500               # 「大きくて長く触れていないもの」の大きさ（MB）
+    stale_days = 365                 # …と、触れていない日数
+    fanout_max = 200                 # 構造の見直しで「直下のファイルが多すぎる」とする数
 
     [safety]
     mass_missing_ratio = 0.2         # 一度に消えたとみなす割合がこれを超えたら確定を保留する
@@ -112,6 +116,13 @@ class HygieneConfig:
     app_data_names: list[str] = field(default_factory=list)
     # この数以上のファイルを抱え、拡張子の無いファイルが過半数のフォルダをアプリのデータとみなす
     app_data_min_files: int = 500
+    # 使わない検出ルール（カテゴリの短い名前。例: ["temp", "stale-large"]）
+    disabled: list[str] = field(default_factory=list)
+    # 「大きくて長く触れていないもの」の大きさ（MB）と、触れていない日数
+    stale_min_mb: int = 500
+    stale_days: int = 365
+    # 構造の見直しで「直下のファイルが多すぎる」とするファイルの数
+    fanout_max: int = 200
 
 
 @dataclass
@@ -292,6 +303,11 @@ def load_config(path: Path | None = None) -> Config:
         hygiene.app_data_names = [str(n) for n in hy["app_data_names"]]
     if "app_data_min_files" in hy:
         hygiene.app_data_min_files = int(hy["app_data_min_files"])
+    if "disabled" in hy:
+        hygiene.disabled = [str(x) for x in hy["disabled"]]
+    for key in ("stale_min_mb", "stale_days", "fanout_max"):
+        if key in hy:
+            setattr(hygiene, key, int(hy[key]))
 
     sf = data.get("safety", {})
     safety = SafetyConfig()

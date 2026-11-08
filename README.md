@@ -73,6 +73,16 @@ $ tag-keeper search --text invoice         # search by name, text (--text), kind
     content differs from the original are marked as needing review
   - empty files and folders
   - exact duplicates, confirmed by hash (never guessed from size)
+  - archives next to the folder they were extracted to, versions superseded by a newer one
+    (from a *previous version* relation), and large files untouched for a long time (as
+    candidates for other storage; these need review and stay out of plans by default)
+  - **Keep** any candidate with a reason (from the report page) and it stops being reported;
+    rules can be turned off with `[hygiene] disabled`.
+  - **Structure review**: folders with too many files, sibling folders whose names overlap
+    (`invoices` / `Invoices2`… with the same digits), duplicate or missing numbers in numbered
+    folders, mixed date formats, chains of single subfolders, identical folders and folders
+    mixing kinds of files. These are suggestions only; archive, bundle and app-managed folders
+    are not reviewed.
 
 The catalog is an SQLite file outside the tree (`~/.local/share/tag-keeper/catalog.db` by
 default). None of these commands writes into the tree.

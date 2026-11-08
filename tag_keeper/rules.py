@@ -24,6 +24,9 @@ CAT_OS_JUNK = "OS・アプリが作るゴミ"
 CAT_TEMP = "一時ファイル・バックアップ"
 CAT_EMPTY_FILE = "空ファイル"
 CAT_EMPTY_DIR = "空フォルダ"
+CAT_EXTRACTED = "展開済みの圧縮ファイル"
+CAT_OLD_VERSION = "後継版がある旧版"
+CAT_STALE_LARGE = "大きくて長く触れていないもの"
 
 CATEGORY_ORDER = [
     CAT_APP_DATA,
@@ -36,7 +39,13 @@ CATEGORY_ORDER = [
     CAT_TEMP,
     CAT_EMPTY_FILE,
     CAT_EMPTY_DIR,
+    CAT_EXTRACTED,
+    CAT_OLD_VERSION,
+    CAT_STALE_LARGE,
 ]
+
+# 圧縮ファイルの拡張子（展開済みのフォルダと並んでいるかを調べる）
+ARCHIVE_EXTS = (".zip", ".7z", ".rar", ".tar", ".tar.gz", ".tgz", ".tar.bz2", ".tar.xz", ".lzh")
 
 # コマンドラインでカテゴリを指定するための短い名前
 CATEGORY_KEYS = {
@@ -50,6 +59,9 @@ CATEGORY_KEYS = {
     "temp": CAT_TEMP,
     "empty-file": CAT_EMPTY_FILE,
     "empty-dir": CAT_EMPTY_DIR,
+    "extracted-archive": CAT_EXTRACTED,
+    "old-version": CAT_OLD_VERSION,
+    "stale-large": CAT_STALE_LARGE,
 }
 
 # 作り直せる生成物のフォルダ名（中身ごと候補にする）

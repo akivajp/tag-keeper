@@ -491,8 +491,37 @@ async function pageReport(main, root) {
     return h('details', { class: 'group' },
       h('summary', {}, h('span', { class: 'title' }, c),
         h('span', { class: 'muted' }, t('{n} 件・ファイル {files}・{size}', { n: num(items.length), files: num(sum(items, 'files')), size: size(sum(items, 'size')) }))),
-      h('div', { class: 'body table-wrap' }, findingTable(items)));
+      r.category_help && r.category_help[c] ? h('p', { class: 'muted small' }, translateString(r.category_help[c])) : null,
+      h('div', { class: 'body table-wrap' }, findingTable(items, root)));
   });
+
+  // 構造の見直しの提案（F-OR-5）: 種類ごとにまとめ、ファイルブラウザで見直せるようにする
+  const issuesBy = {};
+  for (const i of r.structure || []) (issuesBy[i.kind] ||= []).push(i);
+  const structure = Object.keys(issuesBy).length ? [
+    h('h2', {}, '構造の見直しの提案'),
+    h('p', { class: 'muted' }, '人の判断が要るので、自動では何もしません。フォルダを開いて見直すか、「残す」で以後は出さないようにできます。保管・まとまり・アプリ管理の型のフォルダの中は見ていません。'),
+    ...Object.entries(issuesBy).map(([kind, list]) => h('details', { class: 'group' },
+      h('summary', {}, h('span', { class: 'title' }, translateString(list[0].label)), h('span', { class: 'muted' }, t('{n} 件', { n: num(list.length) }))),
+      h('div', { class: 'body table-wrap' }, h('table', {},
+        h('thead', {}, h('tr', {}, h('th', {}, 'フォルダ'), h('th', {}, '内容'), h('th', {}, ''))),
+        h('tbody', {}, list.map((i) => h('tr', {},
+          h('td', { class: 'path' }, h('a', { href: browseHref(root, i.path) }, i.path || root),
+            i.paths.filter((p) => p !== i.path).map((p) => h('div', {}, h('a', { href: browseHref(root, p) }, p)))),
+          h('td', { class: 'muted' }, i.detail),
+          h('td', {}, h('button', { class: 'small', onclick: () => keepDialog(root, i.path) }, '残す…'))))))))),
+  ] : [];
+
+  // 「残す」と判断したもの（外すと、次のレポートからまた出る）
+  const kept = (r.kept || []).length ? h('details', { class: 'group' },
+    h('summary', {}, h('span', { class: 'title' }, '「残す」と判断したもの'), h('span', { class: 'muted' }, t('{n} 件', { n: num(r.kept.length) }))),
+    h('div', { class: 'body table-wrap' }, h('table', {},
+      h('thead', {}, h('tr', {}, h('th', {}, 'パス'), h('th', {}, '理由'), h('th', {}, ''))),
+      h('tbody', {}, r.kept.map((k) => h('tr', {},
+        h('td', { class: 'path' }, k.path), h('td', { class: 'muted' }, k.reason),
+        h('td', {}, h('button', { class: 'small', onclick: async () => {
+          try { await api('/api/keep', { root, path: k.path, op: 'remove' }); app.render(); } catch (e) { toast(e.message, 'danger'); }
+        } }, '外す')))))))) : null;
 
   const dup = r.duplicates.length ? h('details', { class: 'group' },
     h('summary', {}, h('span', { class: 'title' }, '内容が同じファイル'),
@@ -513,19 +542,33 @@ async function pageReport(main, root) {
     h('h2', {}, '置く価値の薄いものの候補'),
     ...groups,
     dup,
+    ...structure,
+    kept,
   );
+}
+
+/** 候補・見直しの提案を「残す」と記録する（理由を書いてもらう）。以後のレポートには出さない。 */
+async function keepDialog(root, path) {
+  const input = h('input', { class: 'name-input', placeholder: t('理由（例: 検証用に残す・別のバックアップが無い）') });
+  setTimeout(() => input.focus(), 50);
+  const ok = await confirmDialog(t('「{path}」を残しますか？', { path: path || root }), [
+    input, h('p', { class: 'muted small' }, t('以後、整理の候補と構造の見直しに出しません（配下も含む）。レポートの「「残す」と判断したもの」から外せます。')),
+  ], t('残す'));
+  if (!ok) return;
+  try { await api('/api/keep', { root, path, reason: input.value }); app.render(); } catch (e) { toast(e.message, 'danger'); }
 }
 
 function sum(items, key) { return items.reduce((a, x) => a + (x[key] || 0), 0); }
 
-function findingTable(items) {
+function findingTable(items, root) {
   return h('table', {},
-    h('thead', {}, h('tr', {}, h('th', {}, 'パス'), h('th', { class: 'hide-narrow' }, '理由'), h('th', { class: 'num' }, 'ファイル'), h('th', { class: 'num' }, '容量'))),
+    h('thead', {}, h('tr', {}, h('th', {}, 'パス'), h('th', { class: 'hide-narrow' }, '理由'), h('th', { class: 'num' }, 'ファイル'), h('th', { class: 'num' }, '容量'), root ? h('th', {}, '') : null)),
     h('tbody', {}, items.map((f) => h('tr', {},
       h('td', { class: 'path' }, f.relpath + (f.is_dir ? '/' : ''), f.needs_review ? [' ', h('span', { class: 'badge warn' }, t('要確認'))] : null),
       h('td', { class: 'hide-narrow muted' }, f.reason),
       h('td', { class: 'num' }, num(f.files)),
-      h('td', { class: 'num' }, size(f.size))))));
+      h('td', { class: 'num' }, size(f.size)),
+      root ? h('td', {}, h('button', { class: 'small', onclick: () => keepDialog(root, f.relpath) }, '残す…')) : null))));
 }
 
 // ---------- 画面: プランの一覧 ----------

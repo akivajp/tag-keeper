@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **More findings**: archives next to their extracted folder, versions superseded by a newer
+  one (from *previous version* relations), and large files untouched for long (`stale-large`,
+  `[hygiene] stale_min_mb` / `stale_days`; needs review, not in plans by default).
+- **Keep with a reason**: any candidate or structure suggestion can be kept from the report
+  page; kept items are listed there and can be released. Rules can be turned off with
+  `[hygiene] disabled`.
+- **Structure review** on the report page and in `tag-keeper report`: too many files in a
+  folder (`[hygiene] fanout_max`), overlapping sibling names, numbering gaps and duplicates,
+  mixed date formats, single-child chains, identical folders (grouped by where they differ)
+  and folders mixing kinds of files.
+
 ## [0.14.0] - 2026-11-08
 
 ### Added

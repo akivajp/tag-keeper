@@ -118,6 +118,9 @@ def build_report(
     hygiene: HygieneConfig,
     *,
     top_fanout: int = 15,
+    kept: Iterable[str] = (),
+    old_versions: dict[str, str] | None = None,
+    now_ns: int | None = None,
 ) -> Report:
     """カタログからルートの報告を作る。
 
@@ -127,7 +130,17 @@ def build_report(
         root_name: 表示用のルート名。
         hygiene: 検出ルールの設定（報告しないパス・端末名など）。
         top_fanout: 直下のファイル数が多いフォルダを何件まで載せるか。
+        kept: 利用者が「残す」と判断したパス（配下ごと報告しない。F-OR-2）。
+        old_versions: 「前の版」の関係で後継版があるとされた旧版（旧版 → 後継版）。
+        now_ns: 今の時刻（ナノ秒。「長く触れていない」の判定に使う。テスト用）。
     """
+    import time
+    import unicodedata
+
+    disabled = {rules.CATEGORY_KEYS.get(k, k) for k in hygiene.disabled}
+
+    def enabled(cat: str) -> bool:
+        return cat not in disabled
     rows = conn.execute(
         "SELECT relpath, is_dir, size, mtime_ns, sha256, hashed_size, hashed_mtime_ns"
         " FROM entries WHERE root_id = ? AND gone_at IS NULL",
@@ -136,6 +149,15 @@ def build_report(
     files = [r for r in rows if not r["is_dir"]]
     dirs = sorted((r["relpath"] for r in rows if r["is_dir"]))
     allow = hygiene.allow
+    # 「残す」と判断したもの（パスは NFC で記録しているので、カタログのパスもそろえて比べる）
+    kept_set = {unicodedata.normalize("NFC", p) for p in kept}
+
+    def is_kept(relpath: str) -> bool:
+        if not kept_set:
+            return False
+        p = unicodedata.normalize("NFC", relpath)
+        return p in kept_set or any(a in kept_set for a in ancestors(p) if a)
+
     report = Report(
         root=root_name,
         files=len(files),
@@ -160,14 +182,14 @@ def build_report(
     app_names = rules.DEFAULT_APP_DATA_NAMES | set(hygiene.app_data_names)
     flagged: set[str] = set()
     for d in dirs:
-        if _under(d, flagged) or _matches_any(d, allow):
+        if _under(d, flagged) or _matches_any(d, allow) or is_kept(d):
             continue
         name = d.rsplit("/", 1)[-1]
-        if name in rules.REGENERABLE_DIRS:
+        if name in rules.REGENERABLE_DIRS and enabled(rules.CAT_REGENERABLE):
             match = rules.Match(rules.CAT_REGENERABLE, f"{name} はビルドや実行で作り直せる")
-        elif name in app_names:
+        elif name in app_names and enabled(rules.CAT_APP_DATA):
             match = rules.Match(rules.CAT_APP_DATA, "既知のアプリのデータ")
-        elif name.lower() in rules.CACHE_DIR_NAMES and desc_files[d] > 0:
+        elif name.lower() in rules.CACHE_DIR_NAMES and desc_files[d] > 0 and enabled(rules.CAT_APP_DATA):
             match = rules.Match(rules.CAT_APP_DATA, "キャッシュ")
         else:
             continue
@@ -198,6 +220,8 @@ def build_report(
         if rest_files[d] >= hygiene.app_data_min_files
         and rest_noext[d] * 2 >= rest_files[d]
         and not _matches_any(d, allow)
+        and not is_kept(d)
+        and enabled(rules.CAT_APP_DATA)
     ]
     # 条件を満たす子孫を持たない、最も深いものだけを残す
     deepest = [d for d in qualifying if not any(q.startswith(d + "/") for q in qualifying)]
@@ -220,10 +244,12 @@ def build_report(
     direct_files: Counter[str] = Counter()
     for r in files:
         rel = r["relpath"]
-        if _under(rel, flagged) or _matches_any(rel, allow):
+        if _under(rel, flagged) or _matches_any(rel, allow) or is_kept(rel):
             continue
         direct_files[parent_of(rel)] += 1
         match = rules.classify_file(rel, r["size"], hygiene.device_names)
+        if match is not None and not enabled(match.category):
+            match = None
         needs_review = False
         if match is not None and match.category == rules.CAT_CONFLICT:
             match, needs_review = _check_conflict_original(r, by_path, match, hygiene.device_names)
@@ -236,8 +262,58 @@ def build_report(
 
     # 4. 空フォルダ
     for d in dirs:
-        if d not in non_empty and not _under(d, flagged) and not _matches_any(d, allow):
+        if d not in non_empty and not _under(d, flagged) and not _matches_any(d, allow) and not is_kept(d) and enabled(rules.CAT_EMPTY_DIR):
             report.findings.append(Finding(rules.CAT_EMPTY_DIR, d, True, 0, 0, "中身が無い"))
+
+    reported = {f.relpath for f in report.findings}
+
+    def open_for(rel: str) -> bool:
+        """ほかのカテゴリでまだ報告しておらず、除外・残すの対象でもないか。"""
+        return rel not in reported and not _under(rel, flagged) and not _matches_any(rel, allow) and not is_kept(rel)
+
+    # 5. 展開済みの圧縮ファイル（同じフォルダに、拡張子を除いた名前のフォルダがあるもの。中身が全部そろっているかは人が確かめる）
+    dir_set = set(dirs)
+    if enabled(rules.CAT_EXTRACTED):
+        for r in files:
+            rel = r["relpath"]
+            low = rel.lower()
+            ext = next((e for e in rules.ARCHIVE_EXTS if low.endswith(e)), None)
+            if ext is None or not open_for(rel):
+                continue
+            folder = rel[: -len(ext)]
+            if folder in dir_set and desc_files[folder] > 0:
+                report.findings.append(Finding(
+                    rules.CAT_EXTRACTED, rel, False, 1, r["size"],
+                    f"展開したフォルダ（{folder.rsplit('/', 1)[-1]}/、{desc_files[folder]:,} 件）が隣にある。中身がそろっているか確認が必要", True,
+                ))
+                reported.add(rel)
+
+    # 6. 後継版がある旧版（「前の版」の関係を張ったもの。後継版が今もあるときだけ）
+    live = {r["relpath"]: r for r in rows}
+    if enabled(rules.CAT_OLD_VERSION):
+        nfc_live = {unicodedata.normalize("NFC", p): p for p in live}
+        for old, newer in sorted((old_versions or {}).items()):
+            o, n = nfc_live.get(old), nfc_live.get(newer)
+            if o is None or n is None or not open_for(o):
+                continue
+            row = live[o]
+            files_n = desc_files[o] if row["is_dir"] else 1
+            size_n = desc_bytes[o] if row["is_dir"] else row["size"]
+            report.findings.append(Finding(rules.CAT_OLD_VERSION, o, bool(row["is_dir"]), files_n, size_n, f"後継版: {n}"))
+            reported.add(o)
+
+    # 7. 大きくて長く触れていないもの（消すのではなく、保管先の見直しの候補。プランには既定で含めない）
+    if enabled(rules.CAT_STALE_LARGE):
+        now = now_ns if now_ns is not None else time.time_ns()
+        cutoff = now - hygiene.stale_days * 86400 * 1_000_000_000
+        limit = hygiene.stale_min_mb * 1024 * 1024
+        for r in files:
+            rel = r["relpath"]
+            if r["size"] >= limit and r["mtime_ns"] < cutoff and open_for(rel):
+                days = (now - r["mtime_ns"]) // (86400 * 1_000_000_000)
+                report.findings.append(Finding(
+                    rules.CAT_STALE_LARGE, rel, False, 1, r["size"], f"{days:,} 日触れていない。保管先の見直しの候補", True,
+                ))
 
     groups = [
         DuplicateGroup(sha, rs[0]["size"], sorted(r["relpath"] for r in rs))
@@ -284,4 +360,28 @@ def _hash_is_current(row: sqlite3.Row) -> bool:
         row["sha256"] is not None
         and row["hashed_size"] == row["size"]
         and row["hashed_mtime_ns"] == row["mtime_ns"]
+    )
+
+
+def user_report(conn: sqlite3.Connection, root_id: int, root_name: str, config: Any, store: Any, *, top_fanout: int = 15) -> Report:
+    """利用者の判断（「残す」・「前の版」の関係）を反映した報告（画面・CLI・プランの作成で使う）。
+
+    Args:
+        config: tag-keeper 全体の設定（Config）。
+        store: タグのログ（TagStore）。
+    """
+    return build_report(
+        conn, root_id, root_name, config.hygiene, top_fanout=top_fanout,
+        kept=store.kept_of(root_name), old_versions=store.old_versions(root_name),
+    )
+
+
+def structure_issues(conn: sqlite3.Connection, root_id: int, root_name: str, config: Any, store: Any, report: Report) -> list[Any]:
+    """構造の見直しの提案（F-OR-5）。報告でアプリのデータ・作り直せる生成物としたフォルダの中は見ない。"""
+    from tag_keeper import structure
+
+    skip = [f.relpath for f in report.findings if f.is_dir and f.category in (rules.CAT_APP_DATA, rules.CAT_REGENERABLE)]
+    return structure.review(
+        conn, root_id, types=store.dir_types_of(root_name), skip=skip, kept=store.kept_of(root_name),
+        fanout_max=config.hygiene.fanout_max, inbox_patterns=config.organize.inbox_patterns,
     )

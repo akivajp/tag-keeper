@@ -81,7 +81,7 @@ from tag_keeper.plan import (
     undo_plan,
     write_plan,
 )
-from tag_keeper.report import Report, build_report
+from tag_keeper.report import Report, structure_issues, user_report
 from tag_keeper.scan import RootUnavailableError, relink_by_hash, scan_root
 from tag_keeper.syncguard import SyncError, SyncGuard, make_guard
 from tag_keeper.tags import TagError, TagStore
@@ -583,8 +583,17 @@ def cmd_report(args: argparse.Namespace, config: Config) -> int:
         if row is None or last_scan(conn, row["id"]) is None:
             log.error("まだ走査していません: %s（先に tag-keeper scan を実行してください）", rc.name)
             return 2
-        report = build_report(conn, row["id"], rc.name, config.hygiene, top_fanout=args.top)
+        store = TagStore(config.tags.dir)
+        report = user_report(conn, row["id"], rc.name, config, store, top_fanout=args.top)
         render_report(report, args.examples)
+        issues = structure_issues(conn, row["id"], rc.name, config, store, report)
+        if issues:
+            st = Table(title="構造の見直しの提案")
+            for col in ("種類", "フォルダ", "内容"):
+                st.add_column(col)
+            for i in issues:
+                st.add_row(i.to_dict()["label"], i.path or "（ルート）", i.detail)
+            out_console.print(st)
         reports.append(report)
     if args.json is not None:
         args.json.parent.mkdir(parents=True, exist_ok=True)
@@ -637,7 +646,7 @@ def cmd_plan(args: argparse.Namespace, config: Config) -> int:
     if row is None or last_scan(conn, row["id"]) is None:
         log.error("まだ走査していません: %s（先に tag-keeper scan を実行してください）", rc.name)
         return 2
-    report = build_report(conn, row["id"], rc.name, config.hygiene)
+    report = user_report(conn, row["id"], rc.name, config, TagStore(config.tags.dir))
     plan = build_plan(
         report, rc.name, rc.path, _parse_categories(args.category), include_review=args.include_review
     )

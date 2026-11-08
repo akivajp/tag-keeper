@@ -84,7 +84,7 @@ from tag_keeper.plan import (
     undo_plan,
     write_plan,
 )
-from tag_keeper.report import build_report
+from tag_keeper.report import build_report, structure_issues, user_report
 from tag_keeper.scan import RootUnavailableError, link_move, relink_by_hash, relink_candidates, scan_root
 from tag_keeper.suggest_queue import SuggestQueue
 from tag_keeper.syncguard import CloudSyncGuard, OneDriveGuard, SyncError, SyncGuard, make_guard
@@ -322,10 +322,20 @@ def create_app(
             row = conn.execute("SELECT id FROM roots WHERE name = ?", (rc.name,)).fetchone()
             if row is None or last_scan(conn, row["id"]) is None:
                 raise fail(409, f"まだ走査していません: {rc.name}")
-            report = build_report(conn, row["id"], rc.name, config.hygiene)
+            store = settings.tags(config)
+            report = user_report(conn, row["id"], rc.name, config, store)
+            issues = structure_issues(conn, row["id"], rc.name, config, store, report)
         finally:
             conn.close()
         data = report.to_dict()
+        # 構造の見直しの提案と、「残す」と判断したもの（F-OR-2・F-OR-5）
+        data["structure"] = [i.to_dict() for i in issues]
+        data["kept"] = [{"path": p, "reason": why} for p, why in sorted(store.kept_of(rc.name).items())]
+        data["category_help"] = {
+            rules.CAT_EXTRACTED: "圧縮ファイルの隣に、展開したフォルダがあるもの。中身がそろっていれば、圧縮ファイルは要りません。",
+            rules.CAT_OLD_VERSION: "「前の版」の関係を張った旧版のうち、後継版が今もあるもの。",
+            rules.CAT_STALE_LARGE: "大きくて長く更新していないファイル。消すのではなく、保管先（ローカルや別のクラウド）の見直しの候補です。",
+        }
         data["duplicate_groups"] = len(report.duplicates)
         data["duplicate_waste"] = sum(g.waste for g in report.duplicates)
         data["duplicates"] = data["duplicates"][:DUPLICATE_LIMIT]
@@ -445,7 +455,7 @@ def create_app(
                 if row is None or last_scan(conn, row["id"]) is None:
                     raise PlanError(f"まだ走査していません: {rc.name}")
                 rep.phase("レポートの作成")
-                report = build_report(conn, row["id"], rc.name, config.hygiene)
+                report = user_report(conn, row["id"], rc.name, config, settings.tags(config))
             finally:
                 conn.close()
             rep.phase("対象の状態の記録", total=len(report.findings))
@@ -877,6 +887,18 @@ def create_app(
             conn.close()
         moved = store.follow_moves(rc.name, [(old_rel, new_rel)])
         return {"from": old_rel, "to": new_rel, "tag_moves": moved}
+
+    @app.post("/api/keep")
+    def api_keep() -> dict[str, Any]:
+        """整理の候補・構造の見直しを「残す」と記録する（理由つき。op=remove で外す）。F-OR-2。"""
+        data = body()
+        config = settings.config()
+        rc = root_config(config, str(data.get("root", "")))
+        rel = clean_relpath(str(data.get("path", "")))
+        store = settings.tags(config)
+        if data.get("op") == "remove":
+            return {"changed": store.unkeep(rc.name, rel)}
+        return {"changed": store.keep(rc.name, rel, str(data.get("reason", "")))}
 
     @app.post("/api/dirtype")
     def api_dirtype() -> dict[str, Any]:

@@ -224,6 +224,23 @@ const I18N_EN = {
   '完了したものの保管場所。構造の見直しの対象から外します。': 'An archive of finished things. Left out of the structure review.',
   '走査しません（キャッシュなど）。次の走査から、カタログでは消えた扱いになります。': 'Not scanned (caches and the like). From the next scan it counts as gone in the catalog.',
   '走査しないフォルダ: {list}': 'Not scanned: {list}', '{path}（{reason}）': '{path} ({reason})', '除外の型': 'excluded type',
+  // --- 整理の支援の残り（0.15） ---
+  '構造の見直しの提案': 'Structure review',
+  '人の判断が要るので、自動では何もしません。フォルダを開いて見直すか、「残す」で以後は出さないようにできます。保管・まとまり・アプリ管理の型のフォルダの中は見ていません。':
+    'These need your judgement, so nothing is done automatically. Open the folder to review it, or choose “Keep” to stop seeing it. Archive, bundle and app-managed folders are not reviewed.',
+  '残す…': 'Keep…', '残す': 'Keep', '「残す」と判断したもの': 'Kept', '内容': 'Details',
+  '理由（例: 検証用に残す・別のバックアップが無い）': 'Reason (e.g. kept for testing, no other backup)',
+  '「{path}」を残しますか？': 'Keep “{path}”?',
+  '以後、整理の候補と構造の見直しに出しません（配下も含む）。レポートの「「残す」と判断したもの」から外せます。':
+    'It (and everything inside it) will no longer appear in the candidates or the structure review. You can undo this under “Kept” in the report.',
+  '展開済みの圧縮ファイル': 'Extracted archives', '後継版がある旧版': 'Superseded versions', '大きくて長く触れていないもの': 'Large files untouched for long',
+  '直下のファイルが多すぎるフォルダ': 'Folders with too many files', '意味が重なっていそうな兄弟のフォルダ': 'Sibling folders that may overlap',
+  '番号付きのフォルダの番号の重複・欠番': 'Duplicate or missing numbers', '日付のフォルダの名前の書式の混在': 'Mixed date formats',
+  '子が1つだけの入れ子の連鎖': 'Chains of single subfolders', '中身がまったく同じフォルダ': 'Identical folders', '中身の種類が混ざったフォルダ': 'Folders mixing kinds of files',
+  '圧縮ファイルの隣に、展開したフォルダがあるもの。中身がそろっていれば、圧縮ファイルは要りません。': 'An archive next to the folder it was extracted to. If the folder is complete, the archive is not needed.',
+  '「前の版」の関係を張った旧版のうち、後継版が今もあるもの。': 'Items marked as the previous version of something that still exists.',
+  '大きくて長く更新していないファイル。消すのではなく、保管先（ローカルや別のクラウド）の見直しの候補です。': 'Large files not changed for a long time: candidates for moving to other storage, not for deleting.',
+  '残す理由を書いてください': 'Enter a reason for keeping it',
   // --- 検索（名前・本文・種類・タグ） ---
   '検索': 'Search', '名前やフォルダで探す': 'Search names and folders', '本文に含む語': 'Words in the text', 'PDF・Office・テキストの本文から探します（文字の無いスキャンは OCR で読んだもの）': 'Searches the text of PDF, Office and text files (scans without text are read by OCR)',
   '種類': 'Kind', 'すべての種類': 'All kinds', '書類（PDF・Office・テキスト）': 'Documents (PDF, Office, text)', 'Office 文書': 'Office documents',
@@ -332,6 +349,9 @@ const I18N_PATTERNS = [
   [/^拡張子の無いファイルが ([\d,]+) 件中 ([\d,]+) 件$/, (m) => `${m[2]} of ${m[1]} files have no extension`],
   [/^(\.\S+) は一時ファイルや自動バックアップに使われる$/, (m) => `${m[1]} is used for temporary files and automatic backups`],
   [/^端末名（(.+)）付きの競合コピー$/, (m) => `conflict copy with device name (${m[1]})`],
+  [/^後継版: (.+)$/, (m) => `superseded by ${m[1]}`],
+  [/^([\d,]+) 日触れていない。保管先の見直しの候補$/, (m) => `untouched for ${m[1]} days; consider other storage`],
+  [/^直下にファイルが ([\d,]+) 件$/, (m) => `${m[1]} files directly inside`],
 ];
 
 const I18N_JA_CHARS = /[぀-ヿ一-鿿]/;

@@ -40,6 +40,11 @@
     {"op": "unrelate",    "root": "onedrive", "from": "a/v2.docx", "to": "a/v1.docx", "kind": "前の版"}
     {"op": "relink-skip", "root": "onedrive", "path": "new/x.pdf", "sha256": "..."}
 
+整理の候補で「残す」と判断したもの（F-OR-2。以後は報告しない）:
+
+    {"op": "keep",   "root": "onedrive", "path": "archive/old.iso", "reason": "検証用に残す"}
+    {"op": "unkeep", "root": "onedrive", "path": "archive/old.iso"}
+
 ディレクトリの型とディレクトリカード（F-DR-1〜4）:
 
     {"op": "dir-type", "root": "onedrive", "path": "archive", "type": "archive"}       # type が "" なら設定を外す（推定に任せる）
@@ -284,6 +289,8 @@ class TagStore:
         # ディレクトリの型（(ルート名, 相対パス) → 型）と、ディレクトリカード（(ルート名, 相対パス) → {description, naming}）
         self.dir_types: dict[tuple[str, str], str] = {}
         self.dir_cards: dict[tuple[str, str], dict[str, str]] = {}
+        # 「残す」と判断したもの（(ルート名, 相対パス) → 理由）
+        self.kept: dict[tuple[str, str], str] = {}
         self._stamp: tuple[tuple[str, int, int], ...] = ()
 
     @property
@@ -319,7 +326,7 @@ class TagStore:
             self.aliases, self.parents = {}, {}
             self.attr_defs, self.attrs, self.searches = {}, {}, {}
             self.relations, self.relink_skips = {}, set()
-            self.dir_types, self.dir_cards = {}, {}
+            self.dir_types, self.dir_cards, self.kept = {}, {}, {}
             for ev in events:
                 self._apply(ev)
             self._stamp = stamp
@@ -389,7 +396,7 @@ class TagStore:
 
                 self.relations[root] = {(moved_path(a), moved_path(b), k) for a, b, k in rels}
             # ディレクトリの型とカードも追従させる
-            for table in (self.dir_types, self.dir_cards):
+            for table in (self.dir_types, self.dir_cards, self.kept):
                 for k in [k for k in table if k[0] == root and _under(k[1], src)]:
                     table[(root, dst + k[1][len(src):])] = table.pop(k)
         elif op == "alias":
@@ -441,6 +448,10 @@ class TagStore:
             self.relations.get(root, set()).discard((_nk(str(ev["from"])), _nk(str(ev["to"])), str(ev.get("kind") or "関連")))
         elif op == "relink-skip":
             self.relink_skips.add((root, _nk(str(ev["path"])), str(ev.get("sha256", ""))))
+        elif op == "keep":
+            self.kept[(root, _nk(str(ev["path"])))] = str(ev.get("reason") or "")
+        elif op == "unkeep":
+            self.kept.pop((root, _nk(str(ev["path"]))), None)
         elif op == "dir-type":
             key = (root, _nk(str(ev["path"])))
             if ev.get("type"):
@@ -513,7 +524,7 @@ class TagStore:
             self.reload_if_changed()
             events = []
             rel_paths = {p for a, b, _k in self.relations.get(root, ()) for p in (a, b)}
-            rel_paths |= {k[1] for k in [*self.dir_types, *self.dir_cards] if k[0] == root}
+            rel_paths |= {k[1] for k in [*self.dir_types, *self.dir_cards, *self.kept] if k[0] == root}
             for src, dst in order_moves([(_nk(a), _nk(b)) for a, b in moves]):
                 if any(k[0] == root and _under(k[1], src) for k in [*self.items, *self.attrs]) or any(
                     _under(p, src) for p in rel_paths
@@ -994,6 +1005,43 @@ class TagStore:
                 n += self.set_dir_card(root, p, str(card.get("description", "")), str(card.get("naming", "")))
         return n
 
+    # --- 整理の候補で「残す」と判断したもの（F-OR-2） ---
+
+    def keep(self, root: str, path: str, reason: str) -> bool:
+        """候補を「残す」と記録する（理由つき。以後は報告しない）。変えたら True。"""
+        path = _nk(path)
+        reason = " ".join(reason.split())[:300]
+        if not reason:
+            raise TagError("残す理由を書いてください")
+        with self.lock:
+            self.reload_if_changed()
+            if self.kept.get((root, path)) == reason:
+                return False
+            self._append([{"at": utcnow(), "host": self.host, "op": "keep", "root": root, "path": path, "reason": reason}])
+        return True
+
+    def unkeep(self, root: str, path: str) -> bool:
+        """「残す」の記録を外す（また報告するようにする）。外したら True。"""
+        path = _nk(path)
+        with self.lock:
+            self.reload_if_changed()
+            if (root, path) not in self.kept:
+                return False
+            self._append([{"at": utcnow(), "host": self.host, "op": "unkeep", "root": root, "path": path}])
+        return True
+
+    def kept_of(self, root: str) -> dict[str, str]:
+        """ルートの中で「残す」と判断したもの（相対パス → 理由）。"""
+        with self.lock:
+            self.reload_if_changed()
+            return {p: r for (rt, p), r in self.kept.items() if rt == root}
+
+    def old_versions(self, root: str) -> dict[str, str]:
+        """「前の版」の関係で、後継版があるとされた旧版（旧版の相対パス → 後継版の相対パス）。"""
+        with self.lock:
+            self.reload_if_changed()
+            return {b: a for a, b, k in self.relations.get(root, ()) if k == "前の版"}
+
     # --- 書き出しと読み込み（F-MD-9） ---
 
     def export_events(self) -> list[dict[str, Any]]:
@@ -1016,6 +1064,7 @@ class TagStore:
             out += [{"op": "search-save", "name": n, "query": q} for n, q in sorted(self.searches.items())]
             out += [{"op": "dir-type", "root": r, "path": p, "type": t} for (r, p), t in sorted(self.dir_types.items())]
             out += [{"op": "dir-card", "root": r, "path": p, **c} for (r, p), c in sorted(self.dir_cards.items())]
+            out += [{"op": "keep", "root": r, "path": p, "reason": why} for (r, p), why in sorted(self.kept.items())]
             return out
 
     def import_events(self, events: Iterable[dict[str, Any]]) -> Counter[str]:
@@ -1048,6 +1097,8 @@ class TagStore:
                 elif op == "search-save":
                     changed = str(ev["name"]) not in self.searches or self.searches[str(ev["name"])] != str(ev["query"])
                     self.save_search(str(ev["name"]), str(ev["query"]))
+                elif op == "keep":
+                    changed = self.keep(str(ev["root"]), str(ev["path"]), str(ev.get("reason") or ""))
                 elif op == "dir-type":
                     changed = self.set_dir_type(str(ev["root"]), str(ev["path"]), str(ev.get("type") or ""))
                 elif op == "dir-card":
