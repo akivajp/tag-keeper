@@ -854,7 +854,16 @@ function dirMetaBlock(root, path, data) {
       h('strong', {}, t('ディレクトリカード: ')),
       card ? h('span', {}, card.description, card.naming ? h('span', { class: 'muted small' }, t('（命名: {naming}）', { naming: card.naming })) : null)
         : h('span', { class: 'muted small' }, t('何を置く場所かを書いておくと、整理の提案が移動先を選ぶときに使います。')),
-      h('button', { class: 'small', onclick: () => dirCardDialog(root, path, card) }, card ? t('編集…') : t('書く…'))));
+      h('button', { class: 'small', onclick: () => dirCardDialog(root, path, card) }, card ? t('編集…') : t('書く…'))),
+    data.dir.extract ? h('div', { class: 'toolbar' },
+      h('label', { class: 'small' }, h('input', {
+        type: 'checkbox', checked: data.dir.extract.enabled, disabled: !!data.dir.extract.from && data.dir.extract.from !== path,
+        onchange: async (e) => {
+          try { await api('/api/dirextract', { root, path, extract: e.target.checked }); app.render(); }
+          catch (err) { toast(err.message, 'danger'); }
+        },
+      }), ' ', t('中の本文を全文検索の索引に入れる（書き起こしも）')),
+      data.dir.extract.from && data.dir.extract.from !== path ? h('span', { class: 'muted small' }, t('{from} で入れない設定にしています', { from: data.dir.extract.from || root })) : null) : null);
 }
 
 /** ディレクトリカードを書く画面。モデルに下書きさせることもできる（保存は「保存する」を押したときだけ）。 */

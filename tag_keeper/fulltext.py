@@ -91,6 +91,7 @@ def pending(
     app_data: Iterable[str] = (),
     limit: int | None = None,
     skip: Iterable[str] = (),
+    no_extract: Iterable[str] = (),
 ) -> list[Pending]:
     """本文をまだ抽出していないファイル。書類を優先し、新しいものから順に返す。
 
@@ -105,7 +106,11 @@ def pending(
         app_data: アプリのデータとみなすフォルダ名（中は索引に入れない）。
         limit: 返す件数の上限。
         skip: 飛ばす内容ハッシュ（この実行では読めなかったものなど）。
+        no_extract: 本文を索引に入れないフォルダ（配下も含む。F-EX-7）。
     """
+    import unicodedata as _ud
+
+    closed = [_ud.normalize("NFC", p) for p in no_extract]
     exts = sorted(extract.index_exts(cfg.ocr and cfg.ocr_images))
     # 拡張子での絞り込みは SQL で行う（索引に入れない種類のファイルが多くても、毎回 Python で全件を見ないように）
     like = " OR ".join("e.relpath LIKE ?" for _ in exts)
@@ -124,6 +129,8 @@ def pending(
     for r in rows:
         sha, rel = str(r["sha256"]), str(r["relpath"])
         if sha in skipped or ext_of(rel) not in want or _skipped(rel, app):
+            continue
+        if closed and any(_ud.normalize("NFC", rel).startswith(c + "/") for c in closed):
             continue
         cur = best.get(sha)
         if cur is None or r["mtime_ns"] > cur.mtime_ns:
@@ -198,7 +205,8 @@ def run_pending(
     """抽出していないファイルの本文を、まとめて抽出して保存する（CLI の extract）。"""
     cfg = config.extract
     ocr_lang = extract.ocr_languages(cfg.ocr_lang) if cfg.ocr else None
-    items = pending(conn, root_id, cfg, ocr_ready=ocr_lang is not None, app_data=app_data_names(config), limit=limit)
+    items = pending(conn, root_id, cfg, ocr_ready=ocr_lang is not None, app_data=app_data_names(config), limit=limit,
+                    no_extract=_no_extract(config, root_id, conn))
     if on_start is not None:
         on_start(len(items))
     res = ExtractResult()
@@ -218,11 +226,20 @@ def run_pending(
     return res
 
 
+def _no_extract(config: Config, root_id: int, conn: sqlite3.Connection) -> list[str]:
+    """ルートの「本文を索引に入れない」フォルダ（タグのログから）。"""
+    from tag_keeper.tags import TagStore
+
+    row = conn.execute("SELECT name FROM roots WHERE id = ?", (root_id,)).fetchone()
+    return TagStore(config.tags.dir).no_extract_of(str(row["name"])) if row is not None else []
+
+
 def index_status(conn: sqlite3.Connection, root_id: int, config: Config) -> dict[str, Any]:
     """索引の状況（画面の表示用）: 抽出済みの数・待っている数・OCR を使えるか・索引があるか。"""
     cfg = config.extract
     ocr_lang = extract.ocr_languages(cfg.ocr_lang) if cfg.ocr else None
-    waiting = len(pending(conn, root_id, cfg, ocr_ready=ocr_lang is not None, app_data=app_data_names(config)))
+    waiting = len(pending(conn, root_id, cfg, ocr_ready=ocr_lang is not None, app_data=app_data_names(config),
+                          no_extract=_no_extract(config, root_id, conn)))
     (indexed,) = conn.execute(
         "SELECT COUNT(DISTINCT x.sha256) FROM extracts x JOIN entries e ON e.sha256 = x.sha256"
         " WHERE e.root_id = ? AND e.gone_at IS NULL AND x.method IN ('pdftotext', 'office', 'text', 'ocr', 'transcript', 'describe')",
@@ -473,6 +490,7 @@ class ExtractWorker:
                 items = pending(
                     conn, int(row["id"]), cfg, ocr_ready=ocr_lang is not None,
                     app_data=app_data_names(config), limit=self.batch, skip=self._skip,
+                    no_extract=_no_extract(config, int(row["id"]), conn),
                 )
                 for it in items:
                     if self._stop.is_set():

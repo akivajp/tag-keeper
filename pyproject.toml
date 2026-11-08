@@ -13,7 +13,7 @@ license-files = ["LICENSE"]
 authors = [{ name = "Akiva Miura", email = "akiva.miura@gmail.com" }]
 keywords = ["file-management", "tagging", "catalog", "cloud-drive", "onedrive", "pcloud", "self-hosted"]
 classifiers = [
-    "Development Status :: 2 - Pre-Alpha",
+    "Development Status :: 3 - Alpha",
     "Environment :: Console",
     "Environment :: Web Environment",
     "Framework :: Bottle",

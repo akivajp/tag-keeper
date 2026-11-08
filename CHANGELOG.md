@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Keep a folder's text out of the index** (inherited by the folders inside): a checkbox in
+  the file browser's type and card panel; text extraction and transcription both skip it.
+
+### Changed
+
+- The README status is now alpha, and the roadmap lists what is left to consider.
+
 ## [0.18.0] - 2026-11-08
 
 ### Added

@@ -53,6 +53,7 @@ AI の読み取りの結果に対する判断（F-AI-2。承認したタグと�
 
     {"op": "dir-type", "root": "onedrive", "path": "archive", "type": "archive"}       # type が "" なら設定を外す（推定に任せる）
     {"op": "dir-card", "root": "onedrive", "path": "経理/請求書", "description": "...", "naming": "YYYYMMDD_相手_件名"}  # 両方空なら外す
+    {"op": "dir-extract", "root": "onedrive", "path": "code/repo", "extract": false}  # 本文を索引に入れない（F-EX-7。true で戻す）
 
 古い版は知らない種類の行を読み飛ばす（互換を保つため、既存の行の書式は変えない）。
 
@@ -293,6 +294,8 @@ class TagStore:
         # ディレクトリの型（(ルート名, 相対パス) → 型）と、ディレクトリカード（(ルート名, 相対パス) → {description, naming}）
         self.dir_types: dict[tuple[str, str], str] = {}
         self.dir_cards: dict[tuple[str, str], dict[str, str]] = {}
+        # 本文を索引に入れないフォルダ（(ルート名, 相対パス)。配下も含む）
+        self.no_extract: set[tuple[str, str]] = set()
         # 「残す」と判断したもの（(ルート名, 相対パス) → 理由）
         self.kept: dict[tuple[str, str], str] = {}
         # AI の読み取りの結果に対する判断（(ルート名, 相対パス, 内容ハッシュ) → accept / reject）
@@ -333,6 +336,7 @@ class TagStore:
             self.attr_defs, self.attrs, self.searches = {}, {}, {}
             self.relations, self.relink_skips = {}, set()
             self.dir_types, self.dir_cards, self.kept, self.reviews = {}, {}, {}, {}
+            self.no_extract = set()
             for ev in events:
                 self._apply(ev)
             self._stamp = stamp
@@ -405,6 +409,9 @@ class TagStore:
             for table in (self.dir_types, self.dir_cards, self.kept):
                 for k in [k for k in table if k[0] == root and _under(k[1], src)]:
                     table[(root, dst + k[1][len(src):])] = table.pop(k)
+            for k in [k for k in self.no_extract if k[0] == root and _under(k[1], src)]:
+                self.no_extract.discard(k)
+                self.no_extract.add((root, dst + k[1][len(src):]))
         elif op == "alias":
             alias, tag = str(ev["alias"]), str(ev["tag"])
             if alias != tag:
@@ -454,6 +461,12 @@ class TagStore:
             self.relations.get(root, set()).discard((_nk(str(ev["from"])), _nk(str(ev["to"])), str(ev.get("kind") or "関連")))
         elif op == "relink-skip":
             self.relink_skips.add((root, _nk(str(ev["path"])), str(ev.get("sha256", ""))))
+        elif op == "dir-extract":
+            key = (root, _nk(str(ev["path"])))
+            if ev.get("extract") is False:
+                self.no_extract.add(key)
+            else:
+                self.no_extract.discard(key)
         elif op == "review":
             self.reviews[(root, _nk(str(ev["path"])), str(ev.get("sha256", "")))] = str(ev.get("decision", ""))
         elif op == "keep":
@@ -983,6 +996,22 @@ class TagStore:
             self.reload_if_changed()
             return {p: dict(c) for (r, p), c in self.dir_cards.items() if r == root}
 
+    def set_extract(self, root: str, path: str, extract: bool) -> bool:
+        """フォルダの本文を索引に入れるか（False で入れない。配下も含む）を記録する。変えたら True。F-EX-7。"""
+        path = _nk(path)
+        with self.lock:
+            self.reload_if_changed()
+            if ((root, path) not in self.no_extract) == extract:
+                return False
+            self._append([{"at": utcnow(), "host": self.host, "op": "dir-extract", "root": root, "path": path, "extract": extract}])
+        return True
+
+    def no_extract_of(self, root: str) -> list[str]:
+        """本文を索引に入れないフォルダ（相対パス）。"""
+        with self.lock:
+            self.reload_if_changed()
+            return sorted(p for r, p in self.no_extract if r == root)
+
     def detach_dirmeta_under(self, root: str, base: str) -> dict[str, dict[str, Any]]:
         """base とその配下の型とカードを外し、外したもの（相対パス → {type, card}）を返す（隔離のとき）。"""
         base = _nk(base)
@@ -1089,6 +1118,7 @@ class TagStore:
             out += [{"op": "dir-type", "root": r, "path": p, "type": t} for (r, p), t in sorted(self.dir_types.items())]
             out += [{"op": "dir-card", "root": r, "path": p, **c} for (r, p), c in sorted(self.dir_cards.items())]
             out += [{"op": "keep", "root": r, "path": p, "reason": why} for (r, p), why in sorted(self.kept.items())]
+            out += [{"op": "dir-extract", "root": r, "path": p, "extract": False} for r, p in sorted(self.no_extract)]
             return out
 
     def import_events(self, events: Iterable[dict[str, Any]]) -> Counter[str]:
@@ -1121,6 +1151,8 @@ class TagStore:
                 elif op == "search-save":
                     changed = str(ev["name"]) not in self.searches or self.searches[str(ev["name"])] != str(ev["query"])
                     self.save_search(str(ev["name"]), str(ev["query"]))
+                elif op == "dir-extract":
+                    changed = self.set_extract(str(ev["root"]), str(ev["path"]), bool(ev.get("extract")))
                 elif op == "keep":
                     changed = self.keep(str(ev["root"]), str(ev["path"]), str(ev.get("reason") or ""))
                 elif op == "dir-type":

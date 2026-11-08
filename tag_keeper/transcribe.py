@@ -224,15 +224,18 @@ class Target:
 
 
 def pending(conn: sqlite3.Connection, root_id: int, *, limit: int | None = None, paths: Iterable[str] | None = None,
-            force: bool = False, app_data: Iterable[str] = ()) -> list[Target]:
+            force: bool = False, app_data: Iterable[str] = (), no_extract: Iterable[str] = ()) -> list[Target]:
     """まだ書き起こしていない音声・動画（新しいものから。同じ内容は1件）。
 
     作り直せる生成物・バージョン管理・アプリのデータのフォルダの中は対象にしない（全文検索の索引と同じ）。
     """
     from tag_keeper import fulltext
 
+    import unicodedata
+
     wanted = set(paths) if paths is not None else None
     app = frozenset(app_data)
+    closed = [unicodedata.normalize("NFC", p) for p in no_extract]
     rows = conn.execute(
         "SELECT e.relpath, e.sha256, e.size, x.method FROM entries e LEFT JOIN extracts x ON x.sha256 = e.sha256"
         " WHERE e.root_id = ? AND e.gone_at IS NULL AND e.is_dir = 0 AND e.sha256 IS NOT NULL"
@@ -249,6 +252,8 @@ def pending(conn: sqlite3.Connection, root_id: int, *, limit: int | None = None,
         if r["method"] is not None and not force:
             continue
         if wanted is None and fulltext._skipped(rel, app):
+            continue
+        if wanted is None and closed and any(unicodedata.normalize("NFC", rel).startswith(c + "/") for c in closed):
             continue
         out[sha] = Target(sha, rel, int(r["size"]))
         if limit and len(out) >= limit:
@@ -271,10 +276,10 @@ def store_result(conn: sqlite3.Connection, sha256: str, r: Result) -> None:
 
 
 def run_pending(conn: sqlite3.Connection, root_id: int, root: Path, opts: Options, *, limit: int | None = None,
-                paths: Iterable[str] | None = None, force: bool = False, app_data: Iterable[str] = (),
+                paths: Iterable[str] | None = None, force: bool = False, app_data: Iterable[str] = (), no_extract: Iterable[str] = (),
                 on_start: Callable[[int], None] | None = None, on_item: Callable[[Target, Result], None] | None = None) -> list[Result]:
     """まだ書き起こしていないもの（または paths のもの）を書き起こして保存する。"""
-    targets = pending(conn, root_id, limit=limit, paths=paths, force=force, app_data=app_data)
+    targets = pending(conn, root_id, limit=limit, paths=paths, force=force, app_data=app_data, no_extract=no_extract)
     if on_start is not None:
         on_start(len(targets))
     if not targets:
@@ -335,7 +340,10 @@ class TranscribeWorker:
                 row = conn.execute("SELECT id FROM roots WHERE name = ?", (rc.name,)).fetchone()
                 if row is None:
                     continue
+                from tag_keeper.tags import TagStore
+
                 results = run_pending(conn, int(row["id"]), rc.path, tc.options(), limit=tc.batch, app_data=app_data_names(config),
+                                      no_extract=TagStore(config.tags.dir).no_extract_of(rc.name),
                                       on_item=lambda t, r, rc=rc: setattr(self, "current", f"{rc.name}/{t.relpath}"))
                 if results:
                     return any(not r.error for r in results)

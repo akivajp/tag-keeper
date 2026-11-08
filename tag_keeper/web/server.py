@@ -660,6 +660,10 @@ def create_app(
             finally:
                 conn.close()
             dir_info["card"] = store.dir_cards_of(rc.name).get(unicodedata.normalize("NFC", rel))
+            # 本文を索引に入れるか（自身か祖先で「入れない」にしていれば false。from は設定したフォルダ）
+            nfc = unicodedata.normalize("NFC", rel)
+            off = [p for p in store.no_extract_of(rc.name) if nfc == p or nfc.startswith(p + "/")]
+            dir_info["extract"] = {"enabled": not off, "from": off[0] if off else None}
         for e in entries:
             child = f"{rel}/{e['name']}" if rel else e["name"]
             # タグはパスを NFC にそろえて持つ（F-ID-4）。ディスクの名前が NFD でも引けるようにそろえて引く
@@ -973,7 +977,8 @@ def create_app(
                     rep.advance()
 
                 transcribe.run_pending(conn, root_id, rc.path, config.transcribe.options(), limit=None if paths else limit, paths=paths,
-                                       force=bool(paths), app_data=app_data_names(config), on_start=on_start, on_item=on_item)
+                                       force=bool(paths), app_data=app_data_names(config), no_extract=settings.tags(config).no_extract_of(rc.name),
+                                       on_start=on_start, on_item=on_item)
             finally:
                 conn.close()
             return counts
@@ -1117,6 +1122,17 @@ def create_app(
         if not resolve_within(rc.path, rel).is_dir():
             raise fail(404, f"フォルダがありません: {rel}")
         return {"changed": settings.tags(config).set_dir_type(rc.name, rel, t)}
+
+    @app.post("/api/dirextract")
+    def api_dirextract() -> dict[str, Any]:
+        """フォルダの本文を全文検索の索引に入れるか（extract: false で入れない。配下も含む）。F-EX-7。"""
+        data = body()
+        config = settings.config()
+        rc = root_config(config, str(data.get("root", "")))
+        rel = clean_relpath(str(data.get("path", "")))
+        if not resolve_within(rc.path, rel).is_dir():
+            raise fail(404, f"フォルダがありません: {rel}")
+        return {"changed": settings.tags(config).set_extract(rc.name, rel, bool(data.get("extract")))}
 
     @app.post("/api/dircard")
     def api_dircard() -> dict[str, Any]:

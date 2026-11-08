@@ -4,11 +4,9 @@ Tag, search and tidy your existing file trees from the outside — without movin
 
 [日本語版 README はこちら](README.ja.md)
 
-> **Status: pre-alpha.** What works today: the inventory (scanning, content hashing, a
-> hygiene report), cleaning up with plans you approve (with undo), a file browser with tags
-> and version history from btrfs snapshots, search by name, full text (with OCR for scans)
-> and tags, and name and folder suggestions for your inbox folders from a local model.
-> Tag aliases, parents and typed fields come next. See [Roadmap](#roadmap).
+> **Status: alpha.** The inventory, plans with undo, tags and attributes, full-text search
+> (with OCR and transcripts), version history from btrfs snapshots, model-assisted reading
+> and inbox suggestions, folder types and a structure review all work. See [Roadmap](#roadmap).
 
 ![Inbox: pick a file and a model suggests a name, a folder and tags](https://raw.githubusercontent.com/akivajp/tag-keeper/main/docs/screenshots/inbox.png)
 
@@ -223,6 +221,8 @@ and the theme (system, light or dark).
   `/api/export`). Importing skips what is already there.
 - All of this is scriptable: `tag-keeper tags`, `tag`, `alias`, `parent`, `attr`, `relate`,
   `export`, `import` cover what the pages do.
+- **Keep a folder's text out of the index** (a repository, an app library) from the folder's
+  type and card panel; transcripts follow the same switch.
 - **Search** by name and folder, by the text inside documents, by kind (documents, PDF,
   Office, images, videos and so on) and by tags, in any combination. Full-text search covers
   PDF, Office and text files; scanned PDFs without text are read with tesseract when it is
@@ -447,17 +447,18 @@ Every command accepts `--log-file PATH` to keep a timestamped log.
 
 ## Roadmap
 
-1. **Inventory and hygiene report**, and tidy-up plans that quarantine what you approve,
-   with snapper snapshots and undo. *(done)*
-2. **Tags and search** — *partly done:* tags inherited from folders in append-only logs, a
-   file browser, version history across moves (including moves found by content hash),
-   search by tag, name, kind and content. *Next:* aliases and parents, typed fields, saved
-   searches.
-3. **Content extraction** — *partly done:* text from PDF and Office files and OCR of scans
-   for full-text search, images through a local model for inbox suggestions. *Next:*
-   transcripts of audio and video.
-4. **Placement and structure** — *partly done:* name and folder suggestions for inbox files.
-   *Next:* directory cards, structure review.
+1. **Inventory and hygiene report**, tidy-up plans with snapshots and undo, emptying the
+   quarantine. *(done)*
+2. **Tags and search** — tags with aliases and parents, typed attributes, relations, search
+   by name, text, kind, folder, date, size, tags and attributes, saved searches, version
+   history across moves, export and import. *(done)*
+3. **Content extraction** — text and OCR for full-text search, transcripts of audio and
+   video, documents read into fields and images described by a model, with a review page.
+   *(done)*
+4. **Placement and structure** — inbox suggestions, folder types and directory cards, a
+   structure review, a snapshot watch and a digest. *(done)*
+5. **Maybe later** — semantic search, saved searches as virtual folders (WebDAV), scanning
+   cloud storage through its API without a local copy, moves between roots.
 
 ## License
 

@@ -269,6 +269,7 @@ const I18N_EN = {
   '今のツリーに無い（パスと大きさで比べて）100MB 以上のファイルです。スナップショットの保持期間を見直す材料になります。':
     'Files of 100 MB or more that are not in the current tree (by path and size): material for reviewing how long snapshots are kept.',
   '調べる': 'Check', 'スナップショットを読む': 'Reading snapshots',
+  '中の本文を全文検索の索引に入れる（書き起こしも）': 'Add the text inside to the full-text index (transcripts too)', '{from} で入れない設定にしています': 'Turned off at {from}',
   // --- 検索（名前・本文・種類・タグ） ---
   '検索': 'Search', '名前やフォルダで探す': 'Search names and folders', '本文に含む語': 'Words in the text', 'PDF・Office・テキストの本文から探します（文字の無いスキャンは OCR で読んだもの）': 'Searches the text of PDF, Office and text files (scans without text are read by OCR)',
   '種類': 'Kind', 'すべての種類': 'All kinds', '書類（PDF・Office・テキスト）': 'Documents (PDF, Office, text)', 'Office 文書': 'Office documents',

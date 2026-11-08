@@ -18,6 +18,7 @@ from tag_keeper.catalog import SCHEMA_VERSION, connect, ensure_root, fts_enabled
 from tag_keeper.config import Config, RootConfig, SafetyConfig
 from tag_keeper.hashing import hash_root
 from tag_keeper.scan import scan_root
+from tag_keeper.tags import TagStore
 
 SAFETY = SafetyConfig(mass_missing_ratio=0.2, mass_missing_min=3)
 HAS_PDFTOTEXT = shutil.which("pdftotext") is not None
@@ -347,3 +348,21 @@ def test_catalog_works_without_the_fts_index(tmp_path: Path, root: Path, monkeyp
     caplog.clear()
     connect(db).close()
     assert "作れません" not in caplog.text  # 接続のたびに警告を出し続けない
+
+
+def test_folders_can_be_kept_out_of_the_index(conn: sqlite3.Connection, root_id: int, root: Path, tmp_path: Path) -> None:
+    """「本文を索引に入れない」にしたフォルダの中は抽出しない（配下も。F-EX-7）。戻せばまた抽出する。"""
+    write(root / "repo" / "README.md", "リポジトリの説明")
+    write(root / "repo" / "docs" / "spec.txt", "仕様書の本文")
+    write(root / "notes.txt", "ふつうのメモ")
+    refresh(conn, root_id, root)
+    cfg = make_config(root, tmp_path)
+    store = TagStore(tmp_path / "tags")
+    assert store.set_extract("test", "repo", False)
+    assert not store.set_extract("test", "repo", False)
+    assert [i.relpath for i in fulltext.pending(conn, root_id, cfg.extract, ocr_ready=False, no_extract=store.no_extract_of("test"))] == ["notes.txt"]
+    fulltext.run_pending(conn, root_id, root, cfg)
+    assert fulltext.find_entries(conn, root_id, text="仕様書") == []
+    assert store.set_extract("test", "repo", True)
+    fulltext.run_pending(conn, root_id, root, cfg)
+    assert [r["relpath"] for r in fulltext.find_entries(conn, root_id, text="仕様書")] == ["repo/docs/spec.txt"]
