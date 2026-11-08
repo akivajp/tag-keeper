@@ -64,6 +64,7 @@ import socket
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 
 def default_config_path() -> Path:
@@ -192,6 +193,35 @@ class ExtractConfig:
 
 
 @dataclass
+class TranscribeConfig:
+    """音声・動画の書き起こし（要件 F-EX-2）の設定。faster-whisper が要る（pip install 'tag-keeper[transcribe]'）。"""
+
+    # Web の画面（serve）を動かしている間、新しい音声・動画を裏で書き起こすか（重いので既定は止める）
+    auto: bool = False
+    # faster-whisper のモデル（large-v3-turbo・large-v3・medium・small など、または Hugging Face のモデル名）
+    model: str = "large-v3-turbo"
+    # auto（GPU で動かせれば GPU）・cuda・cpu
+    device: str = "auto"
+    device_index: int = 0
+    # auto なら GPU は float16、CPU は int8
+    compute_type: str = "auto"
+    # 空なら言語を自動で判定する（"ja" などで固定もできる）
+    language: str = ""
+    # 発話の検出のしきい値（下げるほど小さな声も拾う。下げすぎると物音に作文する）
+    vad_threshold: float = 0.2
+    # これより長いものは書き起こさない（分）
+    max_minutes: int = 240
+    # 裏の処理の1回で書き起こす件数
+    batch: int = 5
+
+    def options(self) -> Any:
+        """書き起こしのプロセスに渡す設定。"""
+        from tag_keeper.transcribe import Options
+
+        return Options(self.model, self.device, self.device_index, self.compute_type, self.language, self.vad_threshold, self.max_minutes)
+
+
+@dataclass
 class AiConfig:
     """書類の構造化抽出と画像の内容推定（要件 F-AI-1〜3・F-EX-3）の設定。モデルは [organize] のものを使う。"""
 
@@ -247,6 +277,7 @@ class Config:
     extract: ExtractConfig = field(default_factory=ExtractConfig)
     organize: OrganizeConfig = field(default_factory=OrganizeConfig)
     ai: AiConfig = field(default_factory=AiConfig)
+    transcribe: TranscribeConfig = field(default_factory=TranscribeConfig)
 
     def find_root(self, name: str) -> RootConfig | None:
         """名前でルートを探す。見つからなければ None を返す。"""
@@ -401,6 +432,17 @@ def load_config(path: Path | None = None) -> Config:
     for key, conv in (("auto", bool), ("images", bool), ("batch", int)):
         if key in ai_raw:
             setattr(ai, key, conv(ai_raw[key]))
+    tr = data.get("transcribe", {})
+    transcribe = TranscribeConfig()
+    for key, conv in (
+        ("auto", bool), ("model", str), ("device", str), ("device_index", int), ("compute_type", str),
+        ("language", str), ("vad_threshold", float), ("max_minutes", int), ("batch", int),
+    ):
+        if key in tr:
+            setattr(transcribe, key, conv(tr[key]))
+    if transcribe.device not in ("auto", "cuda", "cpu"):
+        raise ConfigError(f"{path}: [transcribe] の device は auto・cuda・cpu のどれかにしてください: {transcribe.device}")
     return Config(
-        roots=roots, hygiene=hygiene, safety=safety, scan=scan, plan=plan, tags=tags, extract=extract, organize=organize, ai=ai
+        roots=roots, hygiene=hygiene, safety=safety, scan=scan, plan=plan, tags=tags, extract=extract, organize=organize, ai=ai,
+        transcribe=transcribe,
     )

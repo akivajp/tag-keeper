@@ -356,3 +356,6 @@ textarea { width: 100%; font: inherit; }
 /* 確認の画面 */
 .review-card .review-facts { display: grid; gap: .1rem; margin: .4rem 0; }
 .chip-check { display: inline-flex; align-items: center; gap: .2rem; border: 1px solid var(--line); border-radius: 999px; padding: .1rem .55rem; font-size: .85rem; }
+
+/* 書き起こし */
+pre.transcript { max-height: 24rem; overflow: auto; white-space: pre-wrap; }

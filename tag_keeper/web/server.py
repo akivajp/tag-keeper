@@ -138,6 +138,7 @@ class Settings:
         # 裏で本文を抽出するスレッド・書類を読み取るスレッド（serve が動かす。テストでは無し）。ルートを最新にしたら起こす
         self.extractor: ExtractWorker | None = None
         self.analyzer: AnalyzeWorker | None = None
+        self.transcriber: Any = None
 
     def sha256_of(self, path: Path) -> str:
         """ファイルの内容ハッシュ（大きさと更新日時が同じあいだは、計算し直さない）。"""
@@ -725,6 +726,13 @@ def create_app(
                         (rc.name, row["sha256"], rel),
                     )
                 ]
+            # 全文検索のために取り出した本文（書き起こし・OCR・画像の説明を含む）の種類と、書き起こしは本文そのもの
+            extract_info = None
+            if row is not None and row["sha256"]:
+                x = conn.execute("SELECT method, note, length(text) AS n, text FROM extracts WHERE sha256 = ?", (row["sha256"],)).fetchone()
+                if x is not None:
+                    extract_info = {"method": x["method"], "note": x["note"], "chars": x["n"],
+                                    "text": x["text"] if x["method"] in ("transcript", "describe") else None}
         finally:
             conn.close()
         return {
@@ -740,6 +748,7 @@ def create_app(
             "attrs": settings.tags(config).attrs_of(rc.name, rel),
             "attr_defs": settings.tags(config).attr_defs_list(),
             "relations": settings.tags(config).relations_of(rc.name, rel),
+            "extract": extract_info,
             "relation_kinds": settings.tags(config).relation_kinds(),
             "cloud_links": links.links(path, path.is_dir()) if (links := settings.cloud_links(rc)) is not None else [],
         }
@@ -926,6 +935,47 @@ def create_app(
             return counts
 
         return start("analyze", f"書類の読み取り: {rc.name}", run, target=rc.name)
+
+    @app.post("/api/transcribe/<root>")
+    def api_transcribe(root: str) -> dict[str, Any]:
+        """音声・動画を書き起こすジョブを始める（F-EX-2）。paths を渡せばそれだけを（書き起こし済みでもやり直す）、
+        無ければまだ書き起こしていないものを新しい順に limit 件まで。"""
+        from tag_keeper import transcribe
+        from tag_keeper.fulltext import app_data_names
+
+        if not transcribe.available():
+            raise fail(409, "書き起こしには faster-whisper が要ります（pip install 'tag-keeper[transcribe]'。GPU なら [transcribe-gpu]）")
+        data = body()
+        config = settings.config()
+        rc = root_config(config, root)
+        paths = [clean_relpath(str(p)) for p in data.get("paths") or []] or None
+        limit = max(1, min(int(data.get("limit") or 10), 200))
+
+        def run(rep: JobReporter) -> dict[str, Any]:
+            conn = open_db()
+            counts = {"ok": 0, "skipped": 0, "error": 0}
+            try:
+                root_id = root_id_of(conn, rc)
+                rep.phase("対象の確認")
+
+                def on_start(n: int) -> None:
+                    rep.phase("書き起こし", total=n)
+                    rep.note(f"モデル: {config.transcribe.model} ／ {'GPU' if transcribe.resolve_device(config.transcribe.options()) == 'cuda' else 'CPU'}")
+
+                def on_item(t: Any, r: Any) -> None:
+                    key = "error" if r.error else ("skipped" if r.skipped else "ok")
+                    counts[key] += 1
+                    name = t.relpath.rsplit("/", 1)[-1]
+                    rep.note(f"{name}: " + (r.error or r.skipped or f"{r.language}・{len(r.text.splitlines())} 行"))
+                    rep.advance()
+
+                transcribe.run_pending(conn, root_id, rc.path, config.transcribe.options(), limit=None if paths else limit, paths=paths,
+                                       force=bool(paths), app_data=app_data_names(config), on_start=on_start, on_item=on_item)
+            finally:
+                conn.close()
+            return counts
+
+        return start("transcribe", f"書き起こし: {rc.name}", run, target=rc.name)
 
     @app.route("/api/review/<root>")
     def api_review(root: str) -> dict[str, Any]:
@@ -2150,6 +2200,11 @@ def serve(
     # 新しい書類・画像を裏で読み取る（[ai] auto = true のときだけ動く。設定を変えれば再起動なしで始まる）
     settings.analyzer = AnalyzeWorker(settings.db_path, settings.config)
     settings.analyzer.start()
+    # 新しい音声・動画を裏で書き起こす（[transcribe] auto = true で、faster-whisper があるときだけ動く）
+    from tag_keeper.transcribe import TranscribeWorker
+
+    settings.transcriber = TranscribeWorker(settings.db_path, settings.config)
+    settings.transcriber.start()
     try:
         server.serve_forever()
     except KeyboardInterrupt:
@@ -2158,5 +2213,6 @@ def serve(
         stop.set()
         settings.extractor.stop()
         settings.analyzer.stop()
+        settings.transcriber.stop()
         server.server_close()
     return 0

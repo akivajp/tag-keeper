@@ -268,6 +268,19 @@ async function pageBrowse(main, root, path, params) {
           parts.push(h('h3', {}, '属性'), attrEditor(root, rel, info.attrs, info.attr_defs, async () => { await app.render(); showDetail(rel, entry); }));
         }
         parts.push(h('h3', {}, '関係'), relationEditor(root, rel, info, () => showDetail(rel, entry)));
+        // 音声・動画の書き起こし（全文検索の索引に入っている）
+        if (MEDIA_EXTS.includes((name.split('.').pop() || '').toLowerCase())) {
+          const x = info.extract;
+          const startTranscribe = async () => {
+            const job = await startJob(`/api/transcribe/${enc(root)}`, { paths: [rel] });
+            if (job) toast(t('書き起こしを始めました'));
+          };
+          parts.push(h('h3', {}, '書き起こし'),
+            x && x.method === 'transcript' ? [h('p', { class: 'muted small' }, x.note), h('pre', { class: 'preview text transcript' }, x.text || t('（声がありませんでした）')),
+              h('button', { class: 'small', onclick: startTranscribe }, t('書き起こし直す'))]
+              : x && (x.method === 'error' || x.method === 'none') ? [h('p', { class: 'muted small' }, x.note), h('button', { class: 'small', onclick: startTranscribe }, t('もう一度書き起こす'))]
+                : h('button', { class: 'small', onclick: startTranscribe }, t('書き起こす（文字にして検索できるようにする）')));
+        }
         if (info.same_content.length) {
           parts.push(h('h3', {}, '同じ内容のファイル'), h('ul', {}, info.same_content.map((p) => h('li', { class: 'path' },
             h('a', { href: browseHref(root, p.split('/').slice(0, -1).join('/')) }, p)))));
@@ -524,6 +537,8 @@ function cloudLinks(links) {
 
 // ---------- ブラウザが直接は再生できない動画のプレビュー ----------
 
+// 書き起こせる種類（tag_keeper.transcribe.MEDIA_EXTS と同じ）
+const MEDIA_EXTS = ['mp3', 'wav', 'm4a', 'aac', 'flac', 'ogg', 'opus', 'wma', 'mp4', 'm4v', 'mov', 'webm', 'mkv', 'avi', 'flv', 'wmv', 'mpg', 'mpeg', 'ts', 'm2ts', 'mts', '3gp'];
 const CONVERT_VIDEO_EXTS = ['flv', 'f4v', 'mkv', 'avi', 'wmv', 'asf', 'mpg', 'mpeg', 'ts', 'm2ts', 'mts', '3gp', 'vob', 'divx'];
 
 /**

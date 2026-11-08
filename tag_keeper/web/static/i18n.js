@@ -255,6 +255,9 @@ const I18N_EN = {
   '自動では読み取りません（設定の [ai] auto = true で、裏で読み取ります）。': 'Nothing is read automatically (set [ai] auto = true to read in the background).',
   '読み取りを始めました。結果は「確認」の画面に出ます': 'Reading started. The result appears on the Review page',
   'この書類・画像を読み取る（種類・日付・相手・金額など）': 'Read this document or image (kind, date, party, amount…)',
+  // --- 書き起こし（0.17） ---
+  '書き起こし': 'Transcript', '書き起こしを始めました': 'Transcription started', '（声がありませんでした）': '(no speech)',
+  '書き起こし直す': 'Transcribe again', 'もう一度書き起こす': 'Try again', '書き起こす（文字にして検索できるようにする）': 'Transcribe (make it searchable)',
   // --- 検索（名前・本文・種類・タグ） ---
   '検索': 'Search', '名前やフォルダで探す': 'Search names and folders', '本文に含む語': 'Words in the text', 'PDF・Office・テキストの本文から探します（文字の無いスキャンは OCR で読んだもの）': 'Searches the text of PDF, Office and text files (scans without text are read by OCR)',
   '種類': 'Kind', 'すべての種類': 'All kinds', '書類（PDF・Office・テキスト）': 'Documents (PDF, Office, text)', 'Office 文書': 'Office documents',
@@ -351,9 +354,9 @@ const I18N_EN = {
 
 // サーバーから来る、変数を含む文（正規表現 → 英語）
 const I18N_PATTERNS = [
-  [/^(走査|ハッシュ計算|最新にする（走査とハッシュ計算）|自動で最新にする|プランの作成|整理の提案|実行|取り消し|隔離を空にする|書類の読み取り|確認|削除の反映の再試行|常駐の同期の再開): (.+)$/, (m) => `${{
+  [/^(走査|ハッシュ計算|最新にする（走査とハッシュ計算）|自動で最新にする|プランの作成|整理の提案|実行|取り消し|隔離を空にする|書類の読み取り|書き起こし|確認|削除の反映の再試行|常駐の同期の再開): (.+)$/, (m) => `${{
     '走査': 'Scan', 'ハッシュ計算': 'Hash', '最新にする（走査とハッシュ計算）': 'Refresh (scan and hash)', '自動で最新にする': 'Auto refresh',
-    'プランの作成': 'Create plan', '隔離を空にする': 'Empty quarantine', '書類の読み取り': 'Read documents',
+    'プランの作成': 'Create plan', '隔離を空にする': 'Empty quarantine', '書類の読み取り': 'Read documents', '書き起こし': 'Transcribe',
     '整理の提案': 'Inbox suggestions', '実行': 'Apply', '取り消し': 'Undo', '確認': 'Check', '削除の反映の再試行': 'Retry reflecting deletions',
     '常駐の同期の再開': 'Restart resident sync',
   }[m[1]]}: ${m[2]}`],

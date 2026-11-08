@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.17.0] - 2026-11-08
+
+### Added
+
+- **Transcripts of audio and video** with faster-whisper (optional extras `transcribe` and
+  `transcribe-gpu`): language detected automatically, timestamped text added to the
+  full-text index, shown in the file details. Start from the details, `tag-keeper
+  transcribe`, or `[transcribe] auto`. Runs in a separate process; a crashed GPU process is
+  retried on the CPU. Voice detection threshold 0.2, silence-like segments dropped.
+
 ## [0.16.0] - 2026-11-08
 
 ### Added
@@ -338,7 +348,8 @@ First release. The web UI and messages are in Japanese.
 - **Decision log.** Accepted suggestions, tag accept and reject, and undone plans are
   appended per machine; the closest past decisions are given to the model as examples.
 
-[Unreleased]: https://github.com/akivajp/tag-keeper/compare/v0.16.0...HEAD
+[Unreleased]: https://github.com/akivajp/tag-keeper/compare/v0.17.0...HEAD
+[0.17.0]: https://github.com/akivajp/tag-keeper/compare/v0.16.0...v0.17.0
 [0.16.0]: https://github.com/akivajp/tag-keeper/compare/v0.15.0...v0.16.0
 [0.15.0]: https://github.com/akivajp/tag-keeper/compare/v0.14.0...v0.15.0
 [0.14.0]: https://github.com/akivajp/tag-keeper/compare/v0.13.0...v0.14.0

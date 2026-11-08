@@ -201,6 +201,14 @@ $ tag-keeper serve                  # http://127.0.0.1:8090/
 内容を外部へ出してはいけないルート（業務のファイルなど）には `allow_cloud = false` を書いてください。
 そのルートでは、クラウドのモデル（`…:cloud`）の代わりに `[organize] local_model` を使います（整理の提案・ディレクトリカードの下書き・読み取りのすべて）。
 
+### 音声・動画の書き起こし
+
+任意の追加の依存 `transcribe`（`pipx install 'tag-keeper[transcribe]'`。GPU で動かすなら cuDNN・cuBLAS も pip で入る `[transcribe-gpu]`）を入れると、
+音声・動画を faster-whisper で書き起こします。言語は自動で判定し、区間ごとの時刻つきの文を全文検索の索引に入れるので、話した内容で録音を探せます。
+ファイルの詳細か `tag-keeper transcribe` から始めます。`[transcribe] auto = true` にすると、新しい録音を裏で書き起こします。
+書き起こしは別のプロセスで動かします（cuDNN を読めない GPU のプロセスは、例外ではなくプロセスごと落ちるため）。落ちたら CPU でやり直すので、Web の画面は巻き込まれません。
+無音の区間に定型文をでっち上げやすいので、発話の検出のしきい値を下げ（0.2）、無音らしい区間は捨てます。
+
 ### 受け皿の整理の提案
 
 名前が `inbox_patterns`（既定は `tmp`・`temp`・`*未整理*`・`*inbox*`）に一致するフォルダを受け皿とみなします。
@@ -246,6 +254,7 @@ $ tag-keeper --help
 | Linux 版 onedrive クライアント | 大量の削除での同期との連携、OneDrive の Web 画面へのリンク |
 | LibreOffice | Office 文書のレイアウトどおりのプレビュー（PDF） |
 | ffmpeg | FLV・MKV・AVI など、ブラウザが直接は再生できない動画の再生 |
+| faster-whisper（`[transcribe]`・`[transcribe-gpu]`） | 音声・動画の書き起こし |
 
 ソースから使う場合:
 
@@ -324,6 +333,14 @@ think = ""                               # 思考に対応したモデルで "tr
 use_images = true
 max_chars = 4000                         # モデルに渡す本文の上限
 candidates = 15                          # モデルに選ばせる移動先の候補の数
+
+[transcribe]
+auto = false                             # 新しい音声・動画を裏で書き起こす
+model = "large-v3-turbo"                 # faster-whisper のモデル
+device = "auto"                          # auto（使えれば GPU）・cuda・cpu
+language = ""                            # 空なら自動で判定
+vad_threshold = 0.2                      # 下げるほど小さな声も拾う（下げすぎると物音に作文する）
+max_minutes = 240                        # これより長いものは書き起こさない
 
 [ai]
 auto = false                             # 新しい書類・画像を裏で読み取る

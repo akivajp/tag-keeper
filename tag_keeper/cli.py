@@ -4,6 +4,7 @@
     tag-keeper scan [ROOT ...]       ルートを走査してカタログを更新する（読み取り専用）
     tag-keeper hash [ROOT ...]       変わったファイルだけ内容ハッシュを計算する
     tag-keeper extract [ROOT ...]    本文を抽出して、全文検索の索引に入れる
+    tag-keeper transcribe [ROOT ...] 音声・動画を書き起こして、全文検索の索引に入れる
     tag-keeper tags / tag / alias / parent / attr / relate   タグ・辞書・属性・関係を見る・付ける
     tag-keeper export / import       管理情報の全量を JSONL で書き出す・読み込む
     tag-keeper search [WORD ...]     名前・本文（--text）・種類・タグで探す
@@ -27,6 +28,7 @@ import sys
 from collections.abc import Sequence
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 from rich.console import Console
 from rich.logging import RichHandler
@@ -56,7 +58,7 @@ from tag_keeper.config import (
     load_config,
 )
 from tag_keeper.dirtypes import scan_exclusions
-from tag_keeper.fulltext import KINDS, Pending, find_entries, query_terms, run_pending, snippets
+from tag_keeper.fulltext import KINDS, Pending, app_data_names, find_entries, query_terms, run_pending, snippets
 from tag_keeper.hashing import hash_root
 from tag_keeper.plan import (
     OpOutcome,
@@ -313,6 +315,43 @@ def cmd_extract(args: argparse.Namespace, config: Config) -> int:
             f"{res.skipped:,}",
         )
     return 0
+
+
+def cmd_transcribe(args: argparse.Namespace, config: Config) -> int:
+    """音声・動画を書き起こして、全文検索の索引に入れる（faster-whisper が要る）。"""
+    from tag_keeper import transcribe
+
+    if not transcribe.available():
+        log.error("書き起こしには faster-whisper が要ります（pip install 'tag-keeper[transcribe]'。GPU なら [transcribe-gpu]）")
+        return 2
+    opts = config.transcribe.options()
+    if args.model:
+        from dataclasses import replace
+
+        opts = replace(opts, model=args.model)
+    log.info("書き起こし: モデル %s ／ %s", opts.model, "GPU" if transcribe.resolve_device(opts) == "cuda" else "CPU")
+    conn = connect(args.db)
+    status = 0
+    for rc in resolve_roots(config, args.roots):
+        root_id = ensure_root(conn, rc.name, rc.path)
+        with Progress(TextColumn("{task.description}"), BarColumn(), MofNCompleteColumn(), TimeElapsedColumn(),
+                      TextColumn("[dim]{task.fields[current]}"), console=err_console) as progress:
+            task = progress.add_task(f"書き起こし: {rc.name}", total=None, current="")
+
+            def on_start(n: int) -> None:
+                log.info("書き起こします: %s  %s 件", rc.name, f"{n:,}")
+                progress.update(task, total=n)
+
+            def on_item(t: Any, r: Any) -> None:
+                nonlocal status
+                progress.update(task, advance=1, current=t.relpath[-50:])
+                if r.error:
+                    status = 1
+                    log.warning("書き起こせませんでした: %s（%s）", t.relpath, r.error)
+
+            transcribe.run_pending(conn, root_id, rc.path, opts, limit=args.limit, paths=args.path or None, force=bool(args.path),
+                                   app_data=app_data_names(config), on_start=on_start, on_item=on_item)
+    return status
 
 
 def cmd_search(args: argparse.Namespace, config: Config) -> int:
@@ -953,6 +992,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--limit", type=int, default=None, help="この回に抽出する件数の上限（書類・新しいものから）")
     p.add_argument("--no-ocr", action="store_true", help="tesseract があっても OCR を使わない（スキャンは後で読み直す）")
     p.set_defaults(func=cmd_extract)
+
+    p = sub.add_parser("transcribe", help="音声・動画を書き起こして、全文検索の索引に入れる（faster-whisper が要る）")
+    p.add_argument("roots", nargs="*", metavar="ROOT", help="ルート名かフォルダのパス（省略時は全ルート）")
+    p.add_argument("--limit", type=int, default=None, help="この回に書き起こす件数の上限（新しいものから）")
+    p.add_argument("--path", action="append", metavar="PATH", help="このファイルだけを書き起こす（ルートからの相対パス。複数指定可。書き起こし済みでもやり直す）")
+    p.add_argument("--model", default=None, help="この回に使うモデル（既定は [transcribe] model）")
+    p.set_defaults(func=cmd_transcribe)
 
     p = sub.add_parser("search", help="名前・本文・種類・タグで探す")
     p.add_argument("words", nargs="*", metavar="WORD", help="名前やフォルダに含む語（すべて含むもの）")

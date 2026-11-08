@@ -225,7 +225,7 @@ def index_status(conn: sqlite3.Connection, root_id: int, config: Config) -> dict
     waiting = len(pending(conn, root_id, cfg, ocr_ready=ocr_lang is not None, app_data=app_data_names(config)))
     (indexed,) = conn.execute(
         "SELECT COUNT(DISTINCT x.sha256) FROM extracts x JOIN entries e ON e.sha256 = x.sha256"
-        " WHERE e.root_id = ? AND e.gone_at IS NULL AND x.method IN ('pdftotext', 'office', 'text', 'ocr')",
+        " WHERE e.root_id = ? AND e.gone_at IS NULL AND x.method IN ('pdftotext', 'office', 'text', 'ocr', 'transcript', 'describe')",
         (root_id,),
     ).fetchone()
     (scans,) = conn.execute(

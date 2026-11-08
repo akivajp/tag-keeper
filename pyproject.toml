@@ -39,6 +39,18 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# 音声・動画の書き起こし（CPU で動かす分）。PyAV 19 は faster-whisper のデコードと合わないので 19 未満に固定する
+transcribe = [
+    "faster-whisper>=1.1",
+    "av<19",
+]
+# 書き起こしを GPU（CUDA 12）で動かす分。cuDNN・cuBLAS を pip のパッケージで入れる（システムに無くてよい）
+transcribe-gpu = [
+    "faster-whisper>=1.1",
+    "av<19",
+    "nvidia-cublas-cu12",
+    "nvidia-cudnn-cu12>=9,<10",
+]
 dev = [
     "pytest>=7.0",
     "webtest>=3.0",

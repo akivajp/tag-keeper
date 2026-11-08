@@ -267,6 +267,18 @@ Set `allow_cloud = false` on a root whose content must not leave the machine (wo
 cloud models (`…:cloud`) are then replaced by `[organize] local_model` for that root, for
 inbox suggestions, directory-card drafts and reading alike.
 
+### Transcripts of audio and video
+
+With the optional `transcribe` extra (`pipx install 'tag-keeper[transcribe]'`, or
+`[transcribe-gpu]` for CUDA, which brings cuDNN and cuBLAS as pip packages), audio and video
+files are transcribed with faster-whisper, the language detected automatically, and the text
+— with a timestamp per segment — goes into the full-text index, so a recording can be found by
+what was said. Start from a file's details or `tag-keeper transcribe`; with `[transcribe] auto =
+true` new recordings are transcribed in the background. Transcription runs in a separate
+process (a GPU process that cannot load cuDNN dies rather than raising, so it is retried on the
+CPU without taking the web UI down). Voice detection uses a lower threshold (0.2) and segments
+that look like silence are dropped, because Whisper tends to invent phrases over silence.
+
 ### Inbox suggestions
 
 Folders whose name matches `inbox_patterns` (by default `tmp`, `temp`, `*未整理*`,
@@ -319,6 +331,7 @@ Optional tools, each used only by the feature that needs it:
 | OneDrive client for Linux | coordinating big deletions with the sync, links to OneDrive on the web |
 | LibreOffice | Office previews as laid out (PDF) |
 | ffmpeg | playing FLV, MKV, AVI and other videos the browser cannot play |
+| faster-whisper (`[transcribe]` / `[transcribe-gpu]`) | transcripts of audio and video |
 
 From source:
 
@@ -397,6 +410,14 @@ think = ""                               # "true" / "false" for thinking models;
 use_images = true
 max_chars = 4000                         # text passed to the model
 candidates = 15                          # destination folders the model chooses from
+
+[transcribe]
+auto = false                             # transcribe new audio and video in the background
+model = "large-v3-turbo"                 # faster-whisper model
+device = "auto"                          # auto (GPU when possible) / cuda / cpu
+language = ""                            # "" = detect automatically
+vad_threshold = 0.2                      # lower catches quieter voices; too low invents text over noise
+max_minutes = 240                        # longer recordings are skipped
 
 [ai]
 auto = false                             # read new documents and images in the background
