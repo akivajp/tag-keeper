@@ -417,11 +417,15 @@ ollama_url = "http://127.0.0.1:11434"
 model = "gemma3:12b"                     # e.g. "gemma4:31b-cloud" (content is sent to ollama's cloud)
 vision_model = ""                        # model for images when `model` cannot read them
 model_choices = ["gemma4:31b-cloud"]     # extra models offered on the page
-local_model = "gemma3:12b"               # used instead of a cloud model for roots with allow_cloud = false
-think = ""                               # "true" / "false" for thinking models; "" = model default
+local_model = "gemma4:12b"               # used instead of a cloud model for roots with allow_cloud = false
+think = ""                               # "true" / "false" for thinking models; "" = model default (local_think for local models)
+local_think = "false"                    # local models answer 4-20x faster without thinking, with about the same quality
 use_images = true
 max_chars = 4000                         # text passed to the model
 candidates = 15                          # destination folders the model chooses from
+
+[organize.endpoints]                     # OpenAI-compatible servers; use a model as "model-id@name"
+strata = "http://127.0.0.1:18080/v1"     # e.g. model = "qwen3.8-flash-next-iq3_s@strata"
 
 [transcribe]
 auto = false                             # transcribe new audio and video in the background
@@ -444,6 +448,12 @@ batch = 10                               # items per background round
 
 With roots configured, `tag-keeper scan` (no arguments) scans all of them.
 Every command accepts `--log-file PATH` to keep a timestamped log.
+
+Besides ollama, any OpenAI-compatible server (Strata, Project Maya, llama.cpp, vLLM…) can be
+used: list it under `[organize.endpoints]` and name a model `model-id@name`; its models also
+appear in the model menu. An endpoint whose address is not local (loopback, LAN or Tailscale)
+counts as sending content outside, like ollama's cloud models. Text-only models read images
+through `vision_model`.
 
 ## Roadmap
 

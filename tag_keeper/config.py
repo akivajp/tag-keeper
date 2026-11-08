@@ -268,8 +268,14 @@ class OrganizeConfig:
     candidates: int = 15
     # 思考（thinking）に対応したモデルで考えさせるか。"true" / "false"、空ならモデルに任せる
     think: str = ""
+    # think が空のとき、手元のモデル（外へ送らないモデル）に使う思考の設定。手元のモデルは考えさせると
+    # 4〜20倍遅くなり、整理の提案の質はほとんど変わらなかった（2026-11 の試験）ので、既定は考えさせない
+    local_think: str = "false"
     # 外部へ送らないルート（allow_cloud = false）で、クラウドのモデルの代わりに使う手元のモデル
-    local_model: str = "gemma3:12b"
+    local_model: str = "gemma4:12b"
+    # OpenAI 互換の API の送り先（名前 → ベースの URL。例: strata = "http://127.0.0.1:18080/v1"）。
+    # モデルを「モデル名@名前」と書くと、ollama の代わりにそこへ送る（Strata・Project Maya・llama.cpp・vLLM など）
+    endpoints: dict[str, str] = field(default_factory=dict)
     # 生成の温度（低いほど毎回同じ提案になる）
     temperature: float = 0.2
     # 1件の問い合わせの待ち時間の上限（秒）
@@ -425,12 +431,17 @@ def load_config(path: Path | None = None) -> Config:
         organize.inbox_patterns = [str(x) for x in og["inbox_patterns"]]
     if "model_choices" in og:
         organize.model_choices = [str(x) for x in og["model_choices"]]
+    if "endpoints" in og:
+        if not isinstance(og["endpoints"], dict):
+            raise ConfigError(f"{path}: [organize.endpoints] は 名前 = \"URL\" の形で書いてください")
+        organize.endpoints = {str(k): str(v).rstrip("/") for k, v in og["endpoints"].items()}
     for key, conv in (
         ("ollama_url", str),
         ("model", str),
         ("vision_model", str),
         ("local_model", str),
         ("think", str),
+        ("local_think", str),
         ("use_images", bool),
         ("max_chars", int),
         ("candidates", int),

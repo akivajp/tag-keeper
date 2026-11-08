@@ -1460,7 +1460,7 @@ def create_app(
             except OllamaError:
                 continue
             if "completion" in caps:
-                out.append({"name": name, "cloud": organize.is_cloud_model(name), "vision": "vision" in caps})
+                out.append({"name": name, "cloud": organize.sends_outside(oc, name), "vision": "vision" in caps})
         return {"default": oc.model, "models": out}
 
     @app.post("/api/suggest")
@@ -1916,12 +1916,20 @@ def create_app(
 
 
 def _local_models(oc: Any) -> list[str]:
-    """ollama の手元のモデルの名前（取れなければ空）。"""
+    """ollama の手元のモデルと、[organize.endpoints] の送り先のモデル（「モデル名@送り先」）の名前（取れなければ空）。"""
+    out: list[str] = []
     try:
         with urllib.request.urlopen(oc.ollama_url.rstrip("/") + "/api/tags", timeout=5) as res:
-            return [m["name"] for m in json.load(res).get("models", [])]
+            out += [m["name"] for m in json.load(res).get("models", [])]
     except (urllib.error.URLError, TimeoutError, OSError, ValueError):
-        return []
+        pass
+    for key, url in (getattr(oc, "endpoints", None) or {}).items():
+        try:
+            with urllib.request.urlopen(url + "/models", timeout=5) as res:
+                out += [f"{m['id']}@{key}" for m in json.load(res).get("data", []) if m.get("id")]
+        except (urllib.error.URLError, TimeoutError, OSError, ValueError, KeyError):
+            continue
+    return out
 
 
 def _log_accepts(

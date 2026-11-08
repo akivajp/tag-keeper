@@ -335,11 +335,15 @@ ollama_url = "http://127.0.0.1:11434"
 model = "gemma3:12b"                     # 例: "gemma4:31b-cloud"（内容が ollama のクラウドに送られる）
 vision_model = ""                        # model が画像を読めないときに、画像を読むモデル
 model_choices = ["gemma4:31b-cloud"]     # 画面で選べるモデルの候補
-local_model = "gemma3:12b"               # allow_cloud = false のルートで、クラウドのモデルの代わりに使う
-think = ""                               # 思考に対応したモデルで "true" / "false"。空ならモデルに任せる
+local_model = "gemma4:12b"               # allow_cloud = false のルートで、クラウドのモデルの代わりに使う
+think = ""                               # 思考に対応したモデルで "true" / "false"。空ならモデルに任せる（手元のモデルは local_think）
+local_think = "false"                    # 手元のモデルは考えさせないと 4〜20倍速く、質はほぼ変わらない
 use_images = true
 max_chars = 4000                         # モデルに渡す本文の上限
 candidates = 15                          # モデルに選ばせる移動先の候補の数
+
+[organize.endpoints]                     # OpenAI 互換の API の送り先。モデルを「モデル名@名前」で指定する
+strata = "http://127.0.0.1:18080/v1"     # 例: model = "qwen3.8-flash-next-iq3_s@strata"
 
 [transcribe]
 auto = false                             # 新しい音声・動画を裏で書き起こす
@@ -362,6 +366,11 @@ batch = 10                               # 裏の処理の1回で読み取る件
 
 ルートを設定しておけば、`tag-keeper scan`（引数なし）で全ルートを走査します。
 どのコマンドも `--log-file PATH` で日時付きのログを残せます。
+
+ollama のほかに、OpenAI 互換の API を持つ推論サーバー（Strata・Project Maya・llama.cpp・vLLM など）も使えます。
+`[organize.endpoints]` に書き、モデルを「モデル名@名前」で指定します（画面のモデルの選択肢にも出ます）。
+送り先が手元（ループバック・LAN・Tailscale）でなければ、ollama のクラウドのモデルと同じく「外部へ送る」扱いになります。
+画像を読めないモデルのときは、画像は `vision_model` で読みます。
 
 ## ロードマップ
 

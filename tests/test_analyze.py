@@ -29,9 +29,9 @@ def test_answers_are_normalized() -> None:
 
 
 def test_cloud_models_are_not_used_for_roots_that_keep_content_local() -> None:
-    oc = OrganizeConfig(model="gemma4:31b-cloud", vision_model="qwen-vl:cloud", local_model="gemma3:12b")
+    oc = OrganizeConfig(model="gemma4:31b-cloud", vision_model="qwen-vl:cloud", local_model="gemma4:12b")
     local, note = organize.config_for_root(oc, False)
-    assert (local.model, local.vision_model) == ("gemma3:12b", "") and "外部へ送らない" in note
+    assert (local.model, local.vision_model) == ("gemma4:12b", "") and "外部へ送らない" in note
     same, note = organize.config_for_root(oc, True)
     assert same.model == "gemma4:31b-cloud" and note == ""
 
@@ -63,7 +63,7 @@ def test_documents_and_images_are_read_and_reviewed(
     assert sorted(t.relpath for t in analyze.pending(conn, root_id)) == ["inv.txt", "lake.png"]
     results = analyze.run_pending(conn, root_id, rc, config)
     assert len(results) == 2 and not any(a.error for a in results)
-    assert "gemma4:31b-cloud" not in used and "gemma3:12b" in used  # 外部へ送らないルート
+    assert "gemma4:31b-cloud" not in used and "gemma4:12b" in used  # 外部へ送らないルート
     assert analyze.pending(conn, root_id) == []
     # 画像の説明は全文検索で探せる
     assert [r["relpath"] for r in fulltext.find_entries(conn, root_id, text="湖と山")] == ["lake.png"]
@@ -110,3 +110,61 @@ def test_review_api(env: dict, monkeypatch: pytest.MonkeyPatch) -> None:  # noqa
     assert app.get("/api/review/data").json["items"] == []
     tags = {t["tag"] for t in app.get("/api/info", {"root": "data", "path": "bill.txt"}).json["tags"]["direct"]}
     assert tags == {"種別:明細", "分類:住まい"}
+
+
+def test_openai_compatible_endpoints(monkeypatch: pytest.MonkeyPatch) -> None:
+    """「モデル名@送り先」は OpenAI 互換の API に送る（思考の部分は除く）。手元でない送り先はクラウドと同じ扱い。"""
+    import json
+    import threading
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+    seen: list[dict] = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:  # /v1/models
+            body = json.dumps({"data": [{"id": "qwen-local", "architecture": {"input_modalities": ["text"]}}]}).encode()
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_POST(self) -> None:  # /v1/chat/completions
+            seen.append(json.loads(self.rfile.read(int(self.headers["Content-Length"]))))
+            answer = '<think>{"draft": 1}</think>\n```json\n{"doc_type": "請求書", "amount": 120}\n```'
+            body = json.dumps({"choices": [{"message": {"role": "assistant", "content": answer}}]}).encode()
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *a: object) -> None:
+            pass
+
+    server = HTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        url = f"http://127.0.0.1:{server.server_port}/v1"
+        oc = OrganizeConfig(model="qwen-local@strata", endpoints={"strata": url, "far": "https://llm.example.com/v1"})
+        assert organize.model_capabilities(oc) == ["completion"]
+        with pytest.raises(organize.OllamaError):
+            organize.model_capabilities(oc, "missing@strata")
+        assert organize.ollama_generate(oc, "読んで") == {"doc_type": "請求書", "amount": 120}
+        assert seen[0]["model"] == "qwen-local" and seen[0]["messages"][0]["content"] == "読んで"
+        assert not organize.sends_outside(oc, "qwen-local@strata")
+        assert organize.sends_outside(oc, "big@far") and organize.sends_outside(oc, "gemma4:31b-cloud")
+        local, note = organize.config_for_root(dataclasses_replace(oc, model="big@far"), False)
+        assert local.model == oc.local_model and note
+    finally:
+        server.shutdown()
+
+
+def dataclasses_replace(obj, **kw):
+    import dataclasses
+
+    return dataclasses.replace(obj, **kw)
+
+
+def test_local_models_do_not_think_by_default() -> None:
+    oc = OrganizeConfig(model="gemma4:12b", endpoints={"strata": "http://127.0.0.1:18080/v1"})
+    assert organize.effective_think(oc, "gemma4:12b") == "false"
+    assert organize.effective_think(oc, "qwen@") == "false"
+    assert organize.effective_think(oc, "gemma4:31b-cloud") == ""  # クラウドのモデルはモデルに任せる
+    assert organize.effective_think(dataclasses_replace(oc, think="true"), "gemma4:12b") == "true"

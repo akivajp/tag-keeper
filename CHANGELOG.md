@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.20.0] - 2026-11-08
+
+### Added
+
+- **OpenAI-compatible servers** (Strata, Project Maya, llama.cpp, vLLM…) as model backends:
+  list them under `[organize.endpoints]` and use `model-id@name`; their models show up in the
+  model menu, images go to `vision_model` when the model is text-only, and an endpoint that is
+  not on a local address counts as sending content outside.
+- `[organize] local_think` (default `"false"`): with `think` left empty, local models answer
+  without thinking. In a test on zefat, thinking made gemma4:12b take 1–4 minutes per inbox
+  suggestion instead of about 8–12 seconds, with about the same quality.
+
+### Changed
+
+- `[organize] local_model` now defaults to `gemma4:12b`.
+
 ## [0.19.0] - 2026-11-08
 
 ### Added
@@ -370,7 +386,8 @@ First release. The web UI and messages are in Japanese.
 - **Decision log.** Accepted suggestions, tag accept and reject, and undone plans are
   appended per machine; the closest past decisions are given to the model as examples.
 
-[Unreleased]: https://github.com/akivajp/tag-keeper/compare/v0.19.0...HEAD
+[Unreleased]: https://github.com/akivajp/tag-keeper/compare/v0.20.0...HEAD
+[0.20.0]: https://github.com/akivajp/tag-keeper/compare/v0.19.0...v0.20.0
 [0.19.0]: https://github.com/akivajp/tag-keeper/compare/v0.18.0...v0.19.0
 [0.18.0]: https://github.com/akivajp/tag-keeper/compare/v0.17.0...v0.18.0
 [0.17.0]: https://github.com/akivajp/tag-keeper/compare/v0.16.0...v0.17.0

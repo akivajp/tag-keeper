@@ -292,6 +292,80 @@ def parse_json_answer(text: str) -> dict[str, Any]:
     raise OllamaError(f"モデルの答えを JSON として読めません: {text[:200]}")
 
 
+def effective_think(config: OrganizeConfig, model: str) -> str:
+    """そのモデルに使う思考の設定（think があればそれ、無ければ手元のモデルには local_think）。
+
+    OpenAI 互換の送り先は、呼び出し側が「モデル名@」の形で渡し、手元の推論サーバーとして扱う
+    （手元でない送り先は、config_for_root が外部へ送らないルートで使わせない）。
+    """
+    if config.think:
+        return config.think
+    if model.endswith("@") or not sends_outside(config, model):
+        return config.local_think
+    return ""
+
+
+def endpoint_of(config: OrganizeConfig, model: str) -> tuple[str, str] | None:
+    """「モデル名@送り先」のモデルなら、（OpenAI 互換の API のベースの URL, モデル名）を返す。ollama のモデルなら None。"""
+    name, sep, key = model.rpartition("@")
+    if not sep or key not in config.endpoints:
+        return None
+    return config.endpoints[key], name
+
+
+def _is_local_url(url: str) -> bool:
+    """URL の宛先が手元か（ループバック・LAN・Tailscale のアドレスか、localhost）。"""
+    import ipaddress
+    from urllib.parse import urlparse
+
+    host = urlparse(url).hostname or ""
+    if host in ("localhost",) or host.endswith(".local") or host.endswith(".ts.net"):
+        return True
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    return ip.is_loopback or ip.is_private or ip in ipaddress.ip_network("100.64.0.0/10")
+
+
+def _strip_thinking(text: str) -> str:
+    """思考の部分（<think>…</think>）を除く（JSON の前に考えた過程を書くモデルがあるため）。"""
+    return re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
+
+
+def openai_generate(base_url: str, model: str, config: OrganizeConfig, prompt: str, image: bytes | None = None) -> dict[str, Any]:
+    """OpenAI 互換の chat completions の API に問い合わせ、JSON の答えを返す（Strata・Project Maya・llama.cpp など）。"""
+    content: Any = prompt
+    if image is not None:
+        mime = "image/png" if image[:8] == b"\x89PNG\r\n\x1a\n" else "image/jpeg"
+        content = [
+            {"type": "text", "text": prompt},
+            {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{base64.b64encode(image).decode('ascii')}"}},
+        ]
+    body: dict[str, Any] = {
+        "model": model,
+        "messages": [{"role": "user", "content": content}],
+        "temperature": config.temperature,
+        "max_tokens": 4096,
+        "stream": False,
+    }
+    think = effective_think(config, f"{model}@")
+    if think in ("true", "false"):
+        # Qwen 系などの思考の切り替え（対応していない API は無視する）
+        body["chat_template_kwargs"] = {"enable_thinking": think == "true"}
+    req = urllib.request.Request(base_url + "/chat/completions", json.dumps(body).encode("utf-8"), {"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=config.timeout) as res:
+            data = json.load(res)
+    except (urllib.error.URLError, TimeoutError, OSError) as e:
+        raise OllamaError(f"{base_url} に問い合わせられません: {e}") from e
+    try:
+        text = str(data["choices"][0]["message"].get("content") or "")
+    except (KeyError, IndexError, TypeError) as e:
+        raise OllamaError(f"{base_url} の答えの形が想定と違います: {str(data)[:200]}") from e
+    return parse_json_answer(_strip_thinking(text))
+
+
 def ollama_generate(
     config: OrganizeConfig,
     prompt: str,
@@ -300,7 +374,13 @@ def ollama_generate(
     fmt: str | dict[str, Any] = "json",
     model: str | None = None,
 ) -> dict[str, Any]:
-    """ollama の generate API に問い合わせ、JSON の答えを返す（model を省くと設定のモデル）。"""
+    """モデルに問い合わせ、JSON の答えを返す（model を省くと設定のモデル）。
+
+    ふつうは ollama の generate API に送る。「モデル名@送り先」のモデルは、[organize.endpoints] の OpenAI 互換の API に送る。
+    """
+    ep = endpoint_of(config, model or config.model)
+    if ep is not None:
+        return openai_generate(ep[0], ep[1], config, prompt, image)
     body: dict[str, Any] = {
         "model": model or config.model,
         "prompt": prompt,
@@ -310,8 +390,9 @@ def ollama_generate(
     }
     # 思考（thinking）の有無は、設定が無ければモデルに任せる
     # （考えさせないと JSON を返さず、考えた過程を文章で書くモデルがあるため）
-    if config.think in ("true", "false"):
-        body["think"] = config.think == "true"
+    think = effective_think(config, model or config.model)
+    if think in ("true", "false"):
+        body["think"] = think == "true"
     if image is not None:
         body["images"] = [base64.b64encode(image).decode("ascii")]
     req = urllib.request.Request(
@@ -333,6 +414,19 @@ def model_capabilities(config: OrganizeConfig, model: str | None = None) -> list
     クラウドのモデル（*-cloud・*:cloud）は手元の一覧（/api/tags）に出ないことがあるので、/api/show で確かめる。
     """
     name = model or config.model
+    ep = endpoint_of(config, name)
+    if ep is not None:
+        # OpenAI 互換の API: /models の一覧にあるかと、入力の種類（画像を読めるか）を見る
+        try:
+            with urllib.request.urlopen(ep[0] + "/models", timeout=15) as res:
+                listing = json.load(res)
+        except (urllib.error.URLError, TimeoutError, OSError, ValueError) as e:
+            raise OllamaError(f"{ep[0]} に接続できません: {e}") from e
+        for m in listing.get("data") or []:
+            if m.get("id") == ep[1]:
+                inputs = ((m.get("architecture") or {}).get("input_modalities")) or ["text"]
+                return ["completion"] + (["vision"] if "image" in inputs else [])
+        raise OllamaError(f"{ep[0]} にモデル {ep[1]} がありません")
     req = urllib.request.Request(
         config.ollama_url.rstrip("/") + "/api/show",
         json.dumps({"model": name}).encode("utf-8"),
@@ -379,7 +473,7 @@ def model_for_root(config: OrganizeConfig, allow_cloud: bool, requested: str | N
         （使うモデル, 切り替えたときの説明。切り替えていなければ空）
     """
     model = requested or config.model
-    if not allow_cloud and is_cloud_model(model):
+    if not allow_cloud and sends_outside(config, model):
         return config.local_model, f"このルートは内容を外部へ送らない設定なので、{model} の代わりに {config.local_model} を使います"
     return model, ""
 
@@ -390,9 +484,17 @@ def config_for_root(config: OrganizeConfig, allow_cloud: bool, requested: str | 
 
     model, note = model_for_root(config, allow_cloud, requested)
     vision = config.vision_model
-    if not allow_cloud and vision and is_cloud_model(vision):
+    if not allow_cloud and vision and sends_outside(config, vision):
         vision = ""
     return dataclasses.replace(config, model=model, vision_model=vision), note
+
+
+def sends_outside(config: OrganizeConfig, model: str) -> bool:
+    """そのモデルに問い合わせると、内容が手元の外へ出るか（ollama のクラウドのモデルか、手元でない送り先）。"""
+    ep = endpoint_of(config, model)
+    if ep is not None:
+        return not _is_local_url(ep[0])
+    return is_cloud_model(model)
 
 
 def check_ollama(config: OrganizeConfig) -> None:
