@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Paths match across NFC and NFD.** Management data refers to items by path in NFC, so a
+  Japanese name written with composed or decomposed characters points at the same item.
+- **Relations between two items** (previous version, derived from, attached to, or your own
+  kinds) from the file browser's details. They follow moves, are detached when quarantined
+  and come back with undo.
+- **Moves needing confirmation.** Files whose content matched more than one recently gone
+  file are listed under *Confirm moves* on the Roots page; picking the place it moved from
+  carries over tags, attributes, relations and version history, and “new file” hides it from
+  the list.
+- **Export and import** all management data (tags, attributes, relations, dictionary, saved
+  searches) as JSONL with `tag-keeper export` / `import` and `GET /api/export`.
+- **CLI for the rest**: `tag-keeper tags`, `tag`, `alias`, `parent`, `attr`, `relate`.
+
 ## [0.12.0] - 2026-11-08
 
 ### Added

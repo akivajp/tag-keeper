@@ -343,3 +343,7 @@ details.narrow > summary { cursor: pointer; margin: .25rem 0; }
 details.copies { margin-top: .2rem; }
 details.copies ul { margin: .2rem 0 0 1rem; padding: 0; }
 tr.gone td { opacity: .7; }
+
+/* 関係の欄 */
+.relations ul { margin: .25rem 0; padding-left: 1rem; }
+.relations .kind-input { width: 7em; }

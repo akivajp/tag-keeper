@@ -264,6 +264,7 @@ async function pageBrowse(main, root, path, params) {
         if ((info.attr_defs || []).length) {
           parts.push(h('h3', {}, '属性'), attrEditor(root, rel, info.attrs, info.attr_defs, async () => { await app.render(); showDetail(rel, entry); }));
         }
+        parts.push(h('h3', {}, '関係'), relationEditor(root, rel, info, () => showDetail(rel, entry)));
         if (info.same_content.length) {
           parts.push(h('h3', {}, '同じ内容のファイル'), h('ul', {}, info.same_content.map((p) => h('li', { class: 'path' },
             h('a', { href: browseHref(root, p.split('/').slice(0, -1).join('/')) }, p)))));
@@ -752,6 +753,46 @@ function attrEditor(root, path, attrs, defs, onChange) {
       h('span', { class: 'attr-name', translate: 'no' }, d.name), input,
       inh ? h('span', { class: 'muted small' }, t('{from} から継承', { from: inh.from || root })) : null);
   }));
+}
+
+/**
+ * アイテム間の関係の欄（前の版・派生元・添付先など。F-MD-7）。自身から張ったものと、ほかから張られたものを並べ、
+ * 種類と相手のパスを入れて足せる。相手のパスは、名前の一部を入れると候補を出す。
+ */
+function relationEditor(root, path, info, onChange) {
+  const rels = info.relations || { outgoing: [], incoming: [] };
+  const call = async (payload) => {
+    try { await api('/api/relations', { root, ...payload }); if (onChange) await onChange(); }
+    catch (e) { toast(e.message, 'danger'); }
+  };
+  const link = (p) => h('a', { class: 'path', href: browseHref(root, p.split('/').slice(0, -1).join('/'), '', p.split('/').pop()) }, p);
+  const listId = `rel-targets-${Math.random().toString(36).slice(2)}`;
+  const kindListId = `${listId}-kinds`;
+  const targets = h('datalist', { id: listId });
+  let timer = null;
+  const target = h('input', { list: listId, placeholder: t('相手のファイル（名前の一部で候補が出ます）'),
+    oninput: (e) => {
+      clearTimeout(timer);
+      const word = e.target.value.trim();
+      if (word.length < 2) return;
+      timer = setTimeout(async () => {
+        try {
+          const r = await api(`/api/search?root=${enc(root)}&q=${enc(word)}&folders=1&limit=20`);
+          setChildren(targets, r.items.filter((x) => x.path !== path).map((x) => h('option', { value: x.path })));
+        } catch { /* 候補が出ないだけ */ }
+      }, 250);
+    } });
+  const kind = h('input', { list: kindListId, value: (info.relation_kinds || ['関連'])[0], class: 'kind-input' });
+  return h('div', { class: 'relations' },
+    targets, h('datalist', { id: kindListId }, (info.relation_kinds || []).map((k) => h('option', { value: k }))),
+    rels.outgoing.length || rels.incoming.length ? h('ul', {},
+      rels.outgoing.map((r) => h('li', {}, h('span', { class: 'badge' }, r.kind), ' → ', link(r.path), ' ',
+        h('button', { class: 'chip-x', title: t('関係を外す'), onclick: () => call({ from: path, to: r.path, kind: r.kind, op: 'remove' }) }, '×'))),
+      rels.incoming.map((r) => h('li', {}, link(r.path), ' → ', h('span', { class: 'badge' }, r.kind), t('（このファイルへ）'), ' ',
+        h('button', { class: 'chip-x', title: t('関係を外す'), onclick: () => call({ from: r.path, to: path, kind: r.kind, op: 'remove' }) }, '×'))))
+      : h('p', { class: 'muted small' }, '関係はまだありません。'),
+    h('form', { class: 'inline', onsubmit: (e) => { e.preventDefault(); if (target.value.trim()) call({ from: path, to: target.value.trim(), kind: kind.value.trim() || '関連' }); } },
+      kind, target, h('button', {}, '関係を足す')));
 }
 
 /** 検索の条件（URL の問い合わせ）を読む。保存した検索の件数を数えるときにも使う。 */

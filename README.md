@@ -187,7 +187,20 @@ and the theme (system, light or dark).
   under it. Tags live in append-only JSONL logs, one file per machine
   (`~/.local/share/tag-keeper/tags/<host>.jsonl`), so they stay readable without the tool
   and never conflict when synced. When a tagged item is moved — by you or by a plan — the
-  log records the move and the tags follow.
+  log records the move and the tags follow. Paths are matched as NFC, so a name written in
+  NFC or NFD (the two Unicode spellings of Japanese characters) points at the same item.
+- **Relations between two items** (previous version, derived from, attached to, …; you can add
+  your own kinds) can be linked from the file browser's details. They follow moves and come
+  back with undo.
+- **Moves needing your confirmation.** When several places lost a file with the same content
+  just before a new one appeared, the tool cannot tell which one moved, so it does not guess.
+  They are listed under *Confirm moves* (linked from the Roots page): pick the place it moved
+  from to carry over tags, attributes, relations and version history, or say it is a new file.
+- **Export and import** the whole management data (tags, attributes, relations, the tag
+  dictionary, saved searches) as JSONL with `tag-keeper export` / `import` (also *Export* at
+  `/api/export`). Importing skips what is already there.
+- All of this is scriptable: `tag-keeper tags`, `tag`, `alias`, `parent`, `attr`, `relate`,
+  `export`, `import` cover what the pages do.
 - **Search** by name and folder, by the text inside documents, by kind (documents, PDF,
   Office, images, videos and so on) and by tags, in any combination. Full-text search covers
   PDF, Office and text files; scanned PDFs without text are read with tesseract when it is

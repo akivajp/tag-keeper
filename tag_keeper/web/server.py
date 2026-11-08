@@ -26,6 +26,7 @@ import os
 import re
 import sqlite3
 import threading
+import unicodedata
 import urllib.error
 import urllib.request
 from dataclasses import asdict
@@ -83,7 +84,7 @@ from tag_keeper.plan import (
     write_plan,
 )
 from tag_keeper.report import build_report
-from tag_keeper.scan import RootUnavailableError, relink_by_hash, scan_root
+from tag_keeper.scan import RootUnavailableError, link_move, relink_by_hash, relink_candidates, scan_root
 from tag_keeper.suggest_queue import SuggestQueue
 from tag_keeper.syncguard import CloudSyncGuard, OneDriveGuard, SyncError, SyncGuard, make_guard
 from tag_keeper.tags import TagError, TagStore, normalize_tag
@@ -286,7 +287,8 @@ def create_app(
         config = settings.config()
         conn = open_db()
         try:
-            roots = [_root_state(conn, rc) for rc in config.roots]
+            store = settings.tags(config)
+            roots = [_root_state(conn, rc, config.scan.relink_days, store.relink_skipped(rc.name)) for rc in config.roots]
         finally:
             conn.close()
         plans = [_plan_summary(p) for p in list_plans(settings.plans_dir, settings.journal_dir)]
@@ -619,7 +621,8 @@ def create_app(
         tagged = store.tagged_under(rc.name, rel)
         for e in entries:
             child = f"{rel}/{e['name']}" if rel else e["name"]
-            e["tags"] = tagged.get(child, [])
+            # タグはパスを NFC にそろえて持つ（F-ID-4）。ディスクの名前が NFD でも引けるようにそろえて引く
+            e["tags"] = tagged.get(unicodedata.normalize("NFC", child), [])
             e["inbox"] = e["is_dir"] and organize.is_inbox_name(e["name"], config.organize.inbox_patterns)
         crumbs = [{"name": rc.name, "path": ""}]
         acc = ""
@@ -697,6 +700,8 @@ def create_app(
             "tags": settings.tags(config).tags_of(rc.name, rel),
             "attrs": settings.tags(config).attrs_of(rc.name, rel),
             "attr_defs": settings.tags(config).attr_defs_list(),
+            "relations": settings.tags(config).relations_of(rc.name, rel),
+            "relation_kinds": settings.tags(config).relation_kinds(),
             "cloud_links": links.links(path, path.is_dir()) if (links := settings.cloud_links(rc)) is not None else [],
         }
 
@@ -801,6 +806,78 @@ def create_app(
         if data.get("op") == "remove" or data.get("value") is None:
             return {"changed": store.unset_attr(rc.name, paths, name)}
         return {"changed": store.set_attr(rc.name, paths, name, data.get("value"))}
+
+    @app.route("/api/relink/<root>")
+    def api_relink(root: str) -> dict[str, Any]:
+        """内容ハッシュでは自動で結び付けられなかった（候補が複数ある）新しいファイルと、その候補（F-ID-2）。"""
+        config = settings.config()
+        rc = root_config(config, root)
+        conn = open_db()
+        try:
+            items = relink_candidates(
+                conn, root_id_of(conn, rc), days=config.scan.relink_days, skipped=settings.tags(config).relink_skipped(rc.name)
+            )
+        finally:
+            conn.close()
+        return {"root": rc.name, "items": items}
+
+    @app.post("/api/relink/<root>")
+    def api_relink_decide(root: str) -> dict[str, Any]:
+        """確認待ちの新しいファイルについて、利用者の判断を記録する。
+
+        old_id を渡せば、その消えたファイルからの移動として結び付ける（タグ・属性・関係も追従する）。
+        skip が真なら、どれとも結び付けないと記録し、以後は一覧に出さない。
+        """
+        data = body()
+        config = settings.config()
+        rc = root_config(config, root)
+        store = settings.tags(config)
+        conn = open_db()
+        try:
+            root_id = root_id_of(conn, rc)
+            row = conn.execute("SELECT relpath, sha256 FROM entries WHERE id = ? AND root_id = ?", (int(data.get("new_id", 0)), root_id)).fetchone()
+            if row is None:
+                raise fail(404, "カタログに見つかりません")
+            if data.get("skip"):
+                store.skip_relink(rc.name, str(row["relpath"]), str(row["sha256"] or ""))
+                return {"skipped": row["relpath"]}
+            try:
+                old_rel, new_rel = link_move(conn, root_id, int(data.get("new_id", 0)), int(data.get("old_id", 0)))
+            except ValueError as e:
+                raise fail(409, str(e)) from e
+        finally:
+            conn.close()
+        moved = store.follow_moves(rc.name, [(old_rel, new_rel)])
+        return {"from": old_rel, "to": new_rel, "tag_moves": moved}
+
+    @app.post("/api/relations")
+    def api_relations() -> dict[str, Any]:
+        """2つのアイテムの間に関係を張る（op=add）・外す（op=remove）。from から to へ（例: 新しい版 → 前の版）。"""
+        data = body()
+        config = settings.config()
+        rc = root_config(config, str(data.get("root", "")))
+        src, dst = clean_relpath(str(data.get("from", ""))), clean_relpath(str(data.get("to", "")))
+        store = settings.tags(config)
+        kind = str(data.get("kind", "") or "関連")
+        if data.get("op") == "remove":
+            return {"changed": store.unrelate(rc.name, src, dst, kind)}
+        for rel in (src, dst):
+            if not rel or not resolve_within(rc.path, rel).exists():
+                raise fail(404, f"ありません: {rel}")
+        return {"changed": store.relate(rc.name, src, dst, kind)}
+
+    @app.route("/api/export")
+    def api_export() -> Any:
+        """管理情報の全量（タグ・属性・関係・辞書・保存した検索）を JSONL で書き出す（F-MD-9）。"""
+        events = settings.tags().export_events()
+        body_text = "".join(json.dumps(ev, ensure_ascii=False) + "\n" for ev in events)
+        return bottle.HTTPResponse(
+            body=body_text,
+            headers={
+                "Content-Type": "application/x-ndjson; charset=utf-8",
+                "Content-Disposition": f'attachment; filename="tag-keeper-{datetime.now():%Y%m%d}.jsonl"',
+            },
+        )
 
     @app.route("/api/searches")
     def api_searches() -> dict[str, Any]:
@@ -1549,8 +1626,11 @@ def _log_accepts(
     settings.decision_log.accept(events)
 
 
-def _root_state(conn: sqlite3.Connection, rc: RootConfig) -> dict[str, Any]:
-    """ルートの概要（ファイル数・容量・ハッシュの計算状況・最後の走査・同期クライアントの状態）。"""
+def _root_state(
+    conn: sqlite3.Connection, rc: RootConfig, relink_days: int = 0, skipped: set[tuple[str, str]] | None = None
+) -> dict[str, Any]:
+    """ルートの概要（ファイル数・容量・ハッシュの計算状況・最後の走査・移動の確認待ち・同期クライアントの状態）。"""
+    skipped = skipped or set()
     out: dict[str, Any] = {"name": rc.name, "path": str(rc.path), "scanned": False}
     row = conn.execute("SELECT id FROM roots WHERE name = ?", (rc.name,)).fetchone()
     if row is not None:
@@ -1574,6 +1654,7 @@ def _root_state(conn: sqlite3.Connection, rc: RootConfig) -> dict[str, Any]:
             hashed=hashed or 0,
             hashed_size=hashed_size,
             held_files=held,
+            relink_pending=len(relink_candidates(conn, row["id"], days=relink_days, skipped=skipped)) if relink_days else 0,
             scanned=scan is not None,
             last_scan=dict(scan) if scan is not None else None,
         )
@@ -1610,7 +1691,7 @@ def _attrs_match(path: str, conds: list[tuple[str, str, str]], values: dict[str,
 
     for name, op, want in conds:
         value = None
-        p = path
+        p = unicodedata.normalize("NFC", path)  # 属性はパスを NFC にそろえて持つ（F-ID-4）
         while True:
             v = values.get(p, {})
             if name in v:

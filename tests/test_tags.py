@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+from conftest import write
 from tag_keeper.tags import TagError, TagStore, normalize_tag
 
 
@@ -243,3 +244,87 @@ def test_saved_searches(tmp_path: Path) -> None:
     assert [s["name"] for s in TagStore(tmp_path / "tags", host="b").saved_searches()] == ["要対応の書類"]
     with pytest.raises(TagError):
         store.save_search("空", "  ")
+
+
+# ---------- パスの正規化（NFC / NFD）・関係・書き出しと読み込み ----------
+
+
+def test_nfc_and_nfd_paths_refer_to_the_same_item(tmp_path: Path) -> None:
+    """NFD（濁点の分解形）で書いた行と NFC で書いた行は、同じアイテムとして扱う（F-ID-4）。"""
+    import unicodedata
+
+    from tag_keeper.tags import search
+
+    nfc = "案件/ドキュメント.pdf"  # 「ド」は NFD では「ト」と濁点に分かれる
+    nfd = unicodedata.normalize("NFD", nfc)
+    assert nfc != nfd
+    store = TagStore(tmp_path / "tags", host="a")
+    store.add("r", [nfd], "種別:請求書")
+    store.add("r", [nfc], "種別:請求書")
+    assert store.all_tags() == {"種別:請求書": 1}  # 1つにまとまる
+    assert store.tags_of("r", nfc)["direct"][0]["tag"] == "種別:請求書"
+    assert store.tags_of("r", nfd)["direct"][0]["tag"] == "種別:請求書"
+    assert store.tagged_paths("r") == {"種別:請求書": {nfc}}
+    assert search([(nfd, False)], store.tagged_paths("r"), ["種別:請求書"]) == [nfd]
+    assert store.remove("r", [nfc], "種別:請求書") == 1
+    assert store.tags_of("r", nfd)["direct"] == []
+    store.follow_moves("r", [(nfd.rsplit("/", 1)[0], "完了")])
+    assert store.tags_of("r", "完了/ドキュメント.pdf")["direct"] == []
+
+
+def test_relations_follow_moves_and_export_round_trip(tmp_path: Path) -> None:
+    from tag_keeper.tags import search
+
+    store = TagStore(tmp_path / "tags", host="a")
+    store.add("r", ["case/v2.docx"], "種別:見積")
+    store.define_attr("対応状態", "choice", ["未対応", "対応済み"])
+    store.set_attr("r", ["case/v2.docx"], "対応状態", "対応済み")
+    store.add_parent("種別:見積", "種別:書類")
+    store.add_alias("種別:見積", "種別:estimate")
+    store.relate("r", "case/v2.docx", "case/v1.docx", "前の版")
+    assert not store.relate("r", "case/v2.docx", "case/v1.docx", "前の版")  # 同じものは1つだけ
+    with pytest.raises(TagError):
+        store.relate("r", "a", "a")
+    store.save_search("見積", "tag=種別:見積")
+
+    rels = store.relations_of("r", "case/v1.docx")
+    assert rels["outgoing"] == [] and rels["incoming"] == [{"kind": "前の版", "path": "case/v2.docx"}]
+    store.follow_moves("r", [("case", "done")])
+    assert store.relations_of("r", "done/v1.docx")["incoming"][0]["path"] == "done/v2.docx"
+    # 書き出して読み直すと同じ状態になる（既にあるものは飛ばす）
+    events = store.export_events()
+    again = TagStore(tmp_path / "other", host="b")
+    counts = again.import_events(events)
+    assert counts["add"] == 1 and counts["attr-set"] == 1 and counts["relate"] == 1
+    assert again.relations_of("r", "done/v1.docx")["incoming"][0]["path"] == "done/v2.docx"
+    assert again.tags_of("r", "done/v2.docx")["direct"][0]["tag"] == "種別:見積"
+    assert again.import_events(events) == {}  # 2回目は何も足さない
+    # 隔離のときに関係を外し、取り消しで戻す
+    detached = store.detach_relations_under("r", "done/v2.docx")
+    assert detached == [["done/v2.docx", "done/v1.docx", "前の版"]]
+    assert store.relations_of("r", "done/v1.docx")["incoming"] == []
+    assert store.attach_relations("r", detached) == 1
+    assert store.unrelate("r", "done/v2.docx", "done/v1.docx", "前の版")
+
+
+def test_nfd_names_in_the_browser_carry_tags(tmp_path: Path, root: Path) -> None:
+    """ディスク上の名前が NFD でも、ファイルブラウザにタグが出て、詳細の属性も引ける（F-ID-4）。"""
+    import unicodedata
+
+    from webtest import TestApp
+
+    from tag_keeper.jobs import JobManager
+    from tag_keeper.web.server import Settings, create_app
+
+    nfd = unicodedata.normalize("NFD", "案件")
+    (root / nfd).mkdir()
+    (root / nfd / "x.txt").write_text("x")
+    cfg = write(tmp_path / "config.toml", f'[[roots]]\nname = "data"\npath = "{root}"\n[tags]\ndir = "{tmp_path / "tags"}"\n')
+    jobs = JobManager(tmp_path / "logs")
+    app = TestApp(create_app(Settings(cfg, tmp_path / "data" / "catalog.db"), jobs=jobs), extra_environ={"HTTP_HOST": "127.0.0.1:8090"})
+    origin = {"Origin": "http://127.0.0.1:8090"}
+    # 付けるときは NFC で渡す（他の端末から書かれたログなど）と、NFD の名前でも出る
+    app.post_json("/api/tags", {"root": "data", "paths": [unicodedata.normalize("NFC", nfd)], "tag": "種別:案件", "op": "add"}, headers=origin)
+    res = app.get("/api/browse", {"root": "data", "path": ""}).json
+    entry = next(e for e in res["entries"] if e["is_dir"])
+    assert entry["name"] == nfd and entry["tags"] == ["種別:案件"]

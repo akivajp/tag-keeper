@@ -386,6 +386,8 @@ async function pageRoots(main) {
         stat('最後の走査', when(scan.finished_at)),
         r.held_files ? stat('状態', h('span', { class: 'badge warn', title: t('次の走査でも見えなければ、消えたと確定します。') },
           t('消失の確定を保留（{n} 件）', { n: num(r.held_files) }))) : null,
+        r.relink_pending ? stat('移動の確認', h('a', { class: 'badge warn', href: `#/relink/${enc(r.name)}` },
+          t('確認待ち（{n} 件）', { n: num(r.relink_pending) }))) : null,
       ) : h('p', { class: 'muted' }, 'まだ走査していません。'),
       staleFor ? h('div', { class: 'alert warn' },
         t('最後の走査から {age} たっています。カタログ（タグの検索・レポート・移動の追従）が今のファイルと合っていない可能性があります。', { age: ageText(staleFor) }),
@@ -414,6 +416,34 @@ async function pageRoots(main) {
     ...cards,
     h('p', { class: 'muted' }, t('設定: {config} ／ 隔離先: {quarantine} ／ スナップショット: {snapper} ／ v{version}', { config: st.config_path, quarantine: st.quarantine_dir, snapper: st.snapper_config || t('撮らない'), version: st.version })),
   );
+}
+
+// ---------- 画面: 移動の確認（内容ハッシュでは決められなかったもの。F-ID-2） ----------
+
+async function pageRelink(main, root) {
+  const { items } = await api(`/api/relink/${enc(root)}`);
+  const decide = async (payload, label) => {
+    try {
+      await api(`/api/relink/${enc(root)}`, payload);
+      toast(label);
+      app.render();
+    } catch (e) { toast(e.message, 'danger'); }
+  };
+  setChildren(main,
+    h('h1', {}, t('移動の確認: {root}', { root })),
+    h('p', { class: 'muted' }, '新しく現れたファイルと同じ内容のものが、少し前に複数の場所から消えています。どれが動いてきたものかを選ぶと、そのタグ・属性・関係・版の履歴が引き継がれます。どれでもなければ「新しいファイル」を選んでください。'),
+    items.length ? items.map((it) => h('section', { class: 'card' },
+      h('h2', { class: 'path' }, h('a', { href: browseHref(root, it.path.split('/').slice(0, -1).join('/'), '', it.path.split('/').pop()) }, it.path)),
+      h('div', { class: 'muted small' }, t('{size}・{when} に現れた', { size: size(it.size), when: when(it.first_seen) })),
+      h('div', { class: 'table-wrap' }, h('table', {},
+        h('thead', {}, h('tr', {}, h('th', {}, '移動元の候補'), h('th', { class: 'hide-narrow' }, '最後に見えた'), h('th', {}, ''))),
+        h('tbody', {}, it.candidates.map((c) => h('tr', {},
+          h('td', { class: 'path' }, c.path),
+          h('td', { class: 'hide-narrow muted' }, when(c.last_seen)),
+          h('td', {}, h('button', { class: 'small', onclick: () => decide({ new_id: it.id, old_id: c.id }, t('結び付けました: {path}', { path: c.path })) }, 'これが移動元'))))))),
+      h('div', { class: 'buttons' }, h('button', { class: 'small secondary', onclick: () => decide({ new_id: it.id, skip: true }, t('新しいファイルとして扱います: {path}', { path: it.path })) }, '新しいファイル（どれでもない）'))))
+      : h('p', { class: 'muted' }, '確認待ちのものはありません。'),
+    h('p', {}, h('a', { href: '#/' }, t('ルートの一覧に戻る'))));
 }
 
 function stat(label, value) {
@@ -725,13 +755,14 @@ async function route() {
   const parts = hashPath.split('/').filter(Boolean).map(decodeURIComponent);
   const params = new URLSearchParams(hashQuery || '');
   // #/tags は前の版の URL（ブックマーク）のため。検索の画面を開く
-  const navOf = { report: 'roots', browse: 'browse', organize: 'organize', search: 'search', tags: 'search', plans: 'plans' };
+  const navOf = { report: 'roots', relink: 'roots', browse: 'browse', organize: 'organize', search: 'search', tags: 'search', plans: 'plans' };
   document.querySelectorAll('[data-nav]').forEach((a) => a.classList.toggle('active', (navOf[parts[0]] || 'roots') === a.dataset.nav));
   let render;
   if (parts[0] === 'browse') render = () => pageBrowse(main, parts[1], parts.slice(2).join('/'), params);
   else if (parts[0] === 'organize') render = () => pageOrganize(main, parts[1]);
   else if (parts[0] === 'search' || parts[0] === 'tags') render = () => pageTags(main, params);
   else if (parts[0] === 'report' && parts[1]) render = () => pageReport(main, parts[1]);
+  else if (parts[0] === 'relink' && parts[1]) render = () => pageRelink(main, parts[1]);
   else if (parts[0] === 'plans' && parts[1]) render = () => pagePlan(main, parts[1]);
   else if (parts[0] === 'plans') render = () => pagePlans(main);
   else render = () => pageRoots(main);

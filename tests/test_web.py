@@ -650,3 +650,126 @@ def test_search_filters_attributes_dictionary_and_saved_searches(env: dict) -> N
     assert app.get("/api/tags").json["searches"] == [{"name": "対応中", "query": "attr=対応状態%3D対応中"}]
     app.post_json("/api/searches", {"name": "対応中", "op": "delete"}, headers=origin)
     assert app.get("/api/searches").json["searches"] == []
+
+
+# ---------- 移動の確認（F-ID-2）・関係・書き出し（0.13） ----------
+
+
+def test_relink_confirmation_and_relations(env: dict, monkeypatch: pytest.MonkeyPatch) -> None:
+    import datetime as dt
+    import shutil
+
+    # 同じ秒に2回走査すると、消えた側の最後の日時と新しい側の初めての日時が同じになり、
+    # 「どちらが先か」を判定できない（tag_keeper.scan の時計を1分ずつ進める）
+    import tag_keeper.scan as scan_mod
+
+    base = dt.datetime(2026, 11, 1, tzinfo=dt.timezone.utc)
+    ticks = [0]
+
+    def fake_now() -> str:
+        ticks[0] += 1
+        return (base + dt.timedelta(minutes=ticks[0])).isoformat(timespec="seconds")
+
+    monkeypatch.setattr(scan_mod, "utcnow", fake_now)
+
+    app, root = env["app"], env["root"]
+    origin = {"Origin": f"http://{HOST}"}
+    # 同じ内容のファイルが2か所から消えて1つ現れた（どれから動いたか、自動では決められない）
+    write(root / "x" / "f.pdf", "same content")
+    write(root / "y" / "f.pdf", "same content")
+    write(root / "keep.txt", "keep")
+    run_job(env, "/api/roots/data/refresh")
+    # 関係とタグを、消える側に付けておく（結び付けたときに追従するはずのもの）
+    app.post_json("/api/relations", {"root": "data", "from": "x/f.pdf", "to": "keep.txt", "kind": "前の版"}, headers=origin)
+    app.post_json("/api/tags", {"root": "data", "paths": ["x/f.pdf"], "tag": "種別:請求書", "op": "add"}, headers=origin)
+    (root / "z").mkdir()
+    shutil.copy2(root / "x" / "f.pdf", root / "z" / "f.pdf")
+    (root / "x" / "f.pdf").unlink()
+    (root / "y" / "f.pdf").unlink()
+    run_job(env, "/api/roots/data/refresh")
+    assert app.get("/api/state").json["roots"][0]["relink_pending"] == 1
+    items = app.get("/api/relink/data").json["items"]
+    assert len(items) == 1 and items[0]["path"] == "z/f.pdf"
+    assert sorted(c["path"] for c in items[0]["candidates"]) == ["x/f.pdf", "y/f.pdf"]
+    new_id = items[0]["id"]
+    old_id = next(c["id"] for c in items[0]["candidates"] if c["path"] == "x/f.pdf")
+    res = app.post_json("/api/relink/data", {"new_id": new_id, "old_id": old_id}, headers=origin).json
+    assert res == {"from": "x/f.pdf", "to": "z/f.pdf", "tag_moves": 1}
+    assert app.get("/api/tags/search", {"root": "data", "tag": "種別:請求書"}).json["items"][0]["path"] == "z/f.pdf"
+    assert app.get("/api/info", {"root": "data", "path": "z/f.pdf"}).json["relations"]["outgoing"] == [{"kind": "前の版", "path": "keep.txt"}]
+    assert app.get("/api/relink/data").json["items"] == []
+    assert app.get("/api/state").json["roots"][0]["relink_pending"] == 0
+
+    # 一対一に決まる移動は、確認待ちにならずに自動で結び付く
+    write(root / "z2" / "a.txt", "gone one")
+    run_job(env, "/api/roots/data/refresh")
+    (root / "z2" / "a.txt").unlink()
+    (root / "z2" / "b.txt").write_text("gone one")
+    run_job(env, "/api/roots/data/refresh")
+    assert app.get("/api/relink/data").json["items"] == []
+    # 候補が複数あるものを「どれでもない（新しいファイル）」と記録すると、以後は出ない
+    write(root / "p" / "c.txt", "twin")
+    write(root / "q" / "c.txt", "twin")
+    run_job(env, "/api/roots/data/refresh")
+    (root / "p" / "c.txt").unlink()
+    (root / "q" / "c.txt").unlink()
+    write(root / "r" / "c.txt", "twin")
+    run_job(env, "/api/roots/data/refresh")
+    items = app.get("/api/relink/data").json["items"]
+    assert len(items) == 1
+    app.post_json("/api/relink/data", {"new_id": items[0]["id"], "skip": True}, headers=origin)
+    assert app.get("/api/relink/data").json["items"] == []
+
+
+def test_export_from_the_web(env: dict) -> None:
+    app = env["app"]
+    origin = {"Origin": f"http://{HOST}"}
+    app.post_json("/api/tags", {"root": "data", "paths": ["docs/report.pdf"], "tag": "種別:請求書", "op": "add"}, headers=origin)
+    res = app.get("/api/export")
+    assert res.content_type == "application/x-ndjson"
+    import json
+
+    events = [json.loads(line) for line in res.text.splitlines()]
+    assert events == [{"op": "add", "root": "data", "path": "docs/report.pdf", "tag": "種別:請求書", "source": "manual"}]
+
+
+def test_cli_tag_attr_relate_export_import(tmp_path: Path, root: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    from tag_keeper.cli import main
+
+    write(root / "case" / "v2.docx", "new")
+    write(root / "case" / "v1.docx", "old")
+    write(root / "absolute.txt", "abs")
+    cfg = write(tmp_path / "config.toml", f'[[roots]]\nname = "data"\npath = "{root}"\n[tags]\ndir = "{tmp_path / "tags"}"\n')
+    base = ["--config", str(cfg), "--db", str(tmp_path / "catalog.db")]
+    # タグ・別名・親子
+    assert main([*base, "tag", "data", "case/v2.docx", "--add", "種別:見積"]) == 0
+    assert main([*base, "alias", "種別:見積", "種別:estimate"]) == 0
+    assert main([*base, "tag", "data", str(root / "absolute.txt"), "--add", "種別:estimate"]) == 0  # 絶対パス・別名
+    assert main([*base, "parent", "種別:見積", "種別:書類"]) == 0
+    assert main([*base, "tags"]) == 0
+    out = capsys.readouterr().out
+    assert "種別:見積" in out and "種別:estimate" in out and "種別:書類" in out
+    # 属性の定義と値
+    assert main([*base, "attr", "define", "対応状態", "choice", "--choices", "未対応, 対応済み"]) == 0
+    assert main([*base, "attr", "set", "data", "対応状態", "対応済み", "case"]) == 0
+    assert main([*base, "attr", "set", "data", "対応状態", "保留", "case"]) == 2  # 選択肢に無い
+    assert main([*base, "attr", "set", "data", "未定義", "1", "case"]) == 2
+    # 関係
+    assert main([*base, "relate", "data", "case/v2.docx", "case/v1.docx", "--kind", "前の版"]) == 0
+    assert main([*base, "relate", "data", "case/v2.docx", "missing.txt"]) == 2  # 無いファイル
+    # 書き出しと読み込み
+    out_file = tmp_path / "out.jsonl"
+    assert main([*base, "export", "-o", str(out_file)]) == 0
+    import json
+
+    events = [json.loads(line) for line in out_file.read_text(encoding="utf-8").splitlines()]
+    assert {ev["op"] for ev in events} == {"add", "attr-def", "attr-set", "alias", "parent", "relate"}
+    other = write(tmp_path / "other.toml", f'[tags]\ndir = "{tmp_path / "other-tags"}"\n')
+    assert main(["--config", str(other), "--db", str(tmp_path / "catalog.db"), "import", str(out_file)]) == 0
+    from tag_keeper.tags import TagStore
+
+    store = TagStore(tmp_path / "other-tags")
+    assert store.relations_of("data", "case/v1.docx")["incoming"][0]["path"] == "case/v2.docx"
+    assert main([*base, "tag", "data", "case/v2.docx", "--remove", "種別:見積"]) == 0
+    assert main([*base, "attr", "unset", "data", "対応状態", "case"]) == 0
+    assert main([*base, "relate", "data", "case/v2.docx", "case/v1.docx", "--kind", "前の版", "--remove"]) == 0

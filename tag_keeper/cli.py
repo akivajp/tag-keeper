@@ -4,6 +4,8 @@
     tag-keeper scan [ROOT ...]       ルートを走査してカタログを更新する（読み取り専用）
     tag-keeper hash [ROOT ...]       変わったファイルだけ内容ハッシュを計算する
     tag-keeper extract [ROOT ...]    本文を抽出して、全文検索の索引に入れる
+    tag-keeper tags / tag / alias / parent / attr / relate   タグ・辞書・属性・関係を見る・付ける
+    tag-keeper export / import       管理情報の全量を JSONL で書き出す・読み込む
     tag-keeper search [WORD ...]     名前・本文（--text）・種類・タグで探す
     tag-keeper report [ROOT ...]     整理候補（置く価値の薄いファイル・重複）を報告する
     tag-keeper plan ROOT             整理候補を隔離するプラン（TOML）を書き出す
@@ -81,7 +83,7 @@ from tag_keeper.plan import (
 from tag_keeper.report import Report, build_report
 from tag_keeper.scan import RootUnavailableError, relink_by_hash, scan_root
 from tag_keeper.syncguard import SyncError, SyncGuard, make_guard
-from tag_keeper.tags import TagStore
+from tag_keeper.tags import TagError, TagStore
 from tag_keeper.tags import search as search_tags
 
 log = logging.getLogger("tag_keeper")
@@ -352,6 +354,171 @@ def cmd_search(args: argparse.Namespace, config: Config) -> int:
     out_console.print(table)
     shown_n = len(table.rows)
     out_console.print(f"[dim]{total:,} 件{f'（うち {shown_n:,} 件を表示。--limit で増やせます）' if shown_n < total else ''}[/dim]")
+    return 0
+
+
+# --- タグ・辞書・属性・関係・書き出しと読み込み（画面と同じことを CLI からも。F-UI-1・F-MD-9） ---
+
+
+def _root_named(config: Config, name: str) -> RootConfig:
+    """設定ファイルのルートを名前で引く。無ければ ConfigError。"""
+    rc = config.find_root(name)
+    if rc is None:
+        raise ConfigError(f"設定ファイルにルートがありません: {name}")
+    return rc
+
+
+def _relpath_in(rc: RootConfig, raw: str, *, must_exist: bool = True) -> str:
+    """コマンドラインで渡されたパス（ルートからの相対パスか、ルートの中の絶対パス）を、ルートからの相対パスにする。"""
+    p = Path(raw).expanduser()
+    if p.is_absolute():
+        try:
+            rel = p.resolve().relative_to(rc.path.resolve()).as_posix()
+        except ValueError as e:
+            raise ConfigError(f"ルート {rc.name} の外を指しています: {raw}") from e
+        rel = "" if rel == "." else rel
+    else:
+        rel = raw.strip("/")
+        if any(part in ("", ".", "..") for part in rel.split("/")) and rel:
+            raise ConfigError(f"不正なパスです: {raw}")
+    if must_exist and not (rc.path / rel).exists():
+        raise ConfigError(f"ありません: {rc.name}/{rel}")
+    return rel
+
+
+def cmd_tags(args: argparse.Namespace, config: Config) -> int:
+    """タグ（件数・別名・親）・属性の定義・保存した検索を一覧する。"""
+    store = TagStore(config.tags.dir)
+    # 先に辞書を読み、続けて件数を読む（件数の側が、タグが直接付いている数の真実源）
+    dictionary = store.dictionary()
+    counts = store.all_tags()
+    table = Table(title="タグ")
+    for col in ("タグ", "件数", "別名", "親"):
+        table.add_column(col)
+    for tag in sorted(set(counts) | set(dictionary)):
+        d = dictionary.get(tag, {})
+        table.add_row(tag, f"{counts.get(tag, 0):,}", "、".join(d.get("aliases", [])), "、".join(d.get("parents", [])))
+    out_console.print(table)
+    defs = store.attr_defs_list()
+    if defs:
+        at = Table(title="属性")
+        for col in ("名前", "型", "選択肢", "件数"):
+            at.add_column(col)
+        for d in defs:
+            at.add_row(d["name"], d["type"], " / ".join(d["choices"]), f"{d['count']:,}")
+        out_console.print(at)
+    searches = store.saved_searches()
+    if searches:
+        st = Table(title="保存した検索")
+        st.add_column("名前")
+        st.add_column("条件")
+        for sv in searches:
+            st.add_row(sv["name"], sv["query"])
+        out_console.print(st)
+    return 0
+
+
+def cmd_tag(args: argparse.Namespace, config: Config) -> int:
+    """ファイル・フォルダにタグを付ける（--add）・外す（--remove）。別名は正式な名前になる。"""
+    if not (args.add or args.remove):
+        log.error("--add か --remove でタグを指定してください")
+        return 2
+    rc = _root_named(config, args.root)
+    paths = [_relpath_in(rc, p) for p in args.paths]
+    store = TagStore(config.tags.dir)
+    for tag in args.add or []:
+        log.info("「%s」を %d 件に付けました", store.canonical(tag), store.add(rc.name, paths, tag))
+    for tag in args.remove or []:
+        log.info("「%s」を %d 件から外しました", store.canonical(tag), store.remove(rc.name, paths, tag))
+    return 0
+
+
+def cmd_alias(args: argparse.Namespace, config: Config) -> int:
+    """タグの別名を登録する（--remove で外す）。既に使われている名前を別名にすると、正式な名前にまとめる。"""
+    store = TagStore(config.tags.dir)
+    if args.remove:
+        ok = store.remove_alias(args.alias)
+        log.info("別名を外しました: %s" if ok else "その別名は登録されていません: %s", args.alias)
+        return 0 if ok else 1
+    store.add_alias(args.tag, args.alias)
+    log.info("「%s」を「%s」の別名にしました", args.alias, store.canonical(args.tag))
+    return 0
+
+
+def cmd_parent(args: argparse.Namespace, config: Config) -> int:
+    """タグの親子を登録する（--remove で外す）。子が付いたものは、親のタグで探しても見つかる。"""
+    store = TagStore(config.tags.dir)
+    if args.remove:
+        ok = store.remove_parent(args.tag, args.parent)
+        log.info("親子を外しました: %s → %s" if ok else "その親子は登録されていません: %s → %s", args.tag, args.parent)
+        return 0 if ok else 1
+    store.add_parent(args.tag, args.parent)
+    log.info("親子を登録しました: %s → %s", store.canonical(args.tag), store.canonical(args.parent))
+    return 0
+
+
+def cmd_attr(args: argparse.Namespace, config: Config) -> int:
+    """属性を定義する（define）・定義を消す（undefine）・値を付ける（set）・外す（unset）。"""
+    store = TagStore(config.tags.dir)
+    if args.attr_command == "define":
+        choices = [c.strip() for c in (args.choices or "").replace("、", ",").split(",") if c.strip()]
+        d = store.define_attr(args.name, args.type, choices)
+        log.info("属性を定義しました: %s（%s%s）", d.name, d.type, f": {' / '.join(d.choices)}" if d.choices else "")
+        return 0
+    if args.attr_command == "undefine":
+        log.info("属性の定義を消しました: %s（値が付いていた %d 件から外しました）", args.name, store.undefine_attr(args.name))
+        return 0
+    rc = _root_named(config, args.root)
+    paths = [_relpath_in(rc, p) for p in args.paths]
+    if args.attr_command == "set":
+        log.info("「%s」を %d 件に付けました", args.name, store.set_attr(rc.name, paths, args.name, args.value))
+    else:
+        log.info("「%s」を %d 件から外しました", args.name, store.unset_attr(rc.name, paths, args.name))
+    return 0
+
+
+def cmd_relate(args: argparse.Namespace, config: Config) -> int:
+    """2つのアイテムの間に関係を張る（--remove で外す）。FROM から TO へ（例: 新しい版 → 前の版）。"""
+    rc = _root_named(config, args.root)
+    store = TagStore(config.tags.dir)
+    src = _relpath_in(rc, args.src, must_exist=not args.remove)
+    dst = _relpath_in(rc, args.dst, must_exist=not args.remove)
+    if args.remove:
+        ok = store.unrelate(rc.name, src, dst, args.kind)
+    else:
+        ok = store.relate(rc.name, src, dst, args.kind)
+    log.info("%s: %s →（%s）→ %s", ("外しました" if args.remove else "張りました") if ok else "変わりません", src, args.kind, dst)
+    return 0
+
+
+def cmd_export(args: argparse.Namespace, config: Config) -> int:
+    """管理情報の全量（タグ・属性・関係・辞書・保存した検索）を JSONL で書き出す。"""
+    events = TagStore(config.tags.dir).export_events()
+    text = "".join(json.dumps(ev, ensure_ascii=False) + "\n" for ev in events)
+    if args.output:
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        args.output.write_text(text, encoding="utf-8")
+        log.info("書き出しました: %s（%s 行）", args.output, f"{len(events):,}")
+    else:
+        sys.stdout.write(text)
+    return 0
+
+
+def cmd_import(args: argparse.Namespace, config: Config) -> int:
+    """export で書き出した JSONL を読み込む（この端末のタグのログに追記する。既にあるものは飛ばす）。"""
+    events = []
+    for n, line in enumerate(args.file.read_text(encoding="utf-8").splitlines(), 1):
+        if not line.strip():
+            continue
+        try:
+            events.append(json.loads(line))
+        except json.JSONDecodeError as e:
+            raise ConfigError(f"{args.file} の {n} 行目を読めません: {e}") from e
+    try:
+        counts = TagStore(config.tags.dir).import_events(events)
+    except TagError as e:
+        raise ConfigError(f"{args.file}: {e}") from e
+    log.info("読み込みました: %s", "、".join(f"{k} {v:,} 件" for k, v in sorted(counts.items())) or "（足したものはありません）")
     return 0
 
 
@@ -785,6 +952,63 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--limit", type=int, default=50, help="表に載せる件数")
     p.set_defaults(func=cmd_search)
 
+    p = sub.add_parser("tags", help="タグ（件数・別名・親）・属性の定義・保存した検索を一覧する")
+    p.set_defaults(func=cmd_tags)
+
+    p = sub.add_parser("tag", help="ファイル・フォルダにタグを付ける・外す")
+    p.add_argument("root", metavar="ROOT", help="ルート名")
+    p.add_argument("paths", nargs="+", metavar="PATH", help="ルートからの相対パスか、ルートの中の絶対パス")
+    p.add_argument("--add", action="append", metavar="TAG", help="付けるタグ（複数指定可。別名は正式な名前になる）")
+    p.add_argument("--remove", action="append", metavar="TAG", help="外すタグ（複数指定可）")
+    p.set_defaults(func=cmd_tag)
+
+    p = sub.add_parser("alias", help="タグの別名を登録する（既に使われている名前なら、正式な名前にまとめる）")
+    p.add_argument("tag", metavar="TAG", help="正式な名前")
+    p.add_argument("alias", metavar="ALIAS", help="別名")
+    p.add_argument("--remove", action="store_true", help="別名の登録を外す（TAG は何でもよい）")
+    p.set_defaults(func=cmd_alias)
+
+    p = sub.add_parser("parent", help="タグの親子を登録する（子が付いたものは、親のタグで探しても見つかる）")
+    p.add_argument("tag", metavar="TAG", help="子のタグ")
+    p.add_argument("parent", metavar="PARENT", help="親のタグ")
+    p.add_argument("--remove", action="store_true", help="親子の登録を外す")
+    p.set_defaults(func=cmd_parent)
+
+    p = sub.add_parser("attr", help="型付きの属性を定義する・値を付ける")
+    attr_sub = p.add_subparsers(dest="attr_command", required=True, metavar="ACTION")
+    q = attr_sub.add_parser("define", help="属性を定義する（同じ名前なら定義し直す）")
+    q.add_argument("name", metavar="NAME", help="属性の名前（例: 対応状態）")
+    q.add_argument("type", choices=["choice", "flag", "date", "number", "text"], help="型（choice=択一・flag・date・number・text）")
+    q.add_argument("--choices", default="", help="択一の選択肢（カンマ区切り。例: 未対応,対応中,対応済み）")
+    q = attr_sub.add_parser("undefine", help="属性の定義を消す（付いた値もすべて外れる）")
+    q.add_argument("name", metavar="NAME", help="属性の名前")
+    q = attr_sub.add_parser("set", help="属性の値を付ける（同じ名前の値は置き換わる）")
+    q.add_argument("root", metavar="ROOT", help="ルート名")
+    q.add_argument("name", metavar="NAME", help="属性の名前")
+    q.add_argument("value", metavar="VALUE", help="値（フラグなら true、日付は YYYY-MM-DD）")
+    q.add_argument("paths", nargs="+", metavar="PATH", help="ルートからの相対パスか、ルートの中の絶対パス")
+    q = attr_sub.add_parser("unset", help="属性の値を外す")
+    q.add_argument("root", metavar="ROOT", help="ルート名")
+    q.add_argument("name", metavar="NAME", help="属性の名前")
+    q.add_argument("paths", nargs="+", metavar="PATH", help="ルートからの相対パスか、ルートの中の絶対パス")
+    p.set_defaults(func=cmd_attr)
+
+    p = sub.add_parser("relate", help="2つのアイテムの間に関係を張る（例: 新しい版 → 前の版）")
+    p.add_argument("root", metavar="ROOT", help="ルート名")
+    p.add_argument("src", metavar="FROM", help="関係の元（例: 新しい版）")
+    p.add_argument("dst", metavar="TO", help="関係の先（例: 前の版）")
+    p.add_argument("--kind", default="関連", help="関係の種類（例: 前の版・派生元・添付先。既定: 関連）")
+    p.add_argument("--remove", action="store_true", help="関係を外す")
+    p.set_defaults(func=cmd_relate)
+
+    p = sub.add_parser("export", help="管理情報の全量（タグ・属性・関係・辞書・保存した検索）を JSONL で書き出す")
+    p.add_argument("-o", "--output", type=Path, default=None, help="書き出すファイル（省略時は標準出力）")
+    p.set_defaults(func=cmd_export)
+
+    p = sub.add_parser("import", help="export で書き出した JSONL を読み込む（既にあるものは飛ばす）")
+    p.add_argument("file", type=Path, metavar="FILE", help="読み込む JSONL")
+    p.set_defaults(func=cmd_import)
+
     p = sub.add_parser("report", help="整理候補（置く価値の薄いもの・重複）を報告する")
     p.add_argument("roots", nargs="*", metavar="ROOT", help="ルート名かフォルダのパス（省略時は全ルート）")
     p.add_argument("--json", type=Path, default=None, help="報告を JSON で書き出すファイル")
@@ -863,7 +1087,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         config = load_config(args.config)
         return int(args.func(args, config))
-    except (ConfigError, PlanError, SnapshotError, SyncError) as e:
+    except (ConfigError, PlanError, SnapshotError, SyncError, TagError) as e:
         log.error("%s", e)
         return 2
 

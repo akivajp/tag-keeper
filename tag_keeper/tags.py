@@ -34,7 +34,17 @@
     {"op": "search-save",   "name": "要対応", "query": "attr=要対応&kind=pdf"}
     {"op": "search-delete", "name": "要対応"}
 
+アイテム間の関係（F-MD-7。種類は自由に足せる）と、内容ハッシュでの移動の結び付けを見送ったもの（F-ID-2）:
+
+    {"op": "relate",      "root": "onedrive", "from": "a/v2.docx", "to": "a/v1.docx", "kind": "前の版"}
+    {"op": "unrelate",    "root": "onedrive", "from": "a/v2.docx", "to": "a/v1.docx", "kind": "前の版"}
+    {"op": "relink-skip", "root": "onedrive", "path": "new/x.pdf", "sha256": "..."}
+
 古い版は知らない種類の行を読み飛ばす（互換を保つため、既存の行の書式は変えない）。
+
+パスは Unicode の NFC にそろえて扱う（F-ID-4。同じ名前でも NFC と NFD でバイト列が違うことがあるため）。
+読み込むときも問い合わせのときもそろえるので、どちらの形で書かれた行でも同じアイテムを指す。
+実際のファイルの操作には、ディスク上の元の名前を使う（ここはパスで管理情報を引くだけ）。
 """
 
 from __future__ import annotations
@@ -87,6 +97,15 @@ def normalize_tag(tag: str) -> str:
     if any(unicodedata.category(ch).startswith("C") for ch in t):
         raise TagError(f"タグの名前に制御文字は使えません: {tag!r}")
     return t
+
+
+def _nk(path: str) -> str:
+    """パスを管理情報の引き当てに使う形（Unicode の NFC）にそろえる（F-ID-4）。"""
+    return unicodedata.normalize("NFC", path)
+
+
+# 関係の種類の既定の候補（画面の補完に出す。自由に足せる）
+RELATION_KINDS = ("前の版", "派生元", "添付先", "関連")
 
 
 def _ancestors(path: str) -> list[str]:
@@ -254,6 +273,9 @@ class TagStore:
         self.attrs: dict[tuple[str, str], dict[str, AttrValue]] = {}
         # 保存した検索（名前 → 問い合わせの文字列）
         self.searches: dict[str, str] = {}
+        # アイテム間の関係（ルート名 → {(元, 先, 種類)}）と、結び付けを見送った移動（ルート名, 新しいパス, 内容ハッシュ）
+        self.relations: dict[str, set[tuple[str, str, str]]] = {}
+        self.relink_skips: set[tuple[str, str, str]] = set()
         self._stamp: tuple[tuple[str, int, int], ...] = ()
 
     @property
@@ -288,6 +310,7 @@ class TagStore:
             self.items = {}
             self.aliases, self.parents = {}, {}
             self.attr_defs, self.attrs, self.searches = {}, {}, {}
+            self.relations, self.relink_skips = {}, set()
             for ev in events:
                 self._apply(ev)
             self._stamp = stamp
@@ -297,12 +320,12 @@ class TagStore:
         op = ev.get("op")
         root = str(ev.get("root", ""))
         if op == "add":
-            key = (root, str(ev["path"]))
+            key = (root, _nk(str(ev["path"])))
             self.items.setdefault(key, {})[ev["tag"]] = Assignment(
                 ev["tag"], str(ev.get("source", "manual")), str(ev.get("at", "")), str(ev.get("host", ""))
             )
         elif op == "remove":
-            key = (root, str(ev["path"]))
+            key = (root, _nk(str(ev["path"])))
             tags = self.items.get(key)
             if tags is not None:
                 tags.pop(ev["tag"], None)
@@ -339,7 +362,7 @@ class TagStore:
             for ps in self.parents.values():
                 ps.discard(tag)
         elif op == "move":
-            src, dst = str(ev["from"]), str(ev["to"])
+            src, dst = _nk(str(ev["from"])), _nk(str(ev["to"]))
             moved = [k for k in self.items if k[0] == root and _under(k[1], src)]
             entries = {k: self.items.pop(k) for k in moved}
             for (r, p), tags in entries.items():
@@ -349,6 +372,13 @@ class TagStore:
             moved_attrs = {k: self.attrs.pop(k) for k in [k for k in self.attrs if k[0] == root and _under(k[1], src)]}
             for (r, p), values in moved_attrs.items():
                 self.attrs.setdefault((r, dst + p[len(src):]), {}).update(values)
+            # 関係の両端も追従させる
+            rels = self.relations.get(root)
+            if rels:
+                def moved_path(path: str) -> str:
+                    return dst + path[len(src):] if _under(path, src) else path
+
+                self.relations[root] = {(moved_path(a), moved_path(b), k) for a, b, k in rels}
         elif op == "alias":
             alias, tag = str(ev["alias"]), str(ev["tag"])
             if alias != tag:
@@ -376,11 +406,11 @@ class TagStore:
                 if not self.attrs[key]:
                     del self.attrs[key]
         elif op == "attr-set":
-            key = (root, str(ev["path"]))
+            key = (root, _nk(str(ev["path"])))
             name = str(ev["name"])
             self.attrs.setdefault(key, {})[name] = AttrValue(name, ev.get("value"), str(ev.get("source", "manual")), str(ev.get("at", "")))
         elif op == "attr-unset":
-            key = (root, str(ev["path"]))
+            key = (root, _nk(str(ev["path"])))
             vals = self.attrs.get(key)
             if vals is not None:
                 vals.pop(str(ev["name"]), None)
@@ -390,6 +420,14 @@ class TagStore:
             self.searches[str(ev["name"])] = str(ev.get("query", ""))
         elif op == "search-delete":
             self.searches.pop(str(ev["name"]), None)
+        elif op == "relate":
+            a, b, kind = _nk(str(ev["from"])), _nk(str(ev["to"])), str(ev.get("kind") or "関連")
+            if a != b:
+                self.relations.setdefault(root, set()).add((a, b, kind))
+        elif op == "unrelate":
+            self.relations.get(root, set()).discard((_nk(str(ev["from"])), _nk(str(ev["to"])), str(ev.get("kind") or "関連")))
+        elif op == "relink-skip":
+            self.relink_skips.add((root, _nk(str(ev["path"])), str(ev.get("sha256", ""))))
 
     # --- 書き込み ---
 
@@ -418,7 +456,7 @@ class TagStore:
             tag = self._canonical(normalize_tag(tag))
             events = [
                 {"at": now, "host": self.host, "op": "add", "root": root, "path": p, "tag": tag, "source": source}
-                for p in dict.fromkeys(paths)
+                for p in dict.fromkeys(_nk(x) for x in paths)
                 if tag not in self.items.get((root, p), {})
             ]
             self._append(events)
@@ -432,7 +470,7 @@ class TagStore:
             tag = self._canonical(normalize_tag(tag))
             events = [
                 {"at": now, "host": self.host, "op": "remove", "root": root, "path": p, "tag": tag}
-                for p in dict.fromkeys(paths)
+                for p in dict.fromkeys(_nk(x) for x in paths)
                 if tag in self.items.get((root, p), {})
             ]
             self._append(events)
@@ -448,8 +486,11 @@ class TagStore:
         with self.lock:
             self.reload_if_changed()
             events = []
-            for src, dst in order_moves(list(moves)):
-                if any(k[0] == root and _under(k[1], src) for k in [*self.items, *self.attrs]):
+            rel_paths = {p for a, b, _k in self.relations.get(root, ()) for p in (a, b)}
+            for src, dst in order_moves([(_nk(a), _nk(b)) for a, b in moves]):
+                if any(k[0] == root and _under(k[1], src) for k in [*self.items, *self.attrs]) or any(
+                    _under(p, src) for p in rel_paths
+                ):
                     events.append({"at": now, "host": self.host, "op": "move", "root": root, "from": src, "to": dst})
             self._append(events)
         return len(events)
@@ -461,6 +502,7 @@ class TagStore:
         返したものを実行記録に残しておき、取り消しのときに attach で戻す。属性は detach_attrs_under で同じように扱う。
         """
         now = utcnow()
+        base = _nk(base)
         with self.lock:
             self.reload_if_changed()
             detached = {
@@ -493,6 +535,7 @@ class TagStore:
     def detach_attrs_under(self, root: str, base: str) -> dict[str, list[list[Any]]]:
         """base とその配下の属性を外し、外したもの（相対パス → [名前, 値, 出所] の一覧）を返す（隔離のとき）。"""
         now = utcnow()
+        base = _nk(base)
         with self.lock:
             self.reload_if_changed()
             detached = {
@@ -702,7 +745,7 @@ class TagStore:
             v = parse_attr_value(d, value)
             events = [
                 {"at": now, "host": self.host, "op": "attr-set", "root": root, "path": p, "name": name, "value": v, "source": source}
-                for p in dict.fromkeys(paths)
+                for p in dict.fromkeys(_nk(x) for x in paths)
                 if (cur := self.attrs.get((root, p), {}).get(name)) is None or cur.value != v
             ]
             self._append(events)
@@ -716,7 +759,7 @@ class TagStore:
             self.reload_if_changed()
             events = [
                 {"at": now, "host": self.host, "op": "attr-unset", "root": root, "path": p, "name": name}
-                for p in dict.fromkeys(paths)
+                for p in dict.fromkeys(_nk(x) for x in paths)
                 if name in self.attrs.get((root, p), {})
             ]
             self._append(events)
@@ -724,6 +767,7 @@ class TagStore:
 
     def attrs_of(self, root: str, path: str) -> dict[str, list[dict[str, Any]]]:
         """アイテムの属性。直接付いたもの（direct）と、祖先のフォルダから継承したもの（inherited。近い方が優先）。"""
+        path = _nk(path)
         with self.lock:
             self.reload_if_changed()
             direct = {v.name: v for v in self.attrs.get((root, path), {}).values()}
@@ -773,6 +817,152 @@ class TagStore:
             self.reload_if_changed()
             return [{"name": n, "query": q} for n, q in sorted(self.searches.items())]
 
+    # --- アイテム間の関係（F-MD-7） ---
+
+    def relate(self, root: str, src: str, dst: str, kind: str = "関連") -> bool:
+        """2つのアイテムの間に関係を張る（src から dst へ。例: 新しい版 → 前の版）。張ったら True。"""
+        src, dst = _nk(src), _nk(dst)
+        kind = normalize_tag(kind or "関連")
+        if src == dst:
+            raise TagError("同じアイテムどうしには関係を張れません")
+        with self.lock:
+            self.reload_if_changed()
+            if (src, dst, kind) in self.relations.get(root, ()):
+                return False
+            self._append([{"at": utcnow(), "host": self.host, "op": "relate", "root": root, "from": src, "to": dst, "kind": kind}])
+        return True
+
+    def unrelate(self, root: str, src: str, dst: str, kind: str = "関連") -> bool:
+        """関係を外す。外したら True。"""
+        src, dst = _nk(src), _nk(dst)
+        kind = normalize_tag(kind or "関連")
+        with self.lock:
+            self.reload_if_changed()
+            if (src, dst, kind) not in self.relations.get(root, ()):
+                return False
+            self._append([{"at": utcnow(), "host": self.host, "op": "unrelate", "root": root, "from": src, "to": dst, "kind": kind}])
+        return True
+
+    def relations_of(self, root: str, path: str) -> dict[str, list[dict[str, str]]]:
+        """アイテムの関係。自身から張ったもの（outgoing）と、ほかから張られたもの（incoming）。"""
+        path = _nk(path)
+        with self.lock:
+            self.reload_if_changed()
+            rels = sorted(self.relations.get(root, ()))
+            return {
+                "outgoing": [{"kind": k, "path": b} for a, b, k in rels if a == path],
+                "incoming": [{"kind": k, "path": a} for a, b, k in rels if b == path],
+            }
+
+    def relation_kinds(self) -> list[str]:
+        """関係の種類の候補（既定の候補と、使われているもの）。"""
+        with self.lock:
+            self.reload_if_changed()
+            used = {k for rels in self.relations.values() for _a, _b, k in rels}
+            return list(dict.fromkeys([*RELATION_KINDS, *sorted(used)]))
+
+    def detach_relations_under(self, root: str, base: str) -> list[list[str]]:
+        """片方の端が base とその配下にある関係を外し、外したもの（[元, 先, 種類] の一覧）を返す（隔離のとき）。"""
+        base = _nk(base)
+        now = utcnow()
+        with self.lock:
+            self.reload_if_changed()
+            hit = sorted((a, b, k) for a, b, k in self.relations.get(root, ()) if _under(a, base) or _under(b, base))
+            self._append([{"at": now, "host": self.host, "op": "unrelate", "root": root, "from": a, "to": b, "kind": k} for a, b, k in hit])
+        return [[a, b, k] for a, b, k in hit]
+
+    def attach_relations(self, root: str, detached: Iterable[Sequence[str]]) -> int:
+        """detach_relations_under で外した関係を張り直す（取り消しのとき）。張った件数を返す。"""
+        now = utcnow()
+        with self.lock:
+            self.reload_if_changed()
+            have = self.relations.get(root, set())
+            events = [
+                {"at": now, "host": self.host, "op": "relate", "root": root, "from": a, "to": b, "kind": k}
+                for a, b, k in (tuple(x) for x in detached)
+                if (a, b, k) not in have
+            ]
+            self._append(events)
+        return len(events)
+
+    # --- 内容ハッシュでの移動の結び付けを見送ったもの（F-ID-2） ---
+
+    def skip_relink(self, root: str, path: str, sha256: str) -> None:
+        """「どれとも結び付けない」と決めた新しいファイルを記録する（確認の一覧に二度と出さない）。"""
+        with self.lock:
+            self.reload_if_changed()
+            if (root, _nk(path), sha256) in self.relink_skips:
+                return
+            self._append([{"at": utcnow(), "host": self.host, "op": "relink-skip", "root": root, "path": _nk(path), "sha256": sha256}])
+
+    def relink_skipped(self, root: str) -> set[tuple[str, str]]:
+        """結び付けを見送った（新しいパス, 内容ハッシュ）の集合。"""
+        with self.lock:
+            self.reload_if_changed()
+            return {(p, sha) for r, p, sha in self.relink_skips if r == root}
+
+    # --- 書き出しと読み込み（F-MD-9） ---
+
+    def export_events(self) -> list[dict[str, Any]]:
+        """今の管理情報の全量を、読み込み直せるイベントの並びにする（属性の定義・別名・親子・タグ・属性・関係・保存した検索）。
+
+        履歴（いつ付けて、いつ外したか）は含めず、今の状態だけを書く。
+        """
+        with self.lock:
+            self.reload_if_changed()
+            out: list[dict[str, Any]] = []
+            out += [{"op": "attr-def", **d.to_dict()} for d in sorted(self.attr_defs.values(), key=lambda d: d.name)]
+            out += [{"op": "alias", "tag": c, "alias": a} for a, c in sorted(self.aliases.items())]
+            out += [{"op": "parent", "tag": c, "parent": p} for c, ps in sorted(self.parents.items()) for p in sorted(ps)]
+            for (r, path), tags in sorted(self.items.items()):
+                out += [{"op": "add", "root": r, "path": path, "tag": a.tag, "source": a.source} for a in sorted(tags.values(), key=lambda a: a.tag)]
+            for (r, path), vals in sorted(self.attrs.items()):
+                out += [{"op": "attr-set", "root": r, "path": path, "name": v.name, "value": v.value, "source": v.source} for v in sorted(vals.values(), key=lambda v: v.name)]
+            for r, rels in sorted(self.relations.items()):
+                out += [{"op": "relate", "root": r, "from": a, "to": b, "kind": k} for a, b, k in sorted(rels)]
+            out += [{"op": "search-save", "name": n, "query": q} for n, q in sorted(self.searches.items())]
+            return out
+
+    def import_events(self, events: Iterable[dict[str, Any]]) -> Counter[str]:
+        """書き出したイベントを読み込む（この端末のログに、今の日時で追記する）。既にあるものは飛ばす。
+
+        受け付けるのは export_events が書く種類だけ。種類ごとに、実際に足した件数を返す。不正な行は TagError。
+        """
+        counts: Counter[str] = Counter()
+        for n, ev in enumerate(events, 1):
+            op = ev.get("op")
+            try:
+                if op == "attr-def":
+                    d = self.attr_defs.get(normalize_tag(str(ev["name"])))
+                    new = self.define_attr(str(ev["name"]), str(ev["type"]), ev.get("choices") or ())
+                    changed = d != new
+                elif op == "alias":
+                    changed = self.canonical(str(ev["alias"])) != self.canonical(str(ev["tag"]))
+                    if changed:
+                        self.add_alias(str(ev["tag"]), str(ev["alias"]))
+                elif op == "parent":
+                    before = self.dictionary().get(self.canonical(str(ev["tag"])), {}).get("parents", [])
+                    self.add_parent(str(ev["tag"]), str(ev["parent"]))
+                    changed = self.canonical(str(ev["parent"])) not in before
+                elif op == "add":
+                    changed = self.add(str(ev["root"]), [str(ev["path"])], str(ev["tag"]), str(ev.get("source", "manual"))) > 0
+                elif op == "attr-set":
+                    changed = self.set_attr(str(ev["root"]), [str(ev["path"])], str(ev["name"]), ev.get("value"), str(ev.get("source", "manual"))) > 0
+                elif op == "relate":
+                    changed = self.relate(str(ev["root"]), str(ev["from"]), str(ev["to"]), str(ev.get("kind") or "関連"))
+                elif op == "search-save":
+                    changed = str(ev["name"]) not in self.searches or self.searches[str(ev["name"])] != str(ev["query"])
+                    self.save_search(str(ev["name"]), str(ev["query"]))
+                else:
+                    raise TagError(f"読み込めない種類です: {op}")
+            except (KeyError, TypeError) as e:
+                raise TagError(f"{n} 行目の項目が足りません: {e}") from e
+            except TagError as e:
+                raise TagError(f"{n} 行目: {e}") from e
+            if changed:
+                counts[str(op)] += 1
+        return counts
+
     # --- タグでの絞り込み ---
 
     def tagged_paths(self, root: str, implied: bool = False) -> dict[str, set[str]]:
@@ -798,6 +988,7 @@ class TagStore:
     def tags_of(self, root: str, path: str) -> dict[str, list[dict[str, str]]]:
         """アイテムのタグ。直接付いたもの（direct）、祖先のフォルダから継承したもの（inherited）、
         親子から成り立つもの（implied。どのタグからか via を添える）。"""
+        path = _nk(path)
         with self.lock:
             self.reload_if_changed()
             direct = [
@@ -831,7 +1022,8 @@ class TagStore:
             return sorted(k for k, tags in self.items.items() if tag in tags and (root is None or k[0] == root))
 
     def tagged_under(self, root: str, path: str) -> dict[str, list[str]]:
-        """path の配下で、直接タグが付いているアイテム（相対パス → タグの一覧）。ファイルブラウザ用。"""
+        """path の配下で、直接タグが付いているアイテム（相対パス → タグの一覧。パスは NFC）。ファイルブラウザ用。"""
+        path = _nk(path)
         with self.lock:
             self.reload_if_changed()
             return {
@@ -872,12 +1064,13 @@ def search(
         return any("/".join(parts[:i]) in paths for i in range(1, len(parts)))
 
     out = []
-    for path, _is_dir in entries:
+    for raw, _is_dir in entries:
+        path = _nk(raw)
         if inc:
             hits = (has(path, s) for s in inc)
             if not (all(hits) if mode == "and" else any(hits)):
                 continue
         if any(has(path, s) for s in exc):
             continue
-        out.append(path)
+        out.append(raw)
     return out

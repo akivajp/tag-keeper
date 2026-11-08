@@ -14,6 +14,7 @@ import logging
 import os
 import sqlite3
 import stat
+import unicodedata
 from collections import defaultdict
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
@@ -459,6 +460,122 @@ def _infer_dir_moves(
     return chosen
 
 
+# 結び付けに使う、新しく現れたファイルの列と、見えなくなったファイルの列
+_NEW_COLS = "id, relpath, size, mtime_ns, inode, sha256, hashed_size, hashed_mtime_ns, first_seen, last_seen"
+_OLD_COLS = "id, relpath, size, sha256, last_seen, gone_at"
+
+
+def _merge_rows(conn: sqlite3.Connection, n: sqlite3.Row, o: sqlite3.Row) -> None:
+    """新しく足された行を消し、消えた側の行を新しいパスで生き返らせる（同じ行が同じアイテムを指し続ける）。
+
+    呼び出し側のトランザクションの中で呼ぶ。
+    """
+    conn.execute("DELETE FROM entries WHERE id = ?", (n["id"],))
+    conn.execute(
+        "UPDATE entries SET relpath = ?, size = ?, mtime_ns = ?, inode = ?, hashed_size = ?,"
+        " hashed_mtime_ns = ?, last_seen = ?, missing_count = 0, gone_at = NULL, gone_by = NULL WHERE id = ?",
+        (n["relpath"], n["size"], n["mtime_ns"], n["inode"], n["hashed_size"], n["hashed_mtime_ns"], n["last_seen"], o["id"]),
+    )
+    # 新しい行を指していた移動の記録（現れた後に inode で追った改名など）は、生き返らせた行に付け替える
+    conn.execute("UPDATE moves SET entry_id = ? WHERE entry_id = ?", (o["id"], n["id"]))
+
+
+def relink_candidates(
+    conn: sqlite3.Connection,
+    root_id: int,
+    *,
+    days: int = 30,
+    skipped: Iterable[tuple[str, str]] = (),
+    now: str | None = None,
+    limit: int = 200,
+) -> list[dict[str, object]]:
+    """内容ハッシュでは自動で結び付けられなかった（候補が複数ある）新しいファイルと、その候補（F-ID-2 の確認待ち）。
+
+    relink_by_hash の後に残っているものだけが出る（一対一に決まるものは、もう結び付けてある）。
+
+    Args:
+        conn: カタログへの接続。
+        root_id: ルートの ID。
+        days: 何日前までに見えなくなったものを候補にするか。
+        skipped: 利用者が「どれとも結び付けない」と決めた（新しいパス, 内容ハッシュ）。
+        now: 現在の日時（テスト用）。
+        limit: 返す件数の上限。
+
+    Returns:
+        {"id", "path", "size", "first_seen", "candidates": [{"id", "path", "last_seen", "gone_at"}]} の一覧（パスの順）。
+    """
+    if days <= 0:
+        return []
+    now = now or utcnow()
+    cutoff = (datetime.fromisoformat(now) - timedelta(days=days)).isoformat(timespec="seconds")
+    skip = set(skipped)
+    news = [
+        r for r in conn.execute(
+            f"SELECT {_NEW_COLS} FROM entries WHERE root_id = ? AND gone_at IS NULL AND is_dir = 0 AND missing_count = 0"
+            " AND sha256 IS NOT NULL AND hashed_size IS size AND hashed_mtime_ns IS mtime_ns AND first_seen >= ? ORDER BY relpath",
+            (root_id, cutoff),
+        )
+        if (unicodedata.normalize("NFC", str(r["relpath"])), str(r["sha256"])) not in skip
+    ]
+    # 候補（見えなくなったファイル）は、内容ハッシュでまとめて引く（新しいファイルごとに問い合わせない）
+    by_key: dict[tuple[str, int], list[sqlite3.Row]] = defaultdict(list)
+    shas = sorted({str(n["sha256"]) for n in news})
+    for i in range(0, len(shas), _IN_CHUNK):
+        chunk = shas[i : i + _IN_CHUNK]
+        marks = ",".join("?" * len(chunk))
+        for o in conn.execute(
+            f"SELECT {_OLD_COLS} FROM entries WHERE root_id = ? AND is_dir = 0 AND sha256 IN ({marks})"
+            " AND ((gone_at IS NOT NULL AND gone_at >= ? AND (gone_by IS NULL OR gone_by = 'scan'))"
+            "      OR (gone_at IS NULL AND missing_count > 0)) ORDER BY relpath",
+            (root_id, *chunk, cutoff),
+        ):
+            by_key[(str(o["sha256"]), int(o["size"]))].append(o)
+    out: list[dict[str, object]] = []
+    for n in news:
+        olds = [o for o in by_key.get((str(n["sha256"]), int(n["size"])), []) if str(o["last_seen"]) < str(n["first_seen"])]
+        if not olds:
+            continue
+        out.append({
+            "id": int(n["id"]), "path": str(n["relpath"]), "size": int(n["size"]), "first_seen": str(n["first_seen"]),
+            "candidates": [{"id": int(o["id"]), "path": str(o["relpath"]), "last_seen": str(o["last_seen"]), "gone_at": o["gone_at"]} for o in olds],
+        })
+        if len(out) >= limit:
+            break
+    return out
+
+
+def link_move(conn: sqlite3.Connection, root_id: int, new_id: int, old_id: int) -> tuple[str, str]:
+    """利用者が選んだ「消えたファイル → 新しいファイル」を、移動として結び付ける（F-ID-2）。
+
+    消えた側の行を新しいパスで生き返らせ、移動の履歴（source = "manual"）に残す。
+    どちらの行も条件（新しい側は存在中、消えた側は消えたか保留中、内容ハッシュと大きさが同じ）を満たさなければ ValueError。
+
+    Returns:
+        （旧パス, 新パス）。タグの追従に使う。
+    """
+    n = conn.execute(
+        f"SELECT {_NEW_COLS}, gone_at FROM entries WHERE id = ? AND root_id = ? AND is_dir = 0", (new_id, root_id)
+    ).fetchone()
+    o = conn.execute(
+        f"SELECT {_OLD_COLS}, missing_count, gone_by FROM entries WHERE id = ? AND root_id = ? AND is_dir = 0", (old_id, root_id)
+    ).fetchone()
+    if n is None or o is None:
+        raise ValueError("カタログに見つかりません")
+    if n["gone_at"] is not None:
+        raise ValueError(f"新しい側のファイルが今はありません: {n['relpath']}")
+    if not (o["gone_at"] is not None or int(o["missing_count"]) > 0) or o["gone_by"] == "plan":
+        raise ValueError(f"消えたファイルではありません（またはツールが隔離したもの）: {o['relpath']}")
+    if (n["sha256"], n["size"]) != (o["sha256"], o["size"]) or not n["sha256"]:
+        raise ValueError("内容が同じではありません")
+    old_rel, new_rel = str(o["relpath"]), str(n["relpath"])
+    with conn:
+        _merge_rows(conn, n, o)
+        if old_rel != new_rel:
+            record_move(conn, root_id, int(o["id"]), old_rel, new_rel, False, "manual")
+    log.info("移動として結び付けました: %s → %s", old_rel, new_rel)
+    return old_rel, new_rel
+
+
 def relink_by_hash(
     conn: sqlite3.Connection,
     root_id: int,
@@ -568,18 +685,7 @@ def relink_by_hash(
 
     with conn:
         for n, o in pairs:
-            # 新しく足された行を消し、消えた側の行を新しいパスで生き返らせる（同じ行が同じアイテムを指し続ける）
-            conn.execute("DELETE FROM entries WHERE id = ?", (n["id"],))
-            conn.execute(
-                "UPDATE entries SET relpath = ?, size = ?, mtime_ns = ?, inode = ?, hashed_size = ?,"
-                " hashed_mtime_ns = ?, last_seen = ?, missing_count = 0, gone_at = NULL, gone_by = NULL WHERE id = ?",
-                (
-                    n["relpath"], n["size"], n["mtime_ns"], n["inode"], n["hashed_size"],
-                    n["hashed_mtime_ns"], n["last_seen"], o["id"],
-                ),
-            )
-            # 新しい行を指していた移動の記録（現れた後に inode で追った改名など）は、生き返らせた行に付け替える
-            conn.execute("UPDATE moves SET entry_id = ? WHERE entry_id = ?", (o["id"], n["id"]))
+            _merge_rows(conn, n, o)
             res.files += 1
             old_rel, new_rel = str(o["relpath"]), str(n["relpath"])
             if old_rel != new_rel and not covered(old_rel, new_rel):

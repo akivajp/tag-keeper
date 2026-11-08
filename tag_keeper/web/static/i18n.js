@@ -194,6 +194,16 @@ const I18N_EN = {
   '（継承: {value}）': '(inherited: {value})', 'このフォルダの属性（配下に継承）': 'Attributes of this folder (inherited inside)',
   '属性はまだ定義されていません。「検索」の画面で定義できます。': 'No attributes are defined yet. Define them on the Search page.',
   '定義されていない属性です': 'Undefined attribute',
+  // --- 移動の確認・関係（0.13） ---
+  '移動の確認': 'Moves to confirm', '確認待ち（{n} 件）': 'Waiting ({n})', '移動の確認: {root}': 'Confirm moves: {root}',
+  '新しく現れたファイルと同じ内容のものが、少し前に複数の場所から消えています。どれが動いてきたものかを選ぶと、そのタグ・属性・関係・版の履歴が引き継がれます。どれでもなければ「新しいファイル」を選んでください。':
+    'Files with the same content as a new file disappeared from several places shortly before. Pick the one it was moved from, and its tags, attributes, relations and version history carry over. If it is none of them, choose “New file”.',
+  '{size}・{when} に現れた': '{size}, appeared {when}', '移動元の候補': 'Moved from', '最後に見えた': 'Last seen', 'これが移動元': 'Moved from here',
+  '新しいファイル（どれでもない）': 'New file (none of these)', '確認待ちのものはありません。': 'Nothing to confirm.',
+  '結び付けました: {path}': 'Linked: {path}', '新しいファイルとして扱います: {path}': 'Treated as a new file: {path}', 'ルートの一覧に戻る': 'Back to the roots',
+  '関係': 'Relations', '関係はまだありません。': 'No relations yet.', '関係を足す': 'Add relation', '関係を外す': 'Remove relation',
+  '（このファイルへ）': ' (to this file)', '相手のファイル（名前の一部で候補が出ます）': 'Other file (type part of a name for suggestions)',
+  '前の版': 'previous version', '派生元': 'derived from', '添付先': 'attached to', '関連': 'related',
   // --- 検索（名前・本文・種類・タグ） ---
   '検索': 'Search', '名前やフォルダで探す': 'Search names and folders', '本文に含む語': 'Words in the text', 'PDF・Office・テキストの本文から探します（文字の無いスキャンは OCR で読んだもの）': 'Searches the text of PDF, Office and text files (scans without text are read by OCR)',
   '種類': 'Kind', 'すべての種類': 'All kinds', '書類（PDF・Office・テキスト）': 'Documents (PDF, Office, text)', 'Office 文書': 'Office documents',
