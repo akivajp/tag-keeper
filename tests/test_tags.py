@@ -6,8 +6,8 @@ import json
 from pathlib import Path
 
 import pytest
-
 from conftest import write
+
 from tag_keeper.tags import TagError, TagStore, normalize_tag
 
 
@@ -273,7 +273,6 @@ def test_nfc_and_nfd_paths_refer_to_the_same_item(tmp_path: Path) -> None:
 
 
 def test_relations_follow_moves_and_export_round_trip(tmp_path: Path) -> None:
-    from tag_keeper.tags import search
 
     store = TagStore(tmp_path / "tags", host="a")
     store.add("r", ["case/v2.docx"], "種別:見積")
