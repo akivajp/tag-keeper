@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.21.1] - 2026-11-08
+
+### Added
+
+- Scroll sideways over a video preview (tilt wheel, touchpad, or Shift + wheel) to seek:
+  about 5 seconds per wheel notch. Vertical scrolling still scrolls the page.
+
 ## [0.21.0] - 2026-11-08
 
 ### Added
@@ -409,7 +416,8 @@ First release. The web UI and messages are in Japanese.
 - **Decision log.** Accepted suggestions, tag accept and reject, and undone plans are
   appended per machine; the closest past decisions are given to the model as examples.
 
-[Unreleased]: https://github.com/akivajp/tag-keeper/compare/v0.21.0...HEAD
+[Unreleased]: https://github.com/akivajp/tag-keeper/compare/v0.21.1...HEAD
+[0.21.1]: https://github.com/akivajp/tag-keeper/compare/v0.21.0...v0.21.1
 [0.21.0]: https://github.com/akivajp/tag-keeper/compare/v0.20.0...v0.21.0
 [0.20.0]: https://github.com/akivajp/tag-keeper/compare/v0.19.0...v0.20.0
 [0.19.0]: https://github.com/akivajp/tag-keeper/compare/v0.18.0...v0.19.0
