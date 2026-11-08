@@ -711,9 +711,10 @@ def test_relink_confirmation_and_relations(env: dict, monkeypatch: pytest.Monkey
     write(root / "p" / "c.txt", "twin")
     write(root / "q" / "c.txt", "twin")
     run_job(env, "/api/roots/data/refresh")
+    # 先に新しいファイルを作ってから消す（ext4 は消した inode をすぐ使い回し、inode での移動に見えてしまうため）
+    write(root / "r" / "c.txt", "twin")
     (root / "p" / "c.txt").unlink()
     (root / "q" / "c.txt").unlink()
-    write(root / "r" / "c.txt", "twin")
     run_job(env, "/api/roots/data/refresh")
     items = app.get("/api/relink/data").json["items"]
     assert len(items) == 1
