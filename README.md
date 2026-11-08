@@ -253,6 +253,20 @@ and the theme (system, light or dark).
   an old version next to the current file under a dated name (never overwriting).
   tag-keeper records renames and moves it sees, so a file's history continues across them.
 
+### Reading documents and images (Review page)
+
+A model can read a document's extracted text and pull out its kind, date, party, amount, due
+date, the action it asks for, a few category labels and a summary; images are described
+(document, photo, screenshot…) by a vision model, and the description goes into the full-text
+index, so photos can be found by what they show. The results are proposals: the **Review**
+page lists them, you untick what you do not want and accept (tags and attributes are added
+with source `ai`) or reject, one by one or in bulk. Start reading from the Review page or
+from a file's details; with `[ai] auto = true` new items are read in the background.
+
+Set `allow_cloud = false` on a root whose content must not leave the machine (work files):
+cloud models (`…:cloud`) are then replaced by `[organize] local_model` for that root, for
+inbox suggestions, directory-card drafts and reading alike.
+
 ### Inbox suggestions
 
 Folders whose name matches `inbox_patterns` (by default `tmp`, `temp`, `*未整理*`,
@@ -363,6 +377,7 @@ sync_client = "onedrive"             # "" (default) = no coordination / "cloud-s
 sync_service = "onedrive.service"    # the systemd --user unit running `onedrive --monitor`
 sync_guard = "auto"                  # "auto": only for big deletions / "always": every run
 replicas = { "OneDrive" = "onedrive" }  # folders inside that copy another root: not scanned
+allow_cloud = true                   # false: never send this root's content to cloud models
 ```
 
 Tags and inbox suggestions:
@@ -377,10 +392,16 @@ ollama_url = "http://127.0.0.1:11434"
 model = "gemma3:12b"                     # e.g. "gemma4:31b-cloud" (content is sent to ollama's cloud)
 vision_model = ""                        # model for images when `model` cannot read them
 model_choices = ["gemma4:31b-cloud"]     # extra models offered on the page
+local_model = "gemma3:12b"               # used instead of a cloud model for roots with allow_cloud = false
 think = ""                               # "true" / "false" for thinking models; "" = model default
 use_images = true
 max_chars = 4000                         # text passed to the model
 candidates = 15                          # destination folders the model chooses from
+
+[ai]
+auto = false                             # read new documents and images in the background
+images = true                            # also describe images (needs a vision model)
+batch = 10                               # items per background round
 ```
 
 With roots configured, `tag-keeper scan` (no arguments) scans all of them.

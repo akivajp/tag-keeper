@@ -16,7 +16,7 @@ from pathlib import Path
 
 log = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS roots (
@@ -89,6 +89,17 @@ CREATE TABLE IF NOT EXISTS extracts (
     created_at TEXT NOT NULL
 );
 
+-- 書類の構造化抽出と画像の内容推定の結果（版 4 から。F-AI-1〜3・F-EX-3）。内容ハッシュごとに最新の1件。
+-- 承認・却下の判断はタグのログ（review）に残すので、ここは作り直せる派生物
+CREATE TABLE IF NOT EXISTS analyses (
+    sha256     TEXT PRIMARY KEY,
+    kind       TEXT NOT NULL,       -- document / image
+    model      TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    data       TEXT NOT NULL,       -- JSON（読み取った項目）
+    error      TEXT NOT NULL DEFAULT ''
+);
+
 -- 整理の提案（版 2 から）。内容ハッシュ・モデル・指示文の版ごとに保存し、同じ条件では作り直さない
 CREATE TABLE IF NOT EXISTS suggestions (
     sha256         TEXT NOT NULL,
@@ -145,6 +156,7 @@ def _migrate(conn: sqlite3.Connection, version: int) -> None:
 
     - 版 1 → 2: 表を足すだけ（SCHEMA の CREATE ... IF NOT EXISTS で足りる）
     - 版 2 → 3: entries に gone_by を足し、extracts を id 付きで作り直す（版 2 までは書き込む処理が無く、ふつうは空）
+    - 版 3 → 4: analyses を足すだけ
     """
     if version in (1, 2):
         cols = {r[1] for r in conn.execute("PRAGMA table_info(entries)")}
@@ -226,7 +238,7 @@ def connect(db_path: Path) -> sqlite3.Connection:
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
     version = conn.execute("PRAGMA user_version").fetchone()[0]
-    if version not in (0, 1, 2, SCHEMA_VERSION):
+    if version not in (0, 1, 2, 3, SCHEMA_VERSION):
         conn.close()
         raise CatalogVersionError(
             f"カタログの版 {version} はこのプログラム（版 {SCHEMA_VERSION}）では扱えません: {db_path}"

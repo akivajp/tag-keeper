@@ -282,6 +282,11 @@ async function pageBrowse(main, root, path, params) {
         })),
       }, t('このファイルの整理の提案を出す（{model}）', { model: models.current() || t('既定のモデル') })));
       parts.push(h('h3', {}, '整理の提案'), sugHolder);
+      // 書類・画像の読み取り（結果は「確認」の画面に出る）
+      parts.push(h('div', { class: 'buttons' }, h('button', { class: 'small', onclick: async () => {
+        const job = await startJob(`/api/analyze/${enc(root)}`, { paths: [rel] });
+        if (job) toast(t('読み取りを始めました。結果は「確認」の画面に出ます'));
+      } }, t('この書類・画像を読み取る（種類・日付・相手・金額など）'))));
     }
     parts.push(h('h3', {}, '版の履歴'), await historyBlock(rel));
     setChildren(detail, parts);

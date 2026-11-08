@@ -241,6 +241,20 @@ const I18N_EN = {
   '「前の版」の関係を張った旧版のうち、後継版が今もあるもの。': 'Items marked as the previous version of something that still exists.',
   '大きくて長く更新していないファイル。消すのではなく、保管先（ローカルや別のクラウド）の見直しの候補です。': 'Large files not changed for a long time: candidates for moving to other storage, not for deleting.',
   '残す理由を書いてください': 'Enter a reason for keeping it',
+  // --- 確認（AI の読み取り。0.16） ---
+  '確認': 'Review', '確認: {root}': 'Review: {root}', '選んでください': 'Select something first',
+  '{n} 件を承認しました（タグ {tags}・属性 {attrs}）': 'Accepted {n} (tags {tags}, attributes {attrs})', '{n} 件を却下しました': 'Rejected {n}',
+  '相手': 'Party', '金額': 'Amount', '期限': 'Due', '必要な対応': 'Action needed', '要約': 'Summary', '画像の種類': 'Image kind',
+  '{model} が読み取り（{when}）': 'read by {model} ({when})', '承認（選んだものを付ける）': 'Accept (add what is ticked)', '却下': 'Reject',
+  'モデルが書類・画像から読み取った内容です。付けたいタグと属性を残して承認すると、出所「ai」として付きます。却下したものは、もう出しません。':
+    'What the model read from documents and images. Accept to add the ticked tags and attributes (source “ai”); rejected items are not shown again.',
+  'このルートは内容を外部へ送らない設定なので、手元のモデルで読み取ります。': 'This root does not send content outside, so a local model is used.',
+  'まだ読み取っていないものを読み取る（新しい順に 20 件。残り {n} 件）': 'Read unread items (20 newest; {n} left)',
+  '選んだものを承認': 'Accept selected', '選んだものを却下': 'Reject selected',
+  '新しい書類・画像は、裏で自動で読み取ります（[ai] auto）。': 'New documents and images are read automatically in the background ([ai] auto).',
+  '自動では読み取りません（設定の [ai] auto = true で、裏で読み取ります）。': 'Nothing is read automatically (set [ai] auto = true to read in the background).',
+  '読み取りを始めました。結果は「確認」の画面に出ます': 'Reading started. The result appears on the Review page',
+  'この書類・画像を読み取る（種類・日付・相手・金額など）': 'Read this document or image (kind, date, party, amount…)',
   // --- 検索（名前・本文・種類・タグ） ---
   '検索': 'Search', '名前やフォルダで探す': 'Search names and folders', '本文に含む語': 'Words in the text', 'PDF・Office・テキストの本文から探します（文字の無いスキャンは OCR で読んだもの）': 'Searches the text of PDF, Office and text files (scans without text are read by OCR)',
   '種類': 'Kind', 'すべての種類': 'All kinds', '書類（PDF・Office・テキスト）': 'Documents (PDF, Office, text)', 'Office 文書': 'Office documents',
@@ -332,14 +346,14 @@ const I18N_EN = {
   '実行後のスナップショット': 'Snapshot after', '常駐の同期を一時停止': 'Pausing the resident sync', '実行（隔離・移動）': 'Applying (quarantine / move)',
   '削除をクラウドに反映': 'Reflecting deletions in the cloud', '隔離を空にする': 'Emptying the quarantine', '常駐の同期を再開': 'Restarting the resident sync', '元に戻す ': 'Undo',
   'レポートの作成': 'Building the report', '対象の状態の記録': 'Recording the current state', '変わっていないかの確認': 'Checking for changes',
-  '対象の確認': 'Finding the files', '内容の読み取りと提案': 'Reading and suggesting',
+  '対象の確認': 'Finding the files', '内容の読み取りと提案': 'Reading and suggesting', '書類・画像の読み取り': 'Reading documents and images',
 };
 
 // サーバーから来る、変数を含む文（正規表現 → 英語）
 const I18N_PATTERNS = [
-  [/^(走査|ハッシュ計算|最新にする（走査とハッシュ計算）|自動で最新にする|プランの作成|整理の提案|実行|取り消し|隔離を空にする|確認|削除の反映の再試行|常駐の同期の再開): (.+)$/, (m) => `${{
+  [/^(走査|ハッシュ計算|最新にする（走査とハッシュ計算）|自動で最新にする|プランの作成|整理の提案|実行|取り消し|隔離を空にする|書類の読み取り|確認|削除の反映の再試行|常駐の同期の再開): (.+)$/, (m) => `${{
     '走査': 'Scan', 'ハッシュ計算': 'Hash', '最新にする（走査とハッシュ計算）': 'Refresh (scan and hash)', '自動で最新にする': 'Auto refresh',
-    'プランの作成': 'Create plan', '隔離を空にする': 'Empty quarantine',
+    'プランの作成': 'Create plan', '隔離を空にする': 'Empty quarantine', '書類の読み取り': 'Read documents',
     '整理の提案': 'Inbox suggestions', '実行': 'Apply', '取り消し': 'Undo', '確認': 'Check', '削除の反映の再試行': 'Retry reflecting deletions',
     '常駐の同期の再開': 'Restart resident sync',
   }[m[1]]}: ${m[2]}`],

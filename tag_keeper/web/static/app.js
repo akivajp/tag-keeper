@@ -449,6 +449,71 @@ async function pageRelink(main, root) {
     h('p', {}, h('a', { href: '#/' }, t('ルートの一覧に戻る'))));
 }
 
+// ---------- 画面: 確認（AI の読み取りの結果の承認・却下。F-AI-2） ----------
+
+async function pageReview(main, rootArg) {
+  const root = rootArg || (await refreshState()).roots[0]?.name;
+  if (!root) { setChildren(main, h('p', { class: 'muted' }, 'ルートがありません。')); return; }
+  const data = await api(`/api/review/${enc(root)}`);
+  // 項目ごとに、付けるかどうかのチェック（既定はすべて付ける）
+  const picks = new Map(data.items.map((it) => [it.path, {
+    tags: new Set(it.proposal.tags), attrs: new Set(Object.keys(it.proposal.attrs)), selected: false,
+  }]));
+  const decide = async (items, decision) => {
+    if (!items.length) { toast(t('選んでください'), 'warn'); return; }
+    try {
+      const r = await api(`/api/review/${enc(root)}`, {
+        items: items.map((it) => {
+          const p = picks.get(it.path);
+          return {
+            path: it.path, sha256: it.analysis.sha256, decision,
+            tags: [...p.tags], attrs: Object.fromEntries(Object.entries(it.proposal.attrs).filter(([k]) => p.attrs.has(k))),
+          };
+        }),
+      });
+      toast(decision === 'accept' ? t('{n} 件を承認しました（タグ {tags}・属性 {attrs}）', { n: r.accept, tags: r.tags, attrs: r.attrs }) : t('{n} 件を却下しました', { n: r.reject }));
+      app.render();
+    } catch (e) { toast(e.message, 'danger'); }
+  };
+  const fieldLabels = { doc_type: '種類', date: '日付', party: '相手', amount: '金額', due: '期限', action: '必要な対応', summary: '要約', kind: '画像の種類', description: '説明' };
+  const cards = data.items.map((it) => {
+    const p = picks.get(it.path);
+    const d = it.analysis.data;
+    const dir = it.path.split('/').slice(0, -1).join('/');
+    const name = it.path.split('/').pop();
+    const sel = h('input', { type: 'checkbox', onchange: (e) => { p.selected = e.target.checked; } });
+    const facts = Object.entries(fieldLabels).filter(([k]) => d[k] !== null && d[k] !== undefined && d[k] !== '')
+      .map(([k, label]) => h('div', { class: 'small' }, h('span', { class: 'muted' }, t(label) + ': '), String(d[k])));
+    const check = (set, key, text) => h('label', { class: 'chip-check' },
+      h('input', { type: 'checkbox', checked: set.has(key), onchange: (e) => { if (e.target.checked) set.add(key); else set.delete(key); } }), ' ', text);
+    return h('section', { class: 'card review-card' },
+      h('div', { class: 'toolbar' }, sel,
+        h('a', { class: 'path', href: browseHref(root, dir, '', name) }, `${fileIcon(name)} ${it.path}`),
+        h('span', { class: 'muted small' }, t('{model} が読み取り（{when}）', { model: it.analysis.model, when: when(it.analysis.created_at) }))),
+      h('div', { class: 'review-facts' }, facts),
+      h('div', { class: 'chips' },
+        it.proposal.tags.map((tg) => check(p.tags, tg, tg)),
+        Object.entries(it.proposal.attrs).map(([k, v]) => check(p.attrs, k, attrText(k, v)))),
+      h('div', { class: 'buttons' },
+        h('button', { class: 'small primary', onclick: () => decide([it], 'accept') }, '承認（選んだものを付ける）'),
+        h('button', { class: 'small', onclick: () => decide([it], 'reject') }, '却下')));
+  });
+  const selected = () => data.items.filter((it) => picks.get(it.path).selected);
+  const busy = jobRunning();
+  setChildren(main,
+    h('h1', {}, t('確認: {root}', { root })),
+    h('p', { class: 'muted' }, 'モデルが書類・画像から読み取った内容です。付けたいタグと属性を残して承認すると、出所「ai」として付きます。却下したものは、もう出しません。'),
+    !data.allow_cloud ? h('div', { class: 'alert info' }, 'このルートは内容を外部へ送らない設定なので、手元のモデルで読み取ります。') : null,
+    h('div', { class: 'toolbar' },
+      h('button', { class: 'primary', disabled: busy || !data.unread, onclick: () => startJob(`/api/analyze/${enc(root)}`, { limit: 20 }) },
+        t('まだ読み取っていないものを読み取る（新しい順に 20 件。残り {n} 件）', { n: num(data.unread) })),
+      data.items.length ? [
+        h('button', { onclick: () => decide(selected(), 'accept') }, '選んだものを承認'),
+        h('button', { onclick: () => decide(selected(), 'reject') }, '選んだものを却下')] : null),
+    h('p', { class: 'muted small' }, data.auto ? '新しい書類・画像は、裏で自動で読み取ります（[ai] auto）。' : '自動では読み取りません（設定の [ai] auto = true で、裏で読み取ります）。'),
+    cards.length ? cards : h('p', { class: 'muted' }, '確認待ちのものはありません。'));
+}
+
 function stat(label, value) {
   return h('div', { class: 'stat' }, h('div', { class: 'label' }, label), h('div', { class: 'value' }, value));
 }
@@ -801,7 +866,7 @@ async function route() {
   const parts = hashPath.split('/').filter(Boolean).map(decodeURIComponent);
   const params = new URLSearchParams(hashQuery || '');
   // #/tags は前の版の URL（ブックマーク）のため。検索の画面を開く
-  const navOf = { report: 'roots', relink: 'roots', browse: 'browse', organize: 'organize', search: 'search', tags: 'search', plans: 'plans' };
+  const navOf = { report: 'roots', relink: 'roots', browse: 'browse', organize: 'organize', search: 'search', tags: 'search', review: 'review', plans: 'plans' };
   document.querySelectorAll('[data-nav]').forEach((a) => a.classList.toggle('active', (navOf[parts[0]] || 'roots') === a.dataset.nav));
   let render;
   if (parts[0] === 'browse') render = () => pageBrowse(main, parts[1], parts.slice(2).join('/'), params);
@@ -809,6 +874,7 @@ async function route() {
   else if (parts[0] === 'search' || parts[0] === 'tags') render = () => pageTags(main, params);
   else if (parts[0] === 'report' && parts[1]) render = () => pageReport(main, parts[1]);
   else if (parts[0] === 'relink' && parts[1]) render = () => pageRelink(main, parts[1]);
+  else if (parts[0] === 'review') render = () => pageReview(main, parts[1]);
   else if (parts[0] === 'plans' && parts[1]) render = () => pagePlan(main, parts[1]);
   else if (parts[0] === 'plans') render = () => pagePlans(main);
   else render = () => pageRoots(main);

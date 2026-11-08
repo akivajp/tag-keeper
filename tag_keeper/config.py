@@ -10,6 +10,7 @@
     sync_service = "onedrive.service"  # 常駐の同期の systemd --user ユニット（cloud-sync なら "cloud-sync-onedrive.service" か項目名）
     sync_guard = "auto"              # auto: 大量削除になるときだけ連携する / always: 実行のたびに連携する
     replicas = { "OneDrive" = "onedrive" }  # 中のフォルダが別のルートの複製なら登録する（走査・重複検出・プランから外す）
+    allow_cloud = true               # false: 内容を外部（クラウドのモデル）へ送らず、手元のモデル（[organize] local_model）を使う
 
     [hygiene]
     allow = ["archive/**"]           # 報告しないパス（「残す」と判断したもの）
@@ -102,6 +103,9 @@ class RootConfig:
     sync_guard: str = "auto"
     # 複製（バックアップ）として登録した中のフォルダ（ルートからの相対パス → 元のルート名）。走査・重複検出・プランから外す（F-SC-6）
     replicas: dict[str, str] = field(default_factory=dict)
+    # このルートのファイルの内容を、外部（ollama のクラウドのモデル）へ送ってよいか（F-EX-4・N-2）。
+    # false なら、クラウドのモデルを選んでいても手元のモデル（[organize] local_model）に切り替える。業務のルートは false にする
+    allow_cloud: bool = True
 
 
 @dataclass
@@ -188,6 +192,18 @@ class ExtractConfig:
 
 
 @dataclass
+class AiConfig:
+    """書類の構造化抽出と画像の内容推定（要件 F-AI-1〜3・F-EX-3）の設定。モデルは [organize] のものを使う。"""
+
+    # Web の画面（serve）を動かしている間、新しい書類・画像を裏で読み取るか（モデルの問い合わせを伴うので既定は止める）
+    auto: bool = False
+    # 画像の内容を推定するか（画像を読めるモデルが要る）
+    images: bool = True
+    # 一度に読み取る件数（裏の処理の1回分）
+    batch: int = 10
+
+
+@dataclass
 class OrganizeConfig:
     """受け皿のフォルダの整理の提案（名前と移動先）の設定。"""
 
@@ -210,6 +226,8 @@ class OrganizeConfig:
     candidates: int = 15
     # 思考（thinking）に対応したモデルで考えさせるか。"true" / "false"、空ならモデルに任せる
     think: str = ""
+    # 外部へ送らないルート（allow_cloud = false）で、クラウドのモデルの代わりに使う手元のモデル
+    local_model: str = "gemma3:12b"
     # 生成の温度（低いほど毎回同じ提案になる）
     temperature: float = 0.2
     # 1件の問い合わせの待ち時間の上限（秒）
@@ -228,6 +246,7 @@ class Config:
     tags: TagsConfig = field(default_factory=TagsConfig)
     extract: ExtractConfig = field(default_factory=ExtractConfig)
     organize: OrganizeConfig = field(default_factory=OrganizeConfig)
+    ai: AiConfig = field(default_factory=AiConfig)
 
     def find_root(self, name: str) -> RootConfig | None:
         """名前でルートを探す。見つからなければ None を返す。"""
@@ -287,6 +306,7 @@ def load_config(path: Path | None = None) -> Config:
                 sync_service=str(item.get("sync_service", "onedrive.service")),
                 sync_guard=sync_guard,
                 replicas=_replicas(path, i, item.get("replicas", {})),
+                allow_cloud=bool(item.get("allow_cloud", True)),
             )
         )
     names = [r.name for r in roots]
@@ -365,6 +385,7 @@ def load_config(path: Path | None = None) -> Config:
         ("ollama_url", str),
         ("model", str),
         ("vision_model", str),
+        ("local_model", str),
         ("think", str),
         ("use_images", bool),
         ("max_chars", int),
@@ -375,6 +396,11 @@ def load_config(path: Path | None = None) -> Config:
         if key in og:
             setattr(organize, key, conv(og[key]))
 
+    ai_raw = data.get("ai", {})
+    ai = AiConfig()
+    for key, conv in (("auto", bool), ("images", bool), ("batch", int)):
+        if key in ai_raw:
+            setattr(ai, key, conv(ai_raw[key]))
     return Config(
-        roots=roots, hygiene=hygiene, safety=safety, scan=scan, plan=plan, tags=tags, extract=extract, organize=organize
+        roots=roots, hygiene=hygiene, safety=safety, scan=scan, plan=plan, tags=tags, extract=extract, organize=organize, ai=ai
     )

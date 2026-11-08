@@ -9,7 +9,6 @@
 
 from __future__ import annotations
 
-import dataclasses
 import logging
 import threading
 import time
@@ -187,7 +186,10 @@ class SuggestQueue:
         item = organize.catalog_item(conn, root_id, req.path)
         if item is None:
             return organize.Suggestion(req.path, "", req.model, error="カタログにありません（新しいファイルなら、走査してから選んでください）")
-        oc = dataclasses.replace(config.organize, model=req.model)
+        # 外部へ送らないルートでは、クラウドのモデルを手元のモデルに切り替える（F-EX-4）
+        oc, note = organize.config_for_root(config.organize, rc.allow_cloud, req.model)
+        if note:
+            log.info("%s", note)
         if req.model not in self._checked:
             organize.check_ollama(oc)
             self._checked.add(req.model)

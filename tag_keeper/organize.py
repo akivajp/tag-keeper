@@ -372,6 +372,29 @@ def is_cloud_model(name: str) -> bool:
     return name.endswith(":cloud") or name.endswith("-cloud") or ":cloud" in name
 
 
+def model_for_root(config: OrganizeConfig, allow_cloud: bool, requested: str | None = None) -> tuple[str, str]:
+    """ルートに使うモデルを決める（F-EX-4）。外部へ送らないルートでクラウドのモデルを頼まれたら、手元のモデルにする。
+
+    Returns:
+        （使うモデル, 切り替えたときの説明。切り替えていなければ空）
+    """
+    model = requested or config.model
+    if not allow_cloud and is_cloud_model(model):
+        return config.local_model, f"このルートは内容を外部へ送らない設定なので、{model} の代わりに {config.local_model} を使います"
+    return model, ""
+
+
+def config_for_root(config: OrganizeConfig, allow_cloud: bool, requested: str | None = None) -> tuple[OrganizeConfig, str]:
+    """ルートに使う設定（モデルと画像のモデル）を決める。外部へ送らないルートでは、クラウドのモデルを使わない。"""
+    import dataclasses
+
+    model, note = model_for_root(config, allow_cloud, requested)
+    vision = config.vision_model
+    if not allow_cloud and vision and is_cloud_model(vision):
+        vision = ""
+    return dataclasses.replace(config, model=model, vision_model=vision), note
+
+
 def check_ollama(config: OrganizeConfig) -> None:
     """ollama が動いていて、設定のモデル（と画像用のモデル）があるかを確かめる。無ければ OllamaError。"""
     model_capabilities(config)

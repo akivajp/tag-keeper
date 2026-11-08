@@ -40,6 +40,10 @@
     {"op": "unrelate",    "root": "onedrive", "from": "a/v2.docx", "to": "a/v1.docx", "kind": "前の版"}
     {"op": "relink-skip", "root": "onedrive", "path": "new/x.pdf", "sha256": "..."}
 
+AI の読み取りの結果に対する判断（F-AI-2。承認したタグと属性は、別に add・attr-set の行で付く）:
+
+    {"op": "review", "root": "onedrive", "path": "a/b.pdf", "sha256": "...", "decision": "accept"}   # accept / reject
+
 整理の候補で「残す」と判断したもの（F-OR-2。以後は報告しない）:
 
     {"op": "keep",   "root": "onedrive", "path": "archive/old.iso", "reason": "検証用に残す"}
@@ -291,6 +295,8 @@ class TagStore:
         self.dir_cards: dict[tuple[str, str], dict[str, str]] = {}
         # 「残す」と判断したもの（(ルート名, 相対パス) → 理由）
         self.kept: dict[tuple[str, str], str] = {}
+        # AI の読み取りの結果に対する判断（(ルート名, 相対パス, 内容ハッシュ) → accept / reject）
+        self.reviews: dict[tuple[str, str, str], str] = {}
         self._stamp: tuple[tuple[str, int, int], ...] = ()
 
     @property
@@ -326,7 +332,7 @@ class TagStore:
             self.aliases, self.parents = {}, {}
             self.attr_defs, self.attrs, self.searches = {}, {}, {}
             self.relations, self.relink_skips = {}, set()
-            self.dir_types, self.dir_cards, self.kept = {}, {}, {}
+            self.dir_types, self.dir_cards, self.kept, self.reviews = {}, {}, {}, {}
             for ev in events:
                 self._apply(ev)
             self._stamp = stamp
@@ -448,6 +454,8 @@ class TagStore:
             self.relations.get(root, set()).discard((_nk(str(ev["from"])), _nk(str(ev["to"])), str(ev.get("kind") or "関連")))
         elif op == "relink-skip":
             self.relink_skips.add((root, _nk(str(ev["path"])), str(ev.get("sha256", ""))))
+        elif op == "review":
+            self.reviews[(root, _nk(str(ev["path"])), str(ev.get("sha256", "")))] = str(ev.get("decision", ""))
         elif op == "keep":
             self.kept[(root, _nk(str(ev["path"])))] = str(ev.get("reason") or "")
         elif op == "unkeep":
@@ -1004,6 +1012,22 @@ class TagStore:
             if card:
                 n += self.set_dir_card(root, p, str(card.get("description", "")), str(card.get("naming", "")))
         return n
+
+    # --- AI の読み取りの結果に対する判断（F-AI-2） ---
+
+    def record_review(self, root: str, path: str, sha256: str, decision: str) -> None:
+        """読み取りの結果を承認した（accept）・却下した（reject）ことを記録する（確認の一覧に二度と出さない）。"""
+        if decision not in ("accept", "reject"):
+            raise TagError(f"判断は accept か reject です: {decision}")
+        with self.lock:
+            self.reload_if_changed()
+            self._append([{"at": utcnow(), "host": self.host, "op": "review", "root": root, "path": _nk(path), "sha256": sha256, "decision": decision}])
+
+    def reviewed(self, root: str) -> set[tuple[str, str]]:
+        """判断済みの（相対パス, 内容ハッシュ）。"""
+        with self.lock:
+            self.reload_if_changed()
+            return {(p, sha) for (r, p, sha) in self.reviews if r == root}
 
     # --- 整理の候補で「残す」と判断したもの（F-OR-2） ---
 

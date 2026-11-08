@@ -91,8 +91,8 @@ def refresh(conn: sqlite3.Connection, root_id: int, root: Path) -> None:
 # ---------- カタログの移行 ----------
 
 
-def test_catalog_v2_is_migrated_to_v3(tmp_path: Path) -> None:
-    """版 2 のカタログは、行を保ったまま版 3 になる（gone_by を足し、extracts を作り直して索引に入れる）。"""
+def test_catalog_v2_is_migrated(tmp_path: Path) -> None:
+    """版 2 のカタログは、行を保ったまま今の版になる（gone_by を足し、extracts を作り直して索引に入れ、analyses を足す）。"""
     db = tmp_path / "old.db"
     old = sqlite3.connect(db)
     old.executescript(
@@ -113,7 +113,8 @@ def test_catalog_v2_is_migrated_to_v3(tmp_path: Path) -> None:
     old.close()
 
     conn = connect(db)
-    assert conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION == 3
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION == 4
+    assert conn.execute("SELECT name FROM sqlite_master WHERE name = 'analyses'").fetchone() is not None
     assert "gone_by" in {r[1] for r in conn.execute("PRAGMA table_info(entries)")}
     assert conn.execute("SELECT relpath FROM entries").fetchone()[0] == "a.pdf"
     row = conn.execute("SELECT id, sha256, method, text, note FROM extracts").fetchone()

@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Reading documents and images** (Review page): a model pulls the kind, date, party,
+  amount, due date, required action, labels and a summary out of a document's text, and
+  describes images (the description is added to the full-text index). Results are proposals
+  to accept (tags and attributes with source `ai`) or reject, singly or in bulk; decisions are
+  kept in the tag logs. Start from the Review page or a file's details, or set `[ai] auto`.
+- **`allow_cloud = false`** on a root keeps its content off cloud models: `[organize]
+  local_model` is used instead for suggestions, card drafts and reading.
+
+### Changed
+
+- The catalog schema is now version 4 (an `analyses` table is added on first use).
+
 ## [0.15.0] - 2026-11-08
 
 ### Added

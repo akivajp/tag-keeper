@@ -19,7 +19,6 @@ API の一覧:
 
 from __future__ import annotations
 
-import dataclasses
 import json
 import logging
 import os
@@ -49,6 +48,7 @@ from tag_keeper.config import (
     default_config_path,
     load_config,
 )
+from tag_keeper.analyze import AnalyzeWorker
 from tag_keeper.decisions import DecisionLog
 from tag_keeper.fulltext import KINDS, ExtractWorker, find_entries, index_status, query_terms, snippets
 from tag_keeper.hashing import hash_root, sha256_file
@@ -135,8 +135,9 @@ class Settings:
         self.media = MediaConverter(data_dir / "media-cache")
         self._sha_cache: dict[tuple[str, int, int], str] = {}
         self._links: dict[tuple[str, str], OneDriveLinks | None] = {}
-        # 裏で本文を抽出するスレッド（serve が動かす。テストでは無し）。ルートを最新にしたら起こす
+        # 裏で本文を抽出するスレッド・書類を読み取るスレッド（serve が動かす。テストでは無し）。ルートを最新にしたら起こす
         self.extractor: ExtractWorker | None = None
+        self.analyzer: AnalyzeWorker | None = None
 
     def sha256_of(self, path: Path) -> str:
         """ファイルの内容ハッシュ（大きさと更新日時が同じあいだは、計算し直さない）。"""
@@ -888,6 +889,87 @@ def create_app(
         moved = store.follow_moves(rc.name, [(old_rel, new_rel)])
         return {"from": old_rel, "to": new_rel, "tag_moves": moved}
 
+    @app.post("/api/analyze/<root>")
+    def api_analyze(root: str) -> dict[str, Any]:
+        """書類・画像をモデルに読み取らせるジョブを始める（F-AI-1・F-AI-3・F-EX-3）。
+
+        paths を渡せばそれだけを（読み取り済みでも読み直す）、無ければまだ読み取っていないものを新しい順に limit 件まで。
+        結果は確認の画面に、未確認の提案として並ぶ。
+        """
+        from tag_keeper import analyze
+
+        data = body()
+        config = settings.config()
+        rc = root_config(config, root)
+        paths = [clean_relpath(str(p)) for p in data.get("paths") or []] or None
+        limit = max(1, min(int(data.get("limit") or 20), 500))
+
+        def run(rep: JobReporter) -> dict[str, Any]:
+            conn = open_db()
+            try:
+                root_id = root_id_of(conn, rc)
+                rep.phase("対象の確認")
+                counts = {"ok": 0, "error": 0}
+
+                def on_start(n: int) -> None:
+                    rep.phase("書類・画像の読み取り", total=n)
+
+                def on_item(t: Any, a: Any) -> None:
+                    counts["error" if a.error else "ok"] += 1
+                    rep.note(f"{'失敗' if a.error else '読み取り'}: {t.relpath.rsplit('/', 1)[-1]}" + (f"（{a.error}）" if a.error else ""))
+                    rep.advance()
+
+                analyze.run_pending(conn, root_id, rc, config, limit=None if paths else limit, paths=paths, force=bool(paths),
+                                    on_start=on_start, on_item=on_item)
+            finally:
+                conn.close()
+            return counts
+
+        return start("analyze", f"書類の読み取り: {rc.name}", run, target=rc.name)
+
+    @app.route("/api/review/<root>")
+    def api_review(root: str) -> dict[str, Any]:
+        """確認待ちの読み取りの結果と、付ける候補（タグ・属性）。"""
+        from tag_keeper import analyze
+
+        config = settings.config()
+        rc = root_config(config, root)
+        store = settings.tags(config)
+        conn = open_db()
+        try:
+            root_id = root_id_of(conn, rc)
+            items = analyze.review_items(conn, root_id, rc.name, store.reviewed(rc.name))
+            waiting = len(analyze.pending(conn, root_id, images=config.ai.images))
+        finally:
+            conn.close()
+        return {"root": rc.name, "items": items, "unread": waiting, "auto": config.ai.auto, "allow_cloud": rc.allow_cloud}
+
+    @app.post("/api/review/<root>")
+    def api_review_decide(root: str) -> dict[str, Any]:
+        """確認の判断をまとめて記録する。items: [{path, sha256, decision: accept|reject, tags, attrs}]。
+
+        承認したものは、渡されたタグと属性（画面で選んだもの）だけを付ける。
+        """
+        from tag_keeper import analyze
+
+        data = body()
+        config = settings.config()
+        rc = root_config(config, root)
+        store = settings.tags(config)
+        done = {"accept": 0, "reject": 0, "tags": 0, "attrs": 0}
+        for it in data.get("items") or []:
+            rel = clean_relpath(str(it.get("path", "")))
+            decision = str(it.get("decision", ""))
+            if decision == "accept":
+                if not resolve_within(rc.path, rel).exists():
+                    raise fail(404, f"ありません: {rel}")
+                n = analyze.apply_accept(store, rc.name, rel, [str(t) for t in it.get("tags") or []], dict(it.get("attrs") or {}))
+                done["tags"] += n["tags"]
+                done["attrs"] += n["attrs"]
+            store.record_review(rc.name, rel, str(it.get("sha256", "")), decision)
+            done[decision] = done.get(decision, 0) + 1
+        return done
+
     @app.post("/api/keep")
     def api_keep() -> dict[str, Any]:
         """整理の候補・構造の見直しを「残す」と記録する（理由つき。op=remove で外す）。F-OR-2。"""
@@ -951,9 +1033,10 @@ def create_app(
             f"ファイル名の例: {' / '.join(files) or '（なし）'}\n日付の付け方の多数派: {style}\n"
             'JSON で {"description": "...", "naming": "..."} の形で答えてください。'
         )
-        model = str(data.get("model", "") or config.organize.model)
+        oc, _note = organize.config_for_root(config.organize, rc.allow_cloud, str(data.get("model", "") or config.organize.model))
+        model = oc.model
         try:
-            answer = organize.ollama_generate(config.organize, prompt, model=model)
+            answer = organize.ollama_generate(oc, prompt, model=model)
         except OllamaError as e:
             return {"description": "", "naming": style if files else "", "model": "", "note": str(e)}
         return {
@@ -1103,7 +1186,7 @@ def create_app(
         rc = root_config(config, root)
         only = [clean_relpath(str(p)) for p in data["paths"]] if data.get("paths") else None
         force = bool(data.get("force", False))
-        oc = dataclasses.replace(config.organize, model=str(data.get("model") or config.organize.model))
+        oc, cloud_note = organize.config_for_root(config.organize, rc.allow_cloud, str(data.get("model") or config.organize.model))
 
         def run(rep: JobReporter) -> dict[str, Any]:
             conn = open_db()
@@ -1112,6 +1195,8 @@ def create_app(
                 rep.phase("対象の確認")
                 excluded = excluded_dirs(conn, root_id, rc, config)
                 rep.note(f"モデル: {oc.model} ／ 受け皿のパターン: {', '.join(oc.inbox_patterns)} ／ 画像: {'使う' if oc.use_images else '使わない'}")
+                if cloud_note:
+                    rep.note(cloud_note)
                 done = {"ok": 0, "cached": 0, "error": 0}
 
                 def on_start(n: int) -> None:
@@ -2062,6 +2147,9 @@ def serve(
     # 裏で本文を抽出し、全文検索の索引を作る（[extract] enabled。止めていても、設定を変えれば再起動なしで始まる）
     settings.extractor = ExtractWorker(settings.db_path, settings.config)
     settings.extractor.start()
+    # 新しい書類・画像を裏で読み取る（[ai] auto = true のときだけ動く。設定を変えれば再起動なしで始まる）
+    settings.analyzer = AnalyzeWorker(settings.db_path, settings.config)
+    settings.analyzer.start()
     try:
         server.serve_forever()
     except KeyboardInterrupt:
@@ -2069,5 +2157,6 @@ def serve(
     finally:
         stop.set()
         settings.extractor.stop()
+        settings.analyzer.stop()
         server.server_close()
     return 0
