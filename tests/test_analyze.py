@@ -148,6 +148,8 @@ def test_openai_compatible_endpoints(monkeypatch: pytest.MonkeyPatch) -> None:
             organize.model_capabilities(oc, "missing@strata")
         assert organize.ollama_generate(oc, "読んで") == {"doc_type": "請求書", "amount": 120}
         assert seen[0]["model"] == "qwen-local" and seen[0]["messages"][0]["content"] == "読んで"
+        # 手元の推論サーバーは考えさせない（Maya は reasoning_effort でしか切れないので、両方送る）
+        assert seen[0]["chat_template_kwargs"] == {"enable_thinking": False} and seen[0]["reasoning_effort"] == "none"
         assert not organize.sends_outside(oc, "qwen-local@strata")
         assert organize.sends_outside(oc, "big@far") and organize.sends_outside(oc, "gemma4:31b-cloud")
         local, note = organize.config_for_root(dataclasses_replace(oc, model="big@far"), False)
@@ -168,3 +170,75 @@ def test_local_models_do_not_think_by_default() -> None:
     assert organize.effective_think(oc, "qwen@") == "false"
     assert organize.effective_think(oc, "gemma4:31b-cloud") == ""  # クラウドのモデルはモデルに任せる
     assert organize.effective_think(dataclasses_replace(oc, think="true"), "gemma4:12b") == "true"
+
+
+def test_falls_back_to_local_model_when_main_model_is_unavailable(monkeypatch: pytest.MonkeyPatch) -> None:
+    """主のモデル（クラウド）が 429 を返したら手元のモデルで処理し、しばらくは主のモデルに問い合わせない。"""
+    import json
+    import threading
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+    monkeypatch.setattr(organize, "_unavailable_until", {})
+    asked: list[str] = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self) -> None:
+            req = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            if self.path == "/api/show":
+                body = json.dumps({"capabilities": ["completion", "vision"]}).encode()
+            else:  # /api/generate
+                asked.append(req["model"])
+                if req["model"].endswith("-cloud"):
+                    self.send_response(429)  # 利用上限
+                    self.end_headers()
+                    return
+                body = json.dumps({"response": json.dumps({"doc_type": "請求書"})}).encode()
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *a: object) -> None:
+            pass
+
+    server = HTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        oc = OrganizeConfig(model="big-cloud", vision_model="big-cloud", local_model="gemma4:12b", ollama_url=f"http://127.0.0.1:{server.server_port}")
+        with pytest.raises(organize.ModelUnavailable):
+            organize.ollama_generate(oc, "読んで")
+        answer, used, note = organize.with_fallback(oc, lambda c: organize.ollama_generate(c, "読んで"))
+        assert answer == {"doc_type": "請求書"} and used.model == "gemma4:12b" and note
+        # 外へ送る画像のモデルも外す（手元のモデルが画像を読む）
+        assert used.vision_model == "" and organize.image_model(used) == "gemma4:12b"
+        assert asked == ["big-cloud", "big-cloud", "gemma4:12b"]
+        # しばらくのあいだは、主のモデルに問い合わせずに手元のモデルを使う
+        asked.clear()
+        _answer, used, note = organize.with_fallback(oc, lambda c: organize.ollama_generate(c, "読んで"))
+        assert asked == ["gemma4:12b"] and used.model == "gemma4:12b" and note
+        assert organize.fallback_model(oc) == "gemma4:12b"
+        # fallback = false なら切り替えない
+        monkeypatch.setattr(organize, "_unavailable_until", {})
+        with pytest.raises(organize.ModelUnavailable):
+            organize.with_fallback(dataclasses_replace(oc, fallback=False), lambda c: organize.ollama_generate(c, "読んで"))
+    finally:
+        server.shutdown()
+
+
+def test_check_falls_back_when_endpoint_is_down(monkeypatch: pytest.MonkeyPatch) -> None:
+    """推論サーバー（Strata など）が止まっていれば、確かめる時点で手元のモデルに切り替える。"""
+    monkeypatch.setattr(organize, "_unavailable_until", {})
+    oc = OrganizeConfig(model="qwen@strata", endpoints={"strata": "http://127.0.0.1:9/v1"}, local_model="gemma4:12b")
+    checked: list[str] = []
+    real = organize.model_capabilities
+
+    def fake(config: OrganizeConfig, model: str | None = None) -> list[str]:
+        name = model or config.model
+        checked.append(name)
+        if name == "gemma4:12b":
+            return ["completion"]
+        return real(config, model)  # 止まっている送り先: 接続できない
+
+    monkeypatch.setattr(organize, "model_capabilities", fake)
+    organize.check_ollama(oc)
+    assert checked == ["qwen@strata", "gemma4:12b"]
+    assert organize.active_config(oc)[0].model == "gemma4:12b"

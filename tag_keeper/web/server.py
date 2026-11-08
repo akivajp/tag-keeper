@@ -1172,9 +1172,10 @@ def create_app(
             'JSON で {"description": "...", "naming": "..."} の形で答えてください。'
         )
         oc, _note = organize.config_for_root(config.organize, rc.allow_cloud, str(data.get("model", "") or config.organize.model))
-        model = oc.model
         try:
-            answer = organize.ollama_generate(oc, prompt, model=model)
+            # 主のモデルが応答しなければ、手元のモデルで下書きする（[organize] fallback）
+            answer, used, _fb_note = organize.with_fallback(oc, lambda c: organize.ollama_generate(c, prompt))
+            model = used.model
         except OllamaError as e:
             return {"description": "", "naming": style if files else "", "model": "", "note": str(e)}
         return {
@@ -1284,7 +1285,8 @@ def create_app(
             root_id = root_id_of(conn, rc)
             excluded = excluded_dirs(conn, root_id, rc, config)
             inbox, files = organize.find_inbox(conn, root_id, config.organize.inbox_patterns, excluded, inbox_hints(rc, config)["inbox_dirs"])
-            cached = organize.cached_suggestions(conn, files, model)
+            # 主のモデルの提案が無ければ、代わりに手元のモデルで作った提案を出す
+            cached = organize.cached_suggestions(conn, files, model, organize.fallback_model(config.organize))
             # 同じ内容のファイルが受け皿の外にあれば示す（その場合は移動より隔離が向く）
             dups: dict[str, list[str]] = {}
             shas = [f.sha256 for f in files if f.sha256]
@@ -1347,7 +1349,8 @@ def create_app(
                     if sug.error:
                         rep.note(f"失敗: {name}: {sug.error}")
                     elif not sug.cached:
-                        rep.note(f"{name} → {sug.new_name}")
+                        # 手元のモデルで代わりに作ったときは、そのモデルを添える
+                        rep.note(f"{name} → {sug.new_name}" + (f"（{sug.model}）" if sug.model != oc.model else ""))
                     rep.advance()
 
                 organize.run_suggestions(
@@ -1491,7 +1494,7 @@ def create_app(
         try:
             root_id = root_id_of(conn, rc)
             item = organize.catalog_item(conn, root_id, rel)
-            sug = organize.load_cached(conn, item.sha256, model) if item is not None and item.sha256 else None
+            sug = organize.load_cached(conn, item.sha256, model, organize.fallback_model(config.organize)) if item is not None and item.sha256 else None
             same: list[str] = []
             if item is not None and item.sha256 and item.size > 0:
                 same = [

@@ -273,6 +273,8 @@ class OrganizeConfig:
     local_think: str = "false"
     # 外部へ送らないルート（allow_cloud = false）で、クラウドのモデルの代わりに使う手元のモデル
     local_model: str = "gemma4:12b"
+    # 主のモデルが応答しないとき（クラウドの利用上限・推論サーバーが止まっている・時間切れ）、local_model で代わりに処理するか
+    fallback: bool = True
     # OpenAI 互換の API の送り先（名前 → ベースの URL。例: strata = "http://127.0.0.1:18080/v1"）。
     # モデルを「モデル名@名前」と書くと、ollama の代わりにそこへ送る（Strata・Project Maya・llama.cpp・vLLM など）
     endpoints: dict[str, str] = field(default_factory=dict)
@@ -442,6 +444,7 @@ def load_config(path: Path | None = None) -> Config:
         ("local_model", str),
         ("think", str),
         ("local_think", str),
+        ("fallback", bool),
         ("use_images", bool),
         ("max_chars", int),
         ("candidates", int),

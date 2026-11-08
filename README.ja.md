@@ -338,6 +338,7 @@ model_choices = ["gemma4:31b-cloud"]     # 画面で選べるモデルの候補
 local_model = "gemma4:12b"               # allow_cloud = false のルートで、クラウドのモデルの代わりに使う
 think = ""                               # 思考に対応したモデルで "true" / "false"。空ならモデルに任せる（手元のモデルは local_think）
 local_think = "false"                    # 手元のモデルは考えさせないと 4〜20倍速く、質はほぼ変わらない
+fallback = true                          # 主のモデルが応答しない（クラウドの利用上限など）ときは local_model で代わりに処理する
 use_images = true
 max_chars = 4000                         # モデルに渡す本文の上限
 candidates = 15                          # モデルに選ばせる移動先の候補の数
@@ -371,6 +372,10 @@ ollama のほかに、OpenAI 互換の API を持つ推論サーバー（Strata�
 `[organize.endpoints]` に書き、モデルを「モデル名@名前」で指定します（画面のモデルの選択肢にも出ます）。
 送り先が手元（ループバック・LAN・Tailscale）でなければ、ollama のクラウドのモデルと同じく「外部へ送る」扱いになります。
 画像を読めないモデルのときは、画像は `vision_model` で読みます。
+
+主のモデルが応答しないとき（ollama のクラウドの利用上限・推論サーバーが止まっている・時間切れ）は、
+そのファイルを `local_model` で処理し直し、10分のあいだは手元のモデルで続けます（`fallback = false` で無効）。
+提案や読み取りの結果には、実際に使ったモデルが残ります。
 
 ## ロードマップ
 

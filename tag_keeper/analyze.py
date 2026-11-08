@@ -231,12 +231,14 @@ def run_one(conn: sqlite3.Connection, root: Path, target: Target, oc: OrganizeCo
         if target.kind == "document":
             row = conn.execute("SELECT text FROM extracts WHERE sha256 = ?", (target.sha256,)).fetchone()
             text = str(row["text"]) if row is not None else ""
-            data, model = analyze_document(oc, name, text), oc.model
+            # 主のモデルが応答しなければ、手元のモデルで読み直す（[organize] fallback）。使ったモデルを記録する
+            (data, model), _used, _note = organize.with_fallback(oc, lambda c: (analyze_document(c, name, text), c.model))
         else:
             path = root / target.relpath
             if path.stat().st_size > extract.MAX_IMAGE_BYTES:
                 raise organize.OllamaError("画像が大きすぎる")
-            data, model = analyze_image(oc, name, path.read_bytes())
+            image = path.read_bytes()
+            (data, model), _used, _note = organize.with_fallback(oc, lambda c: analyze_image(c, name, image))
             # 説明を全文検索の索引に入れる（本文を抽出していない画像だけ。OCR の結果は上書きしない）
             if data.get("description"):
                 desc = extract.Extracted("describe", extract.normalize_text(" ".join([data["description"], *data["labels"]]), 2000))

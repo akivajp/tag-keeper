@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `[organize] fallback` (default on): when the main model does not answer — ollama's cloud
+  usage limit (HTTP 429), a stopped inference server, a timeout — inbox suggestions, document
+  readings and directory-card drafts are redone with `local_model`, which keeps being used for
+  the next 10 minutes. The result records the model actually used, and the inbox screen shows
+  those suggestions when the main model has none. Before, readings failed and were stored as
+  errors that were not retried.
+
+### Fixed
+
+- Thinking is now also turned off with `reasoning_effort: "none"` for OpenAI-compatible
+  servers; Project Maya ignores `enable_thinking: false`.
+
 ## [0.20.0] - 2026-11-08
 
 ### Added

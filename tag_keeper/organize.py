@@ -21,6 +21,7 @@ import json
 import logging
 import re
 import sqlite3
+import time
 import unicodedata
 import urllib.error
 import urllib.request
@@ -29,7 +30,7 @@ from collections.abc import Callable, Iterable, Sequence
 from dataclasses import asdict, dataclass, field
 from fnmatch import fnmatchcase
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeVar
 
 from tag_keeper import rules
 from tag_keeper.catalog import utcnow
@@ -42,6 +43,8 @@ from tag_keeper.textindex import TfIdf, bigrams
 
 log = logging.getLogger(__name__)
 
+T = TypeVar("T")
+
 # 指示文を変えたら上げる（保存した提案を作り直すため）
 PROMPT_VERSION = 5
 # 移動先の候補にするフォルダの深さの上限
@@ -52,6 +55,20 @@ PROFILE_NAMES = 40
 
 class OllamaError(RuntimeError):
     """ollama に問い合わせられないときの例外。"""
+
+
+class ModelUnavailable(OllamaError):
+    """モデルが応答しない（クラウドの利用上限・送り先が止まっている・時間切れなど）。手元のモデルに切り替える合図。"""
+
+    def __init__(self, message: str, model: str) -> None:
+        super().__init__(message)
+        self.model = model
+
+
+# 応答しなかったモデルに、この秒数のあいだは問い合わせず、手元のモデルを使う（1件ごとに失敗を待たないため）
+UNAVAILABLE_COOLDOWN = 600.0
+# 応答しなかったモデル → 再び問い合わせてよくなる時刻（time.monotonic）
+_unavailable_until: dict[str, float] = {}
 
 
 # --- 受け皿のフォルダとファイル ---
@@ -353,12 +370,15 @@ def openai_generate(base_url: str, model: str, config: OrganizeConfig, prompt: s
     if think in ("true", "false"):
         # Qwen 系などの思考の切り替え（対応していない API は無視する）
         body["chat_template_kwargs"] = {"enable_thinking": think == "true"}
+    if think == "false":
+        # Project Maya（GLM）は enable_thinking では切れず、reasoning_effort だけが効く（2026-11 の試験）
+        body["reasoning_effort"] = "none"
     req = urllib.request.Request(base_url + "/chat/completions", json.dumps(body).encode("utf-8"), {"Content-Type": "application/json"})
     try:
         with urllib.request.urlopen(req, timeout=config.timeout) as res:
             data = json.load(res)
     except (urllib.error.URLError, TimeoutError, OSError) as e:
-        raise OllamaError(f"{base_url} に問い合わせられません: {e}") from e
+        raise ModelUnavailable(f"{base_url} に問い合わせられません: {e}", f"{model}@") from e
     try:
         text = str(data["choices"][0]["message"].get("content") or "")
     except (KeyError, IndexError, TypeError) as e:
@@ -380,7 +400,11 @@ def ollama_generate(
     """
     ep = endpoint_of(config, model or config.model)
     if ep is not None:
-        return openai_generate(ep[0], ep[1], config, prompt, image)
+        try:
+            return openai_generate(ep[0], ep[1], config, prompt, image)
+        except ModelUnavailable as e:
+            # 「モデル名@送り先」の名前で知らせる（手元のモデルに切り替えるときに、どれが応答しないかを覚えるため）
+            raise ModelUnavailable(str(e), model or config.model) from e
     body: dict[str, Any] = {
         "model": model or config.model,
         "prompt": prompt,
@@ -404,7 +428,8 @@ def ollama_generate(
         with urllib.request.urlopen(req, timeout=config.timeout) as res:
             data = json.load(res)
     except (urllib.error.URLError, TimeoutError, OSError) as e:
-        raise OllamaError(f"ollama に問い合わせられません（{config.ollama_url}）: {e}") from e
+        # クラウドの利用上限（429）・ollama が止まっている・時間切れなど。手元のモデルに切り替える合図にする
+        raise ModelUnavailable(f"ollama に問い合わせられません（{config.ollama_url}・{body['model']}）: {e}", body["model"]) from e
     return parse_json_answer(str(data.get("response", "")))
 
 
@@ -421,7 +446,7 @@ def model_capabilities(config: OrganizeConfig, model: str | None = None) -> list
             with urllib.request.urlopen(ep[0] + "/models", timeout=15) as res:
                 listing = json.load(res)
         except (urllib.error.URLError, TimeoutError, OSError, ValueError) as e:
-            raise OllamaError(f"{ep[0]} に接続できません: {e}") from e
+            raise ModelUnavailable(f"{ep[0]} に接続できません: {e}", name) from e
         for m in listing.get("data") or []:
             if m.get("id") == ep[1]:
                 inputs = ((m.get("architecture") or {}).get("input_modalities")) or ["text"]
@@ -438,7 +463,7 @@ def model_capabilities(config: OrganizeConfig, model: str | None = None) -> list
     except urllib.error.HTTPError as e:
         raise OllamaError(f"ollama にモデル {name} がありません（ollama pull {name}）") from e
     except (urllib.error.URLError, TimeoutError, OSError) as e:
-        raise OllamaError(f"ollama に接続できません（{config.ollama_url}）: {e}") from e
+        raise ModelUnavailable(f"ollama に接続できません（{config.ollama_url}）: {e}", name) from e
     return [str(c) for c in data.get("capabilities") or []]
 
 
@@ -497,11 +522,76 @@ def sends_outside(config: OrganizeConfig, model: str) -> bool:
     return is_cloud_model(model)
 
 
+def fallback_config(config: OrganizeConfig) -> OrganizeConfig | None:
+    """主のモデルが応答しないときに代わりに使う設定（手元のモデル）。代わりが無ければ None。
+
+    画像のモデルも、外へ送るものなら外す（手元のモデルが画像を読めれば、それで読む）。
+    """
+    if not config.fallback or not config.local_model or config.model == config.local_model:
+        return None
+    return config_for_root(config, False, config.local_model)[0]
+
+
+def fallback_model(config: OrganizeConfig) -> str:
+    """代わりに使う手元のモデルの名前（保存済みの提案を画面に出すときに使う）。代わりが無ければ空。"""
+    fb = fallback_config(config)
+    return fb.model if fb is not None else ""
+
+
+def mark_unavailable(model: str, reason: str) -> None:
+    """モデルが応答しなかったことを覚える（しばらくのあいだ、手元のモデルを使う）。"""
+    if _unavailable_until.get(model, 0.0) <= time.monotonic():
+        log.warning("%s が応答しないため、%d 分のあいだ手元のモデルで代わりに処理します: %s", model, UNAVAILABLE_COOLDOWN // 60, reason)
+    _unavailable_until[model] = time.monotonic() + UNAVAILABLE_COOLDOWN
+
+
+def active_config(config: OrganizeConfig) -> tuple[OrganizeConfig, str]:
+    """今使う設定。主のモデル（か画像のモデル）が少し前に応答しなかったら、手元のモデルの設定を返す。
+
+    Returns:
+        （使う設定, 切り替えたときの説明。切り替えていなければ空）
+    """
+    fb = fallback_config(config)
+    now = time.monotonic()
+    down = [m for m in (config.model, config.vision_model) if m and _unavailable_until.get(m, 0.0) > now]
+    if fb is None or not down:
+        return config, ""
+    return fb, f"{down[0]} が応答しないため、{fb.model} で代わりに処理しました"
+
+
+def with_fallback(config: OrganizeConfig, fn: Callable[[OrganizeConfig], T]) -> tuple[T, OrganizeConfig, str]:
+    """fn(設定) を呼ぶ。主のモデルが応答しなければ、手元のモデルの設定で呼び直す（[organize] fallback）。
+
+    Returns:
+        （fn の結果, 実際に使った設定, 切り替えたときの説明。切り替えていなければ空）
+    """
+    cfg, note = active_config(config)
+    try:
+        return fn(cfg), cfg, note
+    except ModelUnavailable as e:
+        fb = fallback_config(cfg)
+        if fb is None:
+            raise
+        mark_unavailable(e.model, str(e))
+        return fn(fb), fb, f"{e.model} が応答しないため、{fb.model} で代わりに処理しました"
+
+
 def check_ollama(config: OrganizeConfig) -> None:
-    """ollama が動いていて、設定のモデル（と画像用のモデル）があるかを確かめる。無ければ OllamaError。"""
-    model_capabilities(config)
-    if config.vision_model:
-        model_capabilities(config, config.vision_model)
+    """ollama が動いていて、設定のモデル（と画像用のモデル）があるかを確かめる。無ければ OllamaError。
+
+    主のモデルに接続できなければ、代わりの手元のモデルを確かめる（[organize] fallback。しばらく手元のモデルを使う）。
+    """
+    cfg, _note = active_config(config)
+    try:
+        model_capabilities(cfg)
+        if cfg.vision_model:
+            model_capabilities(cfg, cfg.vision_model)
+    except ModelUnavailable as e:
+        fb = fallback_config(cfg)
+        if fb is None:
+            raise
+        mark_unavailable(e.model, str(e))
+        check_ollama(fb)
 
 
 # --- 提案 ---
@@ -753,12 +843,20 @@ def suggest_file(
     return sug
 
 
-def load_cached(conn: sqlite3.Connection, sha256: str, model: str) -> Suggestion | None:
-    """保存した提案を読む。無ければ None。"""
-    row = conn.execute(
-        "SELECT data FROM suggestions WHERE sha256 = ? AND model = ? AND prompt_version = ?",
-        (sha256, model, PROMPT_VERSION),
-    ).fetchone()
+def load_cached(conn: sqlite3.Connection, sha256: str, model: str, also: str = "") -> Suggestion | None:
+    """保存した提案を読む。無ければ None。
+
+    Args:
+        also: model の提案が無ければ、このモデルの提案を読む（主のモデルが応答せず、手元のモデルで代わりに作ったもの）。
+    """
+    row = None
+    for m in dict.fromkeys(x for x in (model, also) if x):
+        row = conn.execute(
+            "SELECT data FROM suggestions WHERE sha256 = ? AND model = ? AND prompt_version = ?",
+            (sha256, m, PROMPT_VERSION),
+        ).fetchone()
+        if row is not None:
+            break
     if row is None:
         return None
     data = json.loads(row["data"])
@@ -825,14 +923,18 @@ def suggest_one(
         sha = item.sha256 or _hash_and_record(conn, root_id, root_path, item)
     except OSError as e:
         return Suggestion(item.relpath, "", config.model, error=f"読めない: {e}")
-    cached = None if force else load_cached(conn, sha, config.model)
+    # 主のモデルが応答しないあいだは、手元のモデルで代わりに作った提案も使い回す
+    active, _note = active_config(config)
+    cached = None if force else load_cached(conn, sha, config.model, active.model)
     if cached is not None:
         cached.relpath = item.relpath
         return cached
     try:
-        sug = suggest_file(root_path, item, sha, context(), config)
+        sug, _used, note = with_fallback(config, lambda c: suggest_file(root_path, item, sha, context(), c))
     except OllamaError as e:
         return Suggestion(item.relpath, sha, config.model, error=str(e))
+    if note:
+        sug.note = (sug.note + " " if sug.note else "") + note
     save(conn, sug)
     return sug
 
@@ -901,13 +1003,17 @@ def run_suggestions(
     return out
 
 
-def cached_suggestions(conn: sqlite3.Connection, files: Sequence[InboxFile], model: str) -> dict[str, Suggestion]:
-    """受け皿のファイルについて、保存済みの提案だけを返す（相対パス → 提案）。画面の表示用。"""
+def cached_suggestions(conn: sqlite3.Connection, files: Sequence[InboxFile], model: str, also: str = "") -> dict[str, Suggestion]:
+    """受け皿のファイルについて、保存済みの提案だけを返す（相対パス → 提案）。画面の表示用。
+
+    Args:
+        also: model の提案が無いファイルは、このモデル（代わりに使う手元のモデル）の提案を返す。
+    """
     out: dict[str, Suggestion] = {}
     for f in files:
         if f.sha256 is None:
             continue
-        sug = load_cached(conn, f.sha256, model)
+        sug = load_cached(conn, f.sha256, model, also)
         if sug is not None:
             sug.relpath = f.relpath
             out[f.relpath] = sug

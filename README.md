@@ -420,6 +420,7 @@ model_choices = ["gemma4:31b-cloud"]     # extra models offered on the page
 local_model = "gemma4:12b"               # used instead of a cloud model for roots with allow_cloud = false
 think = ""                               # "true" / "false" for thinking models; "" = model default (local_think for local models)
 local_think = "false"                    # local models answer 4-20x faster without thinking, with about the same quality
+fallback = true                          # use local_model when the main model does not answer (e.g. cloud usage limit)
 use_images = true
 max_chars = 4000                         # text passed to the model
 candidates = 15                          # destination folders the model chooses from
@@ -454,6 +455,10 @@ used: list it under `[organize.endpoints]` and name a model `model-id@name`; its
 appear in the model menu. An endpoint whose address is not local (loopback, LAN or Tailscale)
 counts as sending content outside, like ollama's cloud models. Text-only models read images
 through `vision_model`.
+
+When the main model does not answer (ollama's cloud usage limit, a stopped server, a timeout),
+the file is redone with `local_model`, which keeps being used for the next 10 minutes
+(`fallback = false` turns this off). Suggestions and readings record the model actually used.
 
 ## Roadmap
 
