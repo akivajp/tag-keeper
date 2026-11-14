@@ -411,3 +411,82 @@ def test_identical_files_inside_a_moved_folder_are_linked_by_their_place(
     after = {r["relpath"]: r["id"] for r in conn.execute("SELECT id, relpath FROM entries WHERE is_dir = 0 AND gone_at IS NULL")}
     assert after["90_System/Windows/chrome/ext/LICENSE"] == before["Windows/chrome/ext/LICENSE"]
     assert after["90_System/Windows/opt/ext/LICENSE"] == before["Windows/opt/ext/LICENSE"]
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root は権限に関係なく読めてしまう")
+def test_entries_whose_attributes_cannot_be_read_are_not_reported_as_gone(conn: sqlite3.Connection, root_id: int, root: Path) -> None:
+    """一覧は読めるが中の属性を読めないフォルダ（検索の権限が無い）の中身を、消えたと記録しない。"""
+    for i in range(3):
+        write(root / "locked" / f"f{i}.txt", str(i))
+    write(root / "keep.txt", "keep")
+    scan_root(conn, root_id, root, SAFETY)
+    os.chmod(root / "locked", 0o600)
+    try:
+        res = scan_root(conn, root_id, root, SAFETY)
+    finally:
+        os.chmod(root / "locked", 0o700)
+    assert res.gone == 0 and res.held == 0 and res.unreadable == 3
+    assert live_paths(conn, root_id) == {"keep.txt", "locked/f0.txt", "locked/f1.txt", "locked/f2.txt"}
+
+
+def test_one_shared_file_does_not_make_a_folder_move(conn: sqlite3.Connection, root_id: int, root: Path, clock: list[int]) -> None:
+    """定型のファイル（LICENSE など）が1つ一致しただけの無関係なフォルダを、フォルダごとの移動にしない。"""
+    import shutil
+
+    mit = "MIT License\nCopyright (c) Akiva\n"
+    write(root / "projA" / "LICENSE", mit)
+    write(root / "projA" / "main.py", "print('A')")
+    write(root / "projA" / "notes.md", "A のメモ")
+    write(root / "keep.txt", "keep")
+    refresh(conn, root_id, root)
+    shutil.rmtree(root / "projA")  # projA は捨てた
+    refresh(conn, root_id, root)
+    # 後日、無関係な projB を作る（同じ LICENSE だけが共通）
+    write(root / "projB" / "LICENSE", mit)
+    write(root / "projB" / "app.js", "console.log('B')")
+    write(root / "projB" / "notes.md", "B のメモ（別物）")
+    res = refresh(conn, root_id, root)
+    # フォルダの移動にはしない（projA に付けた型やタグが projB に付いてしまうため）。一致したファイルの移動だけを記録する
+    assert res.moves == [("projA/LICENSE", "projB/LICENSE")]
+
+
+def test_empty_files_are_not_linked_by_hash(conn: sqlite3.Connection, root_id: int, root: Path, clock: list[int]) -> None:
+    """空のファイルはどれも同じ内容なので、内容ハッシュでは結び付けない（無関係な空のファイルにタグが移る）。"""
+    from tag_keeper.scan import relink_candidates
+
+    write(root / "old" / "memo.txt", "")
+    write(root / "keep.txt", "keep")
+    refresh(conn, root_id, root)
+    (root / "old" / "memo.txt").unlink()
+    refresh(conn, root_id, root)
+    write(root / "new" / ".gitkeep", "")
+    res = refresh(conn, root_id, root)
+    assert (res.files, res.moves, res.ambiguous) == (0, [], 0)
+    assert relink_candidates(conn, root_id) == []
+
+
+def test_duplicates_that_come_back_to_the_same_paths_are_linked(
+    conn: sqlite3.Connection, root_id: int, root: Path, tmp_path: Path, clock: list[int]
+) -> None:
+    """同じ内容のファイルが複数、一度見えなくなって同じ場所に戻ったら、それぞれの場所のものとして結び付ける（確認待ちにしない）。"""
+    import shutil
+
+    from tag_keeper.scan import relink_candidates
+
+    write(root / "d1" / "photo.jpg", "same")
+    write(root / "d2" / "photo.jpg", "same")
+    write(root / "keep.txt", "keep")
+    refresh(conn, root_id, root)
+    before = {r["relpath"]: r["id"] for r in conn.execute("SELECT id, relpath FROM entries WHERE is_dir = 0")}
+    stash = tmp_path / "stash"
+    stash.mkdir()
+    for d in ("d1", "d2"):
+        shutil.move(str(root / d), str(stash / d))
+    refresh(conn, root_id, root)
+    for d in ("d1", "d2"):
+        shutil.move(str(stash / d), str(root / d))
+    res = refresh(conn, root_id, root)
+    assert (res.files, res.ambiguous, res.moves) == (2, 0, [])
+    assert relink_candidates(conn, root_id) == []
+    after = {r["relpath"]: r["id"] for r in conn.execute("SELECT id, relpath FROM entries WHERE is_dir = 0 AND gone_at IS NULL")}
+    assert after == before  # 行（初めて見た日時など）を引き継ぐ

@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import errno
 import logging
 import os
 import sqlite3
@@ -144,6 +145,10 @@ def walk_tree(
                     st = de.stat(follow_symlinks=False)
                 except OSError as e:
                     log.warning("属性を読めませんでした: %s (%s)", de.path, e.strerror)
+                    if e.errno != errno.ENOENT:
+                        # 権限が無いなどで読めないだけで、消えたわけではない（一覧と属性の間に消えたものは別）。
+                        # そのもの自身と配下を、消えたとは扱わせない
+                        result.unreadable.append(rel)
                     continue
                 if stat.S_ISDIR(st.st_mode):
                     result.observed[rel] = Observation(True, 0, st.st_mtime_ns, st.st_ino)
@@ -172,9 +177,13 @@ def check_root_available(root: Path) -> None:
 
 
 def _under_any(relpath: str, dirs: Iterable[str]) -> bool:
-    """relpath が、いずれかのフォルダの配下にあるかを返す（"" はルート全体）。"""
+    """relpath が、いずれかのフォルダ自身かその配下にあるかを返す（"" はルート全体）。
+
+    読めなかったフォルダは観測できているので、自身と一致しても害は無い。属性を読めなかったものは観測できておらず、
+    自身を含めないと「消えた」と扱ってしまう。
+    """
     for d in dirs:
-        if d == "" or relpath.startswith(d + "/"):
+        if d == "" or relpath == d or relpath.startswith(d + "/"):
             return True
     return False
 
@@ -384,11 +393,25 @@ def _pair_by_hash(
         return str(o["last_seen"]) < str(n["first_seen"])
 
     pairs: list[tuple[sqlite3.Row, sqlite3.Row]] = []
+    # 同じパスに戻ってきたもの（一時的に見えなくなっただけ）は、同じ内容の写しがほかにあっても、その場所のものと決まる
+    used: set[int] = set()
+    by_path = {str(o["relpath"]): o for o in olds}
+    rest: list[sqlite3.Row] = []
+    for n in news:
+        o = by_path.get(str(n["relpath"]))
+        if o is not None and int(o["id"]) not in used and valid(n, o):
+            pairs.append((n, o))
+            used.add(int(o["id"]))
+        else:
+            rest.append(n)
+    news = rest
+    olds = [o for o in olds if int(o["id"]) not in used]
+    if not news or not olds:
+        return pairs, 0
     if len(news) == 1 and len(olds) == 1:
         if valid(news[0], olds[0]):
-            return [(news[0], olds[0])], 0
-        return [], 0
-    used: set[int] = set()
+            pairs.append((news[0], olds[0]))
+        return pairs, 0
     undecided = 0
     for n in news:
         cands = [o for o in olds if valid(n, o)]
@@ -419,6 +442,8 @@ def _infer_dir_moves(
     - 旧フォルダが今は見えない（消えたか、走査で見えなくなった）
     - 新フォルダが、旧フォルダが最後に見えた後に新しく現れた
     - 旧フォルダの配下から動いたファイルが、すべて新フォルダの同じ相対パスへ動いている
+    - 旧フォルダにあったファイルの過半が、新フォルダの同じ相対パスに同じ内容である
+      （LICENSE のような定型のファイルが1つ一致しただけの、無関係なフォルダを「移動」にしないため）
 
     Returns:
         採ったフォルダの移動（旧, 新, 新フォルダの行 ID, 新フォルダを初めて見た日時）。浅い順で、他の移動に含まれるものは除く。
@@ -462,8 +487,35 @@ def _infer_dir_moves(
             continue
         if not (str(new_row["first_seen"]) >= cutoff and str(old_row["last_seen"]) < str(new_row["first_seen"])):
             continue
+        if not _mostly_same_content(conn, root_id, od, nd, cutoff):
+            continue
         chosen.append((od, nd, int(new_row["id"]), str(new_row["first_seen"])))
     return chosen
+
+
+def _mostly_same_content(conn: sqlite3.Connection, root_id: int, od: str, nd: str, cutoff: str) -> bool:
+    """旧フォルダ od にあった（今は見えない）ファイルの過半が、新フォルダ nd の同じ相対パスに同じ内容であるか。"""
+    # 旧フォルダの中で見えなくなったファイル（相対パス → 内容ハッシュ。同じパスの行が複数あれば新しいもの）
+    old_files: dict[str, str | None] = {}
+    for r in conn.execute(
+        "SELECT relpath, sha256 FROM entries WHERE root_id = ? AND is_dir = 0 AND relpath >= ? AND relpath < ?"
+        " AND ((gone_at IS NOT NULL AND gone_at >= ? AND (gone_by IS NULL OR gone_by = 'scan'))"
+        "      OR (gone_at IS NULL AND missing_count > 0)) ORDER BY id",
+        (root_id, od + "/", od + "0", cutoff),
+    ):
+        old_files[str(r["relpath"])[len(od):]] = r["sha256"]
+    if not old_files:
+        return False
+    new_files = {
+        str(r["relpath"])[len(nd):]: r["sha256"]
+        for r in conn.execute(
+            "SELECT relpath, sha256 FROM entries WHERE root_id = ? AND is_dir = 0 AND gone_at IS NULL"
+            " AND missing_count = 0 AND relpath >= ? AND relpath < ?",
+            (root_id, nd + "/", nd + "0"),
+        )
+    }
+    same = sum(1 for rel, sha in old_files.items() if sha is not None and new_files.get(rel) == sha)
+    return same * 2 > len(old_files)
 
 
 # 結び付けに使う、新しく現れたファイルの列と、見えなくなったファイルの列
@@ -517,7 +569,7 @@ def relink_candidates(
     skip = set(skipped)
     news = [
         r for r in conn.execute(
-            f"SELECT {_NEW_COLS} FROM entries WHERE root_id = ? AND gone_at IS NULL AND is_dir = 0 AND missing_count = 0"
+            f"SELECT {_NEW_COLS} FROM entries WHERE root_id = ? AND gone_at IS NULL AND is_dir = 0 AND missing_count = 0 AND size > 0"
             " AND sha256 IS NOT NULL AND hashed_size IS size AND hashed_mtime_ns IS mtime_ns AND first_seen >= ? ORDER BY relpath",
             (root_id, cutoff),
         )
@@ -621,7 +673,7 @@ def relink_by_hash(
     # 新しく現れたファイル（ハッシュが今の中身のもの）
     news_rows = conn.execute(
         "SELECT id, relpath, size, mtime_ns, inode, sha256, hashed_size, hashed_mtime_ns, first_seen, last_seen"
-        " FROM entries WHERE root_id = ? AND gone_at IS NULL AND is_dir = 0 AND missing_count = 0"
+        " FROM entries WHERE root_id = ? AND gone_at IS NULL AND is_dir = 0 AND missing_count = 0 AND size > 0"
         " AND sha256 IS NOT NULL AND hashed_size IS size AND hashed_mtime_ns IS mtime_ns AND first_seen >= ?",
         (root_id, cutoff),
     ).fetchall()

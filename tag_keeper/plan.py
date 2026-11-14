@@ -73,6 +73,11 @@ class PlanOp:
     skip: bool = False
     # 移動・改名（action = "move"）の移動先。ルートからの相対パス（新しい名前を含む）
     dest: str = ""
+    # この操作の前提のファイル（競合コピーの元・旧版の後継版。ルートからの相対パス）と、プランの作成時の大きさ・更新日時
+    # （-1 は存在だけを確かめる）。実行の直前に確かめ、無くなった・変わったなら実行しない
+    requires: str = ""
+    requires_size: int = -1
+    requires_mtime_ns: int = -1
 
 
 @dataclass
@@ -190,6 +195,16 @@ def build_plan(
         if fp is None:
             log.warning("走査の後に見えなくなったため、プランに含めません: %s", f.relpath)
             continue
+        # 候補の判定は走査の時点のカタログによる。その後にファイルが変わっていたら、判定はもう当てにならない
+        # （空だったファイルに中身を書いた・内容が同じだった複製を編集した、など）
+        if not f.is_dir and f.mtime_ns and (fp.size, fp.mtime_ns) != (f.size, f.mtime_ns):
+            log.warning("走査の後に変更されたため、プランに含めません（走査し直してください）: %s", f.relpath)
+            continue
+        if f.requires:
+            problem = _check_required(root_path, f.requires, f.requires_size, f.requires_mtime_ns)
+            if problem is not None:
+                log.warning("%sため、プランに含めません（走査し直してください）: %s", problem, f.relpath)
+                continue
         if f.category == rules.CAT_EMPTY_DIR and not dir_is_empty(root_path / f.relpath):
             log.warning("空ではない（走査の対象外のものがある）ため、プランに含めません: %s", f.relpath)
             continue
@@ -204,9 +219,23 @@ def build_plan(
                 mtime_ns=fp.mtime_ns,
                 category=f.category,
                 reason=f.reason,
+                requires=f.requires,
+                requires_size=f.requires_size,
+                requires_mtime_ns=f.requires_mtime_ns,
             )
         )
     return plan
+
+
+def _check_required(root_path: Path, relpath: str, size: int, mtime_ns: int) -> str | None:
+    """操作の前提のファイル（競合コピーの元・旧版の後継版）が、今もそのままあるかを確かめる。崩れていれば理由を返す。"""
+    try:
+        st = os.lstat(root_path / relpath)
+    except OSError:
+        return f"前提のファイル（{relpath}）が無くなった"
+    if size >= 0 and (st.st_size, st.st_mtime_ns) != (size, mtime_ns):
+        return f"前提のファイル（{relpath}）が変更された"
+    return None
 
 
 def _toml_str(s: str) -> str:
@@ -263,7 +292,13 @@ def write_plan(plan: Plan, path: Path) -> None:
                 f"{' dest = ' + _toml_str(op.dest) + ',' if op.action == ACTION_MOVE else ''}"
                 f" category = {_toml_str(op.category)}, reason = {_toml_str(op.reason)},"
                 f" is_dir = {'true' if op.is_dir else 'false'}, files = {op.files}, size = {op.size},"
-                f" inode = {op.inode}, mtime_ns = {op.mtime_ns} }},"
+                f" inode = {op.inode}, mtime_ns = {op.mtime_ns}"
+                + (
+                    f", requires = {_toml_str(op.requires)}, requires_size = {op.requires_size}, requires_mtime_ns = {op.requires_mtime_ns}"
+                    if op.requires
+                    else ""
+                )
+                + " },"
             )
     lines.append("]")
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -300,6 +335,9 @@ def load_plan(path: Path) -> Plan:
                     reason=str(item.get("reason", "")),
                     skip=bool(item.get("skip", False)),
                     dest=str(item.get("dest", "")),
+                    requires=str(item.get("requires", "")),
+                    requires_size=int(item.get("requires_size", -1)),
+                    requires_mtime_ns=int(item.get("requires_mtime_ns", -1)),
                 )
             )
     except KeyError as e:
@@ -307,7 +345,7 @@ def load_plan(path: Path) -> Plan:
     if not re.fullmatch(r"[\w.-]+", plan.id):
         raise PlanError(f"{path}: プラン ID に使えない文字があります: {plan.id}")
     for op in plan.ops:
-        for target in [op.path] + ([op.dest] if op.action == ACTION_MOVE else []):
+        for target in [op.path] + ([op.dest] if op.action == ACTION_MOVE else []) + ([op.requires] if op.requires else []):
             parts = target.split("/")
             if target.startswith("/") or any(p in ("", ".", "..") for p in parts):
                 raise PlanError(f"{path}: ルートの外を指すパスは扱えません: {target!r}")
@@ -333,6 +371,11 @@ def check_op(plan: Plan, op: PlanOp) -> str | None:
         return "プランの作成後に変更された"
     if op.category == rules.CAT_EMPTY_DIR and op.is_dir and not dir_is_empty(plan.root_path / op.path):
         return "空ではない（走査の対象外のものがある）"
+    if op.requires:
+        # 「元のファイルが隣にある」などの前提が、プランを作った後に崩れていないか
+        problem = _check_required(plan.root_path, op.requires, op.requires_size, op.requires_mtime_ns)
+        if problem is not None:
+            return problem
     if op.action == ACTION_MOVE:
         # 移動先の途中にルートの外を指すシンボリックリンクがあると、ルートの外へ移ってしまう
         real = Path(os.path.realpath(plan.root_path / op.dest))
@@ -489,9 +532,10 @@ class RunResult:
 def _subtree_sql(relpath: str) -> tuple[str, tuple[Any, ...]]:
     """relpath 自身とその配下に一致する WHERE 句の断片と引数を返す。
 
-    LIKE は % や _ を含む名前で誤るので、先頭の部分文字列で比べる。
+    LIKE は % や _ を含む名前で誤るので、範囲で比べる（"/" の次の文字は "0"。「relpath/」で始まるものは
+    ちょうど relpath + "/" 以上・relpath + "0" 未満になる）。範囲の比較は索引を使えるので、行数が多くても速い。
     """
-    return "(relpath = ? OR substr(relpath, 1, ?) = ?)", (relpath, len(relpath) + 1, relpath + "/")
+    return "(relpath = ? OR (relpath >= ? AND relpath < ?))", (relpath, relpath + "/", relpath + "0")
 
 
 def _root_id(conn: sqlite3.Connection, name: str) -> int:
@@ -800,10 +844,7 @@ def _quarantine_one(
         log.warning("飛ばしました: %s（%s）", op.path, outcome.detail)
         _append(journal, {"event": "skip", "path": op.path, "detail": outcome.detail})
         return outcome
-    detached = tags.detach_under(plan.root, op.path) if tags is not None else {}
-    detached_attrs = tags.detach_attrs_under(plan.root, op.path) if tags is not None else {}
-    detached_rels = tags.detach_relations_under(plan.root, op.path) if tags is not None else []
-    detached_meta = tags.detach_dirmeta_under(plan.root, op.path) if tags is not None else {}
+    # 動かした直後に実行記録を書く。この後のタグの切り離しやカタログの更新が失敗しても、取り消しで元に戻せる
     _append(
         journal,
         {
@@ -815,19 +856,31 @@ def _quarantine_one(
             "src": str(src),
             "dst": str(dst),
             "gone_at": gone_at,
-            **({"tags": detached} if detached else {}),
-            **({"attrs": detached_attrs} if detached_attrs else {}),
-            **({"relations": detached_rels} if detached_rels else {}),
-            **({"dirmeta": detached_meta} if detached_meta else {}),
         },
     )
-    where, args = _subtree_sql(op.path)
-    with conn:
-        # 隔離したもの（gone_by = 'plan'）は、内容ハッシュによる移動の推定の相手にしない（取り消しで元に戻すため）
-        conn.execute(
-            f"UPDATE entries SET gone_at = ?, gone_by = 'plan' WHERE root_id = ? AND gone_at IS NULL AND {where}",
-            (gone_at, root_id, *args),
-        )
+    detached: dict[str, Any] = {}
+    try:
+        if tags is not None:
+            for key, detach in (
+                ("tags", tags.detach_under),
+                ("attrs", tags.detach_attrs_under),
+                ("relations", tags.detach_relations_under),
+                ("dirmeta", tags.detach_dirmeta_under),
+            ):
+                got = detach(plan.root, op.path)
+                if got:
+                    detached[key] = got
+    finally:
+        # 外した分は、途中で失敗しても控えを残す（取り消しで付け直すため）。カタログも、動かした事実に合わせる
+        if detached:
+            _append(journal, {"event": "detached", "path": op.path, **detached})
+        where, args = _subtree_sql(op.path)
+        with conn:
+            # 隔離したもの（gone_by = 'plan'）は、内容ハッシュによる移動の推定の相手にしない（取り消しで元に戻すため）
+            conn.execute(
+                f"UPDATE entries SET gone_at = ?, gone_by = 'plan' WHERE root_id = ? AND gone_at IS NULL AND {where}",
+                (gone_at, root_id, *args),
+            )
     return outcome
 
 
@@ -882,6 +935,14 @@ def pending_restores(journal: Path) -> list[Restorable]:
                 relations=rec.get("relations") or [],
                 dirmeta=rec.get("dirmeta") or {},
             )
+        elif event == "detached":
+            # 隔離のときに外したタグ・属性・関係・型の控え（隔離の記録とは別に書く。古い記録では隔離の記録の中にある）
+            it = moved.get(rec["path"])
+            if it is not None:
+                it.tags = rec.get("tags") or it.tags
+                it.attrs = rec.get("attrs") or it.attrs
+                it.relations = rec.get("relations") or it.relations
+                it.dirmeta = rec.get("dirmeta") or it.dirmeta
         elif event == "move":
             moved[rec["path"]] = Restorable(
                 root=root,

@@ -327,3 +327,73 @@ def test_nfd_names_in_the_browser_carry_tags(tmp_path: Path, root: Path) -> None
     res = app.get("/api/browse", {"root": "data", "path": ""}).json
     entry = next(e for e in res["entries"] if e["is_dir"])
     assert entry["name"] == nfd and entry["tags"] == ["種別:案件"]
+
+
+def test_every_kind_of_record_follows_a_move(tmp_path: Path) -> None:
+    """「本文を索引に入れない」だけを設定したフォルダや、確認の判断だけがあるファイルも、改名に追従する。"""
+    store = TagStore(tmp_path / "tags", host="t")
+    store.set_extract("test", "code/repo", False)
+    store.record_review("test", "docs/inv.pdf", "abc", "reject")
+    assert store.follow_moves("test", [("code/repo", "code/repo-renamed"), ("docs", "papers"), ("other", "else")]) == 2
+    assert store.no_extract_of("test") == ["code/repo-renamed"]
+    assert store.reviewed("test") == {("papers/inv.pdf", "abc")}
+    # ログを読み直しても同じ
+    again = TagStore(tmp_path / "tags", host="t")
+    assert again.no_extract_of("test") == ["code/repo-renamed"] and again.reviewed("test") == {("papers/inv.pdf", "abc")}
+
+
+def test_many_moves_are_followed_quickly(tmp_path: Path) -> None:
+    """移動が多くても、管理情報の付いたものを含む移動だけを選んでから並べる（件数の積の時間をかけない）。"""
+    import time
+
+    store = TagStore(tmp_path / "tags", host="t")
+    store.add("test", ["old/d42/f.txt"], "重要")
+    moves = [(f"old/d{i}/f.txt", f"new/d{i}/f.txt") for i in range(20_000)]
+    began = time.monotonic()
+    assert store.follow_moves("test", moves) == 1
+    assert time.monotonic() - began < 5
+    assert store.items_with("重要") == [("test", "new/d42/f.txt")]
+
+
+def test_tags_added_under_an_alias_are_found_by_either_name(tmp_path: Path) -> None:
+    """別の端末が別名の登録を知らずに別名のまま付けたタグも、ログを合わせると正式な名前で見つかる。"""
+    import json
+
+    d = tmp_path / "tags"
+    d.mkdir()
+
+    def line(**ev: object) -> str:
+        return json.dumps(ev, ensure_ascii=False) + "\n"
+
+    # hermon: 別名を登録。zefat: その前後に、別名のまま付けていた
+    (d / "hermon.jsonl").write_text(line(at="2026-11-01T00:00:10+00:00", host="hermon", op="alias", tag="会社:アティード", alias="会社:ATID"), encoding="utf-8")
+    (d / "zefat.jsonl").write_text(
+        line(at="2026-11-01T00:00:05+00:00", host="zefat", op="add", root="r", path="a.pdf", tag="会社:ATID", source="manual")
+        + line(at="2026-11-01T00:00:20+00:00", host="zefat", op="add", root="r", path="b.pdf", tag="会社:ATID", source="manual"),
+        encoding="utf-8",
+    )
+    store = TagStore(d, host="zefat")
+    assert store.items_with("会社:ATID") == store.items_with("会社:アティード") == [("r", "a.pdf"), ("r", "b.pdf")]
+    assert store.all_tags() == {"会社:アティード": 2}
+    # 別名のまま外すこともできる
+    store.remove("r", ["a.pdf"], "会社:ATID")
+    assert store.items_with("会社:アティード") == [("r", "b.pdf")]
+
+
+def test_undo_reattaches_tags_under_their_canonical_name(tmp_path: Path) -> None:
+    """隔離している間に別名へまとめたタグは、取り消しで正式な名前で付け直す。"""
+    store = TagStore(tmp_path / "tags", host="t")
+    store.add("r", ["a.pdf"], "会社:ATID")
+    detached = store.detach_under("r", "a.pdf")  # 隔離
+    store.add("r", ["z.pdf"], "会社:ATID")
+    store.add_alias("会社:アティード", "会社:ATID")  # その間に別名にまとめた
+    assert store.attach("r", detached) == 1  # 取り消し
+    assert store.items_with("会社:アティード") == [("r", "a.pdf"), ("r", "z.pdf")]
+
+
+def test_old_values_of_a_redefined_attribute_do_not_break_search() -> None:
+    from tag_keeper.tags import AttrDef, match_attr
+
+    # 数の属性として定義し直す前に付けた、数でない値
+    assert match_attr(AttrDef("金額", "number"), "未対応", ">=", "100") is False
+    assert match_attr(AttrDef("金額", "number"), 250, ">=", "100") is True

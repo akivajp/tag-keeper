@@ -539,3 +539,80 @@ def test_cli_purge_needs_yes(tmp_path: Path, tree: Path) -> None:
     assert (tmp_path / "q" / plan_id / "docs" / "Thumbs.db").exists()  # 確認だけ
     assert main([*base, "purge", plan_id, "--yes"]) == 0
     assert not (tmp_path / "q" / plan_id).exists()
+
+
+def test_plan_leaves_out_files_changed_since_the_scan(conn: sqlite3.Connection, root_id: int, root: Path) -> None:
+    """候補の判定は走査の時点のもの。その後に変わったファイル（空だったファイルに中身を書いた、など）はプランに入れない。"""
+    write(root / "docs" / "draft.txt", "")  # 走査の時点では空
+    write(root / "docs" / "empty.txt", "")
+    write(root / "docs" / "other.txt", "keep")
+    scan_root(conn, root_id, root, SAFETY)
+    write(root / "docs" / "draft.txt", "走査の後に書いた大事な下書き")
+    plan = build_plan(build_report(conn, root_id, "test", HYGIENE), "test", root)  # 走査し直さずに作る
+    assert [(op.path, op.category) for op in plan.ops] == [("docs/empty.txt", rules.CAT_EMPTY_FILE)]
+
+
+def test_copy_is_kept_when_its_original_is_gone_or_changed(conn: sqlite3.Connection, root_id: int, root: Path, tmp_path: Path) -> None:
+    """「元と内容が同じ複製」は、元が今もそのままあるときだけ隔離する（元が消えれば、複製が唯一の版になる）。"""
+    for name in ("a", "b", "c"):
+        write(root / "docs" / f"{name}.pdf", f"same {name}")
+        write(root / "docs" / f"{name} (1).pdf", f"same {name}")
+    scan_root(conn, root_id, root, SAFETY)
+    hash_root(conn, root_id, root)
+    plan_file = tmp_path / "plans" / "p.toml"
+    write_plan(build_plan(build_report(conn, root_id, "test", HYGIENE), "test", root), plan_file)
+    plan = load_plan(plan_file)  # 前提は、プランのファイルに書いて読み直しても残る
+    assert sorted((op.path, op.requires) for op in plan.ops) == [(f"docs/{n} (1).pdf", f"docs/{n}.pdf") for n in ("a", "b", "c")]
+    # プランを作った後に、a の元を消し、b の元を書き換えた
+    (root / "docs" / "a.pdf").unlink()
+    write(root / "docs" / "b.pdf", "edited after the plan")
+    result = run_apply(conn, plan, tmp_path)
+    assert [o.path for o in result.done] == ["docs/c (1).pdf"]
+    assert {o.path: o.detail for o in result.skipped} == {
+        "docs/a (1).pdf": "前提のファイル（docs/a.pdf）が無くなった",
+        "docs/b (1).pdf": "前提のファイル（docs/b.pdf）が変更された",
+    }
+    assert (root / "docs" / "a (1).pdf").exists() and (root / "docs" / "b (1).pdf").exists()
+    # 元が無くなった後に作るプランにも入らない
+    assert build_plan(build_report(conn, root_id, "test", HYGIENE), "test", root).ops == []
+
+
+def test_quarantine_is_journaled_before_tags_are_detached(conn: sqlite3.Connection, root_id: int, tree: Path, tmp_path: Path) -> None:
+    """動かした直後に実行記録を書く。タグの切り離しの途中で失敗しても、取り消しで元に戻り、外したタグも付け直せる。"""
+    from tag_keeper.tags import TagStore
+
+    class Flaky(TagStore):
+        fail = True
+
+        def detach_attrs_under(self, root: str, base: str):  # タグを外した後で失敗する（ディスクの空きが無い、など）
+            if self.fail:
+                raise OSError(28, "No space left on device")
+            return super().detach_attrs_under(root, base)
+
+    plan, _ = make_plan(conn, root_id, tree, tmp_path)
+    store = Flaky(tmp_path / "tags", host="t")
+    first = plan.ops[0].path
+    store.add("test", [first], "重要")
+    with pytest.raises(OSError):
+        apply_plan(conn, plan, quarantine_dir=tmp_path / "quarantine", journal_dir=tmp_path / "journal", snapshot=None, tags=store)
+    assert not (tree / first).exists()
+    # カタログは「消えた」になっていて、取り消すとファイルもタグも戻る
+    assert first not in live_paths(conn, root_id, files_only=False)
+    store.fail = False
+    result = undo_plan(conn, plan.id, journal_dir=tmp_path / "journal", snapshot=None, tags=store)
+    assert [o.path for o in result.done] == [first] and (tree / first).exists()
+    assert [t["tag"] for t in store.tags_of("test", first)["direct"]] == ["重要"]
+    assert first in live_paths(conn, root_id, files_only=False)
+
+
+def test_subtree_matches_only_the_folder_and_what_is_inside(conn: sqlite3.Connection, root_id: int, root: Path, tmp_path: Path) -> None:
+    """フォルダを隔離したとき、名前が同じ文字で始まる隣のもの（a.b・a0・a_b）や、% や _ を含む名前を巻き込まない。"""
+    from tag_keeper.plan import _subtree_sql
+
+    for rel in ("a/x.txt", "a/sub/y.txt", "a.b/x.txt", "a0/x.txt", "a_b/x.txt", "a%/x.txt", "ab.txt"):
+        write(root / rel)
+    scan_root(conn, root_id, root, SAFETY)
+    for base, expected in (("a", {"a", "a/x.txt", "a/sub", "a/sub/y.txt"}), ("a%", {"a%", "a%/x.txt"}), ("a_b", {"a_b", "a_b/x.txt"})):
+        where, args = _subtree_sql(base)
+        got = {r["relpath"] for r in conn.execute(f"SELECT relpath FROM entries WHERE root_id = ? AND {where}", (root_id, *args))}
+        assert got == expected

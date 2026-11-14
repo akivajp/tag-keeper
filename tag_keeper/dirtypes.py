@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import re
 import sqlite3
+import unicodedata
 from collections.abc import Iterable
 from dataclasses import dataclass
 from fnmatch import fnmatchcase
@@ -136,8 +137,12 @@ def infer_type(conn: sqlite3.Connection, root_id: int, path: str, inbox_patterns
 def effective_type(
     conn: sqlite3.Connection, root_id: int, path: str, types: dict[str, str], inbox_patterns: Iterable[str] = ()
 ) -> DirType:
-    """フォルダの型（付けた型 → 継承した型 → 推定の順）。"""
-    return explicit_type(path, types) or infer_type(conn, root_id, path, inbox_patterns)
+    """フォルダの型（付けた型 → 継承した型 → 推定の順）。
+
+    path はカタログのパス（そのままの書き方）で渡す。付けた型は NFC にそろえた名前で引き、
+    中身からの推定はカタログのパスのまま引く（NFD の名前のフォルダでも、どちらも当たるように）。
+    """
+    return explicit_type(unicodedata.normalize("NFC", path), types) or infer_type(conn, root_id, path, inbox_patterns)
 
 
 def closed_dirs(conn: sqlite3.Connection, root_id: int, types: dict[str, str]) -> list[str]:
@@ -153,8 +158,12 @@ def closed_dirs(conn: sqlite3.Connection, root_id: int, types: dict[str, str]) -
     for r in conn.execute(f"SELECT relpath FROM entries WHERE root_id = ? AND gone_at IS NULL AND ({conds})", (root_id, *args)):
         rel = str(r["relpath"])
         parent = rel.rsplit("/", 1)[0] if "/" in rel else ""
-        if parent and types.get(parent) not in ("normal",) and parent not in out:
+        # 付けた型は NFC の名前で記録している。カタログのパスは NFD のこともあるので、そろえてから引く
+        nfc = unicodedata.normalize("NFC", parent)
+        if parent and types.get(nfc) not in ("normal",):
+            # 使う側には、カタログのパスと比べるものと NFC で比べるものがあるので、書き方が違えば両方を返す
             out.add(parent)
+            out.add(nfc)
     # 入れ子（まとまりの中のまとまり）は、外側だけにする
     ordered = sorted(out, key=lambda p: (p.count("/"), p))
     top: list[str] = []

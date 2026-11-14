@@ -38,6 +38,14 @@ class Finding:
     # 人が中身を確かめてから判断すべきもの（元のファイルと内容が異なる競合コピーなど）。
     # 整理プランには既定で含めない
     needs_review: bool = False
+    # 判定に使ったカタログ上の更新日時（ファイルの候補だけ。0 は不明）。プランを作るときにディスクと比べ、
+    # 走査の後に変わっていたら（空だったファイルに中身を書いた、など）候補から外す
+    mtime_ns: int = 0
+    # この候補が成り立つ前提のファイル（競合コピーの元・旧版の後継版。ルートからの相対パス）と、
+    # 判定に使ったカタログ上の大きさ・更新日時（-1 は存在だけを前提にする）。前提が崩れたら隔離しない
+    requires: str = ""
+    requires_size: int = -1
+    requires_mtime_ns: int = -1
 
 
 @dataclass
@@ -158,6 +166,14 @@ def build_report(
         p = unicodedata.normalize("NFC", relpath)
         return p in kept_set or any(a in kept_set for a in ancestors(p) if a)
 
+    # 「残す」・報告しない（allow）としたものを中に含むフォルダ。フォルダごと隔離する候補にはしない
+    # （残したものの親が次の候補になり、残したものごとプランに入るのを防ぐ）
+    protected: set[str] = set()
+    if kept_set or allow:
+        for r in rows:
+            if is_kept(r["relpath"]) or _matches_any(r["relpath"], allow):
+                protected.update(a for a in ancestors(r["relpath"]) if a)
+
     report = Report(
         root=root_name,
         files=len(files),
@@ -182,7 +198,7 @@ def build_report(
     app_names = rules.DEFAULT_APP_DATA_NAMES | set(hygiene.app_data_names)
     flagged: set[str] = set()
     for d in dirs:
-        if _under(d, flagged) or _matches_any(d, allow) or is_kept(d):
+        if _under(d, flagged) or _matches_any(d, allow) or is_kept(d) or d in protected:
             continue
         name = d.rsplit("/", 1)[-1]
         if name in rules.REGENERABLE_DIRS and enabled(rules.CAT_REGENERABLE):
@@ -205,6 +221,9 @@ def build_report(
     for r in files:
         if _under(r["relpath"], flagged):
             continue
+        # 「残す」・報告しないとしたものは、アプリのデータらしさの集計に入れない
+        if is_kept(r["relpath"]) or _matches_any(r["relpath"], allow):
+            continue
         # Git の内部ファイル（.git/objects など）は拡張子が無いが、アプリのデータではない
         if rules.is_in_vcs_dir(r["relpath"]):
             continue
@@ -221,6 +240,7 @@ def build_report(
         and rest_noext[d] * 2 >= rest_files[d]
         and not _matches_any(d, allow)
         and not is_kept(d)
+        and d not in protected
         and enabled(rules.CAT_APP_DATA)
     ]
     # 条件を満たす子孫を持たない、最も深いものだけを残す
@@ -251,12 +271,15 @@ def build_report(
         if match is not None and not enabled(match.category):
             match = None
         needs_review = False
+        orig: sqlite3.Row | None = None
         if match is not None and match.category == rules.CAT_CONFLICT:
-            match, needs_review = _check_conflict_original(r, by_path, match, hygiene.device_names)
+            match, needs_review, orig = _check_conflict_original(r, by_path, match, hygiene.device_names)
         if match is not None:
-            report.findings.append(
-                Finding(match.category, rel, False, 1, r["size"], match.reason, needs_review)
-            )
+            finding = Finding(match.category, rel, False, 1, r["size"], match.reason, needs_review, mtime_ns=r["mtime_ns"])
+            if orig is not None:
+                # 元のファイルが今もそのままあることが前提（無くなれば、この複製が唯一の版になる）
+                finding.requires, finding.requires_size, finding.requires_mtime_ns = orig["relpath"], orig["size"], orig["mtime_ns"]
+            report.findings.append(finding)
         if r["size"] > 0 and _hash_is_current(r):
             by_hash[r["sha256"]].append(r)
 
@@ -285,6 +308,7 @@ def build_report(
                 report.findings.append(Finding(
                     rules.CAT_EXTRACTED, rel, False, 1, r["size"],
                     f"展開したフォルダ（{folder.rsplit('/', 1)[-1]}/、{desc_files[folder]:,} 件）が隣にある。中身がそろっているか確認が必要", True,
+                    mtime_ns=r["mtime_ns"], requires=folder,
                 ))
                 reported.add(rel)
 
@@ -294,12 +318,20 @@ def build_report(
         nfc_live = {unicodedata.normalize("NFC", p): p for p in live}
         for old, newer in sorted((old_versions or {}).items()):
             o, n = nfc_live.get(old), nfc_live.get(newer)
-            if o is None or n is None or not open_for(o):
+            if o is None or n is None or not open_for(o) or o in protected:
                 continue
             row = live[o]
             files_n = desc_files[o] if row["is_dir"] else 1
             size_n = desc_bytes[o] if row["is_dir"] else row["size"]
-            report.findings.append(Finding(rules.CAT_OLD_VERSION, o, bool(row["is_dir"]), files_n, size_n, f"後継版: {n}"))
+            newer_row = live[n]
+            report.findings.append(Finding(
+                rules.CAT_OLD_VERSION, o, bool(row["is_dir"]), files_n, size_n, f"後継版: {n}",
+                mtime_ns=0 if row["is_dir"] else row["mtime_ns"],
+                # 後継版が今もあることが前提（ファイルなら、変わっていないことも）
+                requires=n,
+                requires_size=-1 if newer_row["is_dir"] else newer_row["size"],
+                requires_mtime_ns=-1 if newer_row["is_dir"] else newer_row["mtime_ns"],
+            ))
             reported.add(o)
 
     # 7. 大きくて長く触れていないもの（消すのではなく、保管先の見直しの候補。プランには既定で含めない）
@@ -313,6 +345,7 @@ def build_report(
                 days = (now - r["mtime_ns"]) // (86400 * 1_000_000_000)
                 report.findings.append(Finding(
                     rules.CAT_STALE_LARGE, rel, False, 1, r["size"], f"{days:,} 日触れていない。保管先の見直しの候補", True,
+                    mtime_ns=r["mtime_ns"],
                 ))
 
     groups = [
@@ -330,28 +363,28 @@ def _check_conflict_original(
     by_path: dict[str, sqlite3.Row],
     match: rules.Match,
     device_names: Iterable[str],
-) -> tuple[rules.Match | None, bool]:
+) -> tuple[rules.Match | None, bool, sqlite3.Row | None]:
     """競合コピー・複製の元のファイルを探し、理由に内容の比較結果を足す。
 
     Returns:
-        （理由を足した一致結果, 人の確認が要るか）。元のファイルが無ければ（None, False）。
+        （理由を足した一致結果, 人の確認が要るか, 元のファイルの行）。元のファイルが無ければ（None, False, None）。
         内容が同じと確かめられたものだけを、確認不要とする。
     """
     rel = row["relpath"]
     original = rules.conflict_original(rel.rsplit("/", 1)[-1], device_names)
     if original is None:
-        return None, False
+        return None, False, None
     parent = parent_of(rel)
     orig = by_path.get(f"{parent}/{original}" if parent else original)
     if orig is None:
-        return None, False
+        return None, False, None
     if _hash_is_current(row) and _hash_is_current(orig) and row["sha256"] == orig["sha256"]:
-        return rules.Match(match.category, f"{match.reason}。元のファイルと内容が同じ"), False
+        return rules.Match(match.category, f"{match.reason}。元のファイルと内容が同じ"), False, orig
     if _hash_is_current(row) and _hash_is_current(orig):
         note = "元のファイルと内容が異なる。中身の確認が必要"
     else:
         note = "元のファイルがある（内容は未比較）"
-    return rules.Match(match.category, f"{match.reason}。{note}"), True
+    return rules.Match(match.category, f"{match.reason}。{note}"), True, orig
 
 
 def _hash_is_current(row: sqlite3.Row) -> bool:

@@ -141,3 +141,31 @@ def test_conflict_copies_need_an_original(conn: sqlite3.Connection, root_id: int
     assert conflicts["tax/plan-zefat.xlsx"].endswith("中身の確認が必要")
     review = {f.relpath for f in report.findings if f.needs_review}
     assert review == {"tax/plan-zefat.xlsx"}
+
+
+def test_keeping_a_candidate_does_not_promote_its_parent(conn, root_id, root) -> None:
+    """「残す」・allow にしたフォルダの親が、次の候補にならない（残したものごとプランに入ってしまうため）。"""
+    for slot in ("slot1", "slot2"):
+        for i in range(30):
+            write(root / "Documents" / "MySaves" / slot / f"{i:04x}", "data")
+    write(root / "Documents" / "MySaves" / "readme.txt", "my own note")
+    write(root / "Documents" / "letter.docx", "important")
+    scan_root(conn, root_id, root, SafetyConfig())
+
+    def app(**kw) -> list[str]:
+        hygiene = HygieneConfig(device_names=[], app_data_min_files=10, allow=kw.pop("allow", []))
+        return sorted(f.relpath for f in build_report(conn, root_id, "test", hygiene, **kw).findings if f.category == rules.CAT_APP_DATA)
+
+    assert app() == ["Documents/MySaves/slot1", "Documents/MySaves/slot2"]
+    # slot1 を残しても、親（残したフォルダと自分のメモを含む）は候補にならない。slot2 はこれまでどおり候補
+    assert app(kept=["Documents/MySaves/slot1"]) == ["Documents/MySaves/slot2"]
+    assert app(allow=["Documents/MySaves/slot1"]) == ["Documents/MySaves/slot2"]
+    # 両方残せば、何も候補にならない
+    assert app(kept=["Documents/MySaves/slot1", "Documents/MySaves/slot2"]) == []
+    # 名前で判定するフォルダ（node_modules など）も、中に残したものがあれば、フォルダごとの候補にしない
+    write(root / "proj" / "node_modules" / "pkg" / "index.js", "x")
+    write(root / "proj" / "node_modules" / "mine" / "patch.txt", "my patch")
+    scan_root(conn, root_id, root, SafetyConfig())
+    regen = [f.relpath for f in build_report(conn, root_id, "test", HYGIENE, kept=["proj/node_modules/mine/patch.txt"]).findings
+             if f.category == rules.CAT_REGENERABLE]
+    assert regen == []

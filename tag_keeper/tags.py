@@ -256,9 +256,10 @@ def match_attr(d: AttrDef | None, value: Any, op: str, want: str) -> bool:
     if d.type == "number":
         try:
             w: Any = float(want.replace(",", ""))
-        except ValueError:
+            # 型を定義し直す前に付けた値（数でない文字列）は、条件に合わないものとして扱う
+            v: Any = float(value)
+        except (TypeError, ValueError):
             return False
-        v: Any = float(value)
     elif d.type == "date":
         v, w = str(value), want.strip()
     elif d.type == "text":
@@ -347,14 +348,17 @@ class TagStore:
         root = str(ev.get("root", ""))
         if op == "add":
             key = (root, _nk(str(ev["path"])))
-            self.items.setdefault(key, {})[ev["tag"]] = Assignment(
-                ev["tag"], str(ev.get("source", "manual")), str(ev.get("at", "")), str(ev.get("host", ""))
+            # 別名で付けたもの（別の端末が別名の登録を知らずに付けた・隔離の取り消しで前の名前のまま戻した）は、
+            # 正式な名前で持つ（別名のままだと、どちらの名前で探しても見つからない）
+            tag = self._canonical(str(ev["tag"]))
+            self.items.setdefault(key, {})[tag] = Assignment(
+                tag, str(ev.get("source", "manual")), str(ev.get("at", "")), str(ev.get("host", ""))
             )
         elif op == "remove":
             key = (root, _nk(str(ev["path"])))
             tags = self.items.get(key)
             if tags is not None:
-                tags.pop(ev["tag"], None)
+                tags.pop(self._canonical(str(ev["tag"])), None)
                 if not tags:
                     del self.items[key]
         elif op == "rename":
@@ -412,10 +416,22 @@ class TagStore:
             for k in [k for k in self.no_extract if k[0] == root and _under(k[1], src)]:
                 self.no_extract.discard(k)
                 self.no_extract.add((root, dst + k[1][len(src):]))
+            # 確認（承認・却下）の判断と、移動の確認で「どれとも結び付けない」とした判断も、パスで引くので追従させる
+            for rk in [k for k in self.reviews if k[0] == root and _under(k[1], src)]:
+                self.reviews[(root, dst + rk[1][len(src):], rk[2])] = self.reviews.pop(rk)
+            for sk in [k for k in self.relink_skips if k[0] == root and _under(k[1], src)]:
+                self.relink_skips.discard(sk)
+                self.relink_skips.add((root, dst + sk[1][len(src):], sk[2]))
         elif op == "alias":
             alias, tag = str(ev["alias"]), str(ev["tag"])
             if alias != tag:
                 self.aliases[alias] = tag
+                # 別名にした名前で既に付いている分（別の端末が先に付けていた分）を、正式な名前にまとめる
+                canon = self._canonical(tag)
+                for tags in self.items.values():
+                    a = tags.pop(alias, None)
+                    if a is not None and canon not in tags:
+                        tags[canon] = Assignment(canon, a.source, a.at, a.host)
         elif op == "unalias":
             self.aliases.pop(str(ev["alias"]), None)
         elif op == "parent":
@@ -543,14 +559,24 @@ class TagStore:
         now = utcnow()
         with self.lock:
             self.reload_if_changed()
-            events = []
-            rel_paths = {p for a, b, _k in self.relations.get(root, ()) for p in (a, b)}
-            rel_paths |= {k[1] for k in [*self.dir_types, *self.dir_cards, *self.kept] if k[0] == root}
-            for src, dst in order_moves([(_nk(a), _nk(b)) for a, b in moves]):
-                if any(k[0] == root and _under(k[1], src) for k in [*self.items, *self.attrs]) or any(
-                    _under(p, src) for p in rel_paths
-                ):
-                    events.append({"at": now, "host": self.host, "op": "move", "root": root, "from": src, "to": dst})
+            # 管理情報（タグ・属性・関係・型・カード・「残す」・索引に入れない・確認の判断）の付いたパス
+            paths = {p for a, b, _k in self.relations.get(root, ()) for p in (a, b)}
+            paths |= {
+                k[1]
+                for k in [*self.items, *self.attrs, *self.dir_types, *self.dir_cards, *self.kept, *self.no_extract, *self.reviews, *self.relink_skips]
+                if k[0] == root
+            }
+            # そのパス自身と、すべての親。移動元がこの中にあれば、その移動は管理情報の付いたものを含む
+            # （移動ごとに全部のパスを見ると、移動が多いときに件数の積の時間がかかり、その間ログのロックを握る）
+            touched = set(paths)
+            for path in paths:
+                parts = path.split("/")
+                touched.update("/".join(parts[:i]) for i in range(1, len(parts)))
+            relevant = [m for m in dict.fromkeys((_nk(a), _nk(b)) for a, b in moves) if m[0] == "" or m[0] in touched]
+            events = [
+                {"at": now, "host": self.host, "op": "move", "root": root, "from": src, "to": dst}
+                for src, dst in order_moves(relevant)
+            ]
             self._append(events)
         return len(events)
 
@@ -582,11 +608,12 @@ class TagStore:
         now = utcnow()
         with self.lock:
             self.reload_if_changed()
+            # 外している間に別名にまとめられたタグは、正式な名前で付け直す
             events = [
-                {"at": now, "host": self.host, "op": "add", "root": root, "path": p, "tag": tag, "source": source}
+                {"at": now, "host": self.host, "op": "add", "root": root, "path": p, "tag": self._canonical(tag), "source": source}
                 for p, pairs in sorted(detached.items())
                 for tag, source in pairs
-                if tag not in self.items.get((root, p), {})
+                if self._canonical(tag) not in self.items.get((root, p), {})
             ]
             self._append(events)
         return len(events)

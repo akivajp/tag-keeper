@@ -652,7 +652,8 @@ def create_app(
                     for e in child_dirs:
                         child = f"{rel}/{e['name']}" if rel else e["name"]
                         if len(child_dirs) <= 200:
-                            t = dirtypes.effective_type(conn, row["id"], unicodedata.normalize("NFC", child), types, pats)
+                            # カタログのパスのまま渡す（付けた型は NFC で、中身からの推定はそのままの名前で引かれる）
+                            t = dirtypes.effective_type(conn, row["id"], child, types, pats)
                         else:
                             t = dirtypes.explicit_type(unicodedata.normalize("NFC", child), types) or dirtypes.DirType("normal", "none")
                         # 継承した型は札にしない（親と同じなので、見ればわかる）

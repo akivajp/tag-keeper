@@ -99,3 +99,29 @@ def test_inbox_type_and_cards_feed_suggestions(conn: sqlite3.Connection, root_id
     found = index.find("経理/領収書")
     assert found is not None and "レシートと領収書" in found.card
     assert index.search("領収書 レシート", 3)[0][0].relpath == "経理/領収書"
+
+
+def test_types_work_for_folders_with_nfd_names(conn: sqlite3.Connection, root_id: int, root: Path, tmp_path: Path) -> None:
+    """名前が NFD（濁点が別の文字）のフォルダでも、付けた型と、目印からの推定が効く。"""
+    import unicodedata
+
+    from tag_keeper import structure
+
+    nfd = unicodedata.normalize("NFD", "デザイン")
+    nfc = unicodedata.normalize("NFC", "デザイン")
+    assert nfd != nfc
+    write(root / nfd / ".git" / "HEAD", "ref")
+    for n in ("請求書", "請求書類"):
+        write(root / nfd / n / "a.txt", n)
+    scan_root(conn, root_id, root, SafetyConfig())
+    store = TagStore(tmp_path / "tags", host="t")
+    # 推定したまとまり（.git がある）の中は、構造の見直しの対象にしない
+    assert nfc in dirtypes.closed_dirs(conn, root_id, store.dir_types_of("test"))
+    assert not [i for i in structure.review(conn, root_id, types=store.dir_types_of("test")) if i.path.startswith((nfc, nfd))]
+    assert dirtypes.effective_type(conn, root_id, nfd, store.dir_types_of("test")).type == "bundle"
+    # 「通常」を付ければ、推定を止められる
+    store.set_dir_type("test", nfd, "normal")
+    assert dirtypes.closed_dirs(conn, root_id, store.dir_types_of("test")) == []
+    # 付けた型は、カタログのパス（NFD）で尋ねても当たる
+    store.set_dir_type("test", nfd, "archive")
+    assert dirtypes.effective_type(conn, root_id, nfd, store.dir_types_of("test")).type == "archive"
