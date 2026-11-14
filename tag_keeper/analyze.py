@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import sqlite3
 import threading
 from collections.abc import Callable, Iterable
@@ -109,7 +110,17 @@ def _clean_number(value: Any) -> float | int | None:
         n = float(str(value).replace(",", "").replace("¥", "").replace("円", "").strip())
     except ValueError:
         return None
+    # "NaN" や "inf" は数として読めてしまうが、金額ではない（JSON にもできない）
+    if not math.isfinite(n):
+        return None
     return int(n) if n.is_integer() else n
+
+
+def _clean_labels(value: Any) -> list[str]:
+    """分類のラベル（3つまで）。配列でない答え（数や文字列）は捨てる。"""
+    if not isinstance(value, list):
+        return []
+    return [x for x in (_clean_text(v, 30) for v in value) if x][:3]
 
 
 def _clean_text(value: Any, limit: int = 200) -> str | None:
@@ -121,7 +132,7 @@ def _clean_text(value: Any, limit: int = 200) -> str | None:
 
 def normalize_document(raw: dict[str, Any]) -> dict[str, Any]:
     """モデルの答え（書類）を、決まった形にそろえる（型の合わない値は捨てる）。"""
-    labels = [x for x in (_clean_text(v, 30) for v in raw.get("labels") or [] if isinstance(raw.get("labels"), list)) if x][:3]
+    labels = _clean_labels(raw.get("labels"))
     return {
         "doc_type": _clean_text(raw.get("doc_type"), 40),
         "date": _clean_date(raw.get("date")),
@@ -140,8 +151,7 @@ def normalize_image(raw: dict[str, Any]) -> dict[str, Any]:
     kind = str(raw.get("kind") or "other").strip().lower()
     if kind not in ("document", "photo", "screenshot", "illustration", "other"):
         kind = "other"
-    labels = [x for x in (_clean_text(v, 30) for v in raw.get("labels") or [] if isinstance(raw.get("labels"), list)) if x][:3]
-    return {"kind": kind, "description": _clean_text(raw.get("description"), 400), "labels": labels}
+    return {"kind": kind, "description": _clean_text(raw.get("description"), 400), "labels": _clean_labels(raw.get("labels"))}
 
 
 def analyze_document(oc: OrganizeConfig, name: str, text: str) -> dict[str, Any]:
@@ -191,13 +201,19 @@ class Target:
 
 
 def pending(
-    conn: sqlite3.Connection, root_id: int, *, images: bool = True, limit: int | None = None, paths: Iterable[str] | None = None, force: bool = False
+    conn: sqlite3.Connection, root_id: int, *, images: bool = True, limit: int | None = None, paths: Iterable[str] | None = None, force: bool = False,
+    no_extract: Iterable[str] = (),
 ) -> list[Target]:
     """まだ読み取っていないもの（新しいものから）。paths を渡せば、その中から選ぶ（force なら読み取り済みでも選ぶ）。
 
     書類は本文を抽出済みのもの（pdftotext・office・text・ocr）、画像は jpg・png などの画像ファイル。
+    本文を索引に入れないフォルダ（no_extract。配下も含む）の中は、paths で名指ししたものを除いて対象にしない
+    （画像の説明を索引に入れてしまうため）。
     """
+    import unicodedata
+
     wanted = set(paths) if paths is not None else None
+    closed = [unicodedata.normalize("NFC", p) for p in no_extract]
     rows = conn.execute(
         "SELECT e.relpath, e.sha256, e.mtime_ns, x.method, a.sha256 AS done FROM entries e"
         " LEFT JOIN extracts x ON x.sha256 = e.sha256 LEFT JOIN analyses a ON a.sha256 = e.sha256"
@@ -212,6 +228,8 @@ def pending(
             continue
         if sha in out or (r["done"] is not None and not force):
             continue
+        if wanted is None and closed and any(unicodedata.normalize("NFC", rel).startswith(c + "/") for c in closed):
+            continue
         if r["method"] in ("pdftotext", "office", "text", "ocr"):
             kind = "document"
         elif images and _image_ok(rel):
@@ -225,7 +243,11 @@ def pending(
 
 
 def run_one(conn: sqlite3.Connection, root: Path, target: Target, oc: OrganizeConfig) -> Analysis:
-    """1件を読み取って保存する。モデルの失敗も結果（error）として保存する（同じものを何度も問い合わせないように）。"""
+    """1件を読み取って保存する。モデルの失敗も結果（error）として保存する（同じものを何度も問い合わせないように）。
+
+    ただし、モデルが応答しない（ollama が止まっている・利用上限・時間切れ）ための失敗は保存しない。
+    そのファイルのせいではないので、動くようになってから読み取れるように ModelUnavailable をそのまま上げる。
+    """
     name = target.relpath.rsplit("/", 1)[-1]
     try:
         if target.kind == "document":
@@ -245,6 +267,8 @@ def run_one(conn: sqlite3.Connection, root: Path, target: Target, oc: OrganizeCo
                 if conn.execute("SELECT 1 FROM extracts WHERE sha256 = ?", (target.sha256,)).fetchone() is None:
                     fulltext.store(conn, target.sha256, desc)
         a = Analysis(target.sha256, target.kind, model, data, "", utcnow())
+    except organize.ModelUnavailable:
+        raise
     except (organize.OllamaError, OSError) as e:
         a = Analysis(target.sha256, target.kind, oc.model, {}, str(e), utcnow())
     save(conn, a)
@@ -262,17 +286,33 @@ def run_pending(
     force: bool = False,
     on_start: Callable[[int], None] | None = None,
     on_item: Callable[[Target, Analysis], None] | None = None,
+    no_extract: Iterable[str] | None = None,
 ) -> list[Analysis]:
-    """まだ読み取っていないもの（または paths のもの）を読み取る。"""
+    """まだ読み取っていないもの（または paths のもの）を読み取る。
+
+    モデルが応答しなくなったら、そこで止める（残りは保存せず、次の機会に読み取る）。
+    """
     oc, note = organize.config_for_root(config.organize, rc.allow_cloud)
     if note:
         log.info("%s", note)
-    targets = pending(conn, root_id, images=config.ai.images, limit=limit, paths=paths, force=force)
+    if no_extract is None:
+        # 本文を索引に入れないフォルダ（タグのログから。全文検索の索引・書き起こしと同じ扱い）
+        from tag_keeper.tags import TagStore
+
+        no_extract = TagStore(config.tags.dir).no_extract_of(rc.name)
+    targets = pending(conn, root_id, images=config.ai.images, limit=limit, paths=paths, force=force, no_extract=no_extract)
     if on_start is not None:
         on_start(len(targets))
     out = []
     for t in targets:
-        a = run_one(conn, rc.path, t, oc)
+        try:
+            a = run_one(conn, rc.path, t, oc)
+        except organize.ModelUnavailable as e:
+            log.warning("モデルが応答しないので、読み取りを中断します（残り %d 件は次の機会に）: %s", len(targets) - len(out), e)
+            if not out:
+                # 1件も読み取れなかった。呼び出し側（画面・CLI）に、応答しないことを伝える
+                raise
+            break
         out.append(a)
         if on_item is not None:
             on_item(t, a)

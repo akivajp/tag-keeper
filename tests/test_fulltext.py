@@ -366,3 +366,56 @@ def test_folders_can_be_kept_out_of_the_index(conn: sqlite3.Connection, root_id:
     assert store.set_extract("test", "repo", True)
     fulltext.run_pending(conn, root_id, root, cfg)
     assert [r["relpath"] for r in fulltext.find_entries(conn, root_id, text="仕様書")] == ["repo/docs/spec.txt"]
+
+
+def test_shift_jis_text_cut_in_the_middle_of_a_letter_is_still_read(tmp_path: Path) -> None:
+    """大きなテキストは先頭だけを読む。切れ目が2バイトの文字の途中でも、全文が化けない（Shift_JIS の CSV など）。"""
+    # 先頭に半角を1つ置き、上限（max_chars * 4 バイト）の切れ目が全角の文字の途中に来るようにする
+    body = "a" + "請求書の一覧、" * 2000
+    path = write(tmp_path / "list.csv", body.encode("cp932"))
+    for max_chars in (10, 11, 500):
+        ex = extract.extract_text(path, max_chars=max_chars)
+        assert ex.method == "text" and "�" not in ex.text and ex.text.startswith("a請求書")
+        assert "�" not in extract.extract(path, max_chars=max_chars).text
+    # UTF-8 でも同じ
+    path = write(tmp_path / "memo.txt", "メモ" * 5000)
+    assert extract.extract_text(path, max_chars=10).text == "メモ" * 5
+
+
+def test_stale_text_is_pruned(conn: sqlite3.Connection, root_id: int, root: Path, tmp_path: Path) -> None:
+    """書き換えた・消したファイルの古い本文と、「索引に入れない」にしたフォルダの中の本文を、索引から消す。"""
+    write(root / "a.txt", "最初の本文")
+    write(root / "gone.txt", "消える本文")
+    write(root / "repo" / "spec.txt", "仕様書の本文")
+    write(root / "copy-of-spec.txt", "仕様書の本文")
+    write(root / "private" / "diary.txt", "日記の本文")
+    refresh(conn, root_id, root)
+    cfg = make_config(root, tmp_path)
+    fulltext.run_pending(conn, root_id, root, cfg)
+    assert fulltext.prune(conn, cfg) == 0  # 要らないものは無い
+
+    # 書き換えたファイルの古い本文は、すぐに消す。消したファイルの本文は、しばらく残す（戻ってくれば読み直さずに済む）
+    write(root / "a.txt", "書き換えた後の本文です")
+    (root / "gone.txt").unlink()
+    refresh(conn, root_id, root)
+    fulltext.run_pending(conn, root_id, root, cfg)
+    assert fulltext.prune(conn, cfg) == 1
+    texts = {r[0] for r in conn.execute("SELECT text FROM extracts")}
+    assert "最初の本文" not in texts and "消える本文" in texts
+    assert fulltext.find_entries(conn, root_id, text="最初の本文") == []
+    assert fulltext.prune(conn, cfg, keep_days=-1) == 1  # 残す日数を過ぎた扱いにする
+    assert "消える本文" not in {r[0] for r in conn.execute("SELECT text FROM extracts")}
+
+    # 索引に入れないフォルダの中にしか無い内容は消す。外にも同じ内容のファイルがあれば残す
+    store = TagStore(tmp_path / "tags")
+    store.set_extract("test", "repo", False)
+    store.set_extract("test", "private", False)
+    assert fulltext.prune(conn, cfg) == 1
+    assert fulltext.find_entries(conn, root_id, text="日記") == []
+    assert [r["relpath"] for r in fulltext.find_entries(conn, root_id, text="仕様書")] == ["copy-of-spec.txt", "repo/spec.txt"]
+
+    # 読めなかった記録は、消せば次の抽出で読み直す
+    sha = conn.execute("SELECT sha256 FROM entries WHERE relpath = 'a.txt'").fetchone()[0]
+    fulltext.store(conn, sha, extract.Extracted("error", note="時間内に読み終わらなかった"))
+    assert fulltext.retry_errors(conn) == 1
+    assert [i.relpath for i in fulltext.pending(conn, root_id, cfg.extract, ocr_ready=False, no_extract=store.no_extract_of("test"))] == ["a.txt"]

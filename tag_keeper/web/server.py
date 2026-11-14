@@ -997,7 +997,7 @@ def create_app(
         try:
             root_id = root_id_of(conn, rc)
             items = analyze.review_items(conn, root_id, rc.name, store.reviewed(rc.name))
-            waiting = len(analyze.pending(conn, root_id, images=config.ai.images))
+            waiting = len(analyze.pending(conn, root_id, images=config.ai.images, no_extract=store.no_extract_of(rc.name)))
         finally:
             conn.close()
         return {"root": rc.name, "items": items, "unread": waiting, "auto": config.ai.auto, "allow_cloud": rc.allow_cloud}
@@ -1132,7 +1132,18 @@ def create_app(
         rel = clean_relpath(str(data.get("path", "")))
         if not resolve_within(rc.path, rel).is_dir():
             raise fail(404, f"フォルダがありません: {rel}")
-        return {"changed": settings.tags(config).set_extract(rc.name, rel, bool(data.get("extract")))}
+        changed = settings.tags(config).set_extract(rc.name, rel, bool(data.get("extract")))
+        removed = 0
+        if changed and not data.get("extract"):
+            # 切り替える前に読み取った分が検索に出続けないよう、その場で索引から消す
+            from tag_keeper import fulltext
+
+            conn = open_db()
+            try:
+                removed = fulltext.prune(conn, config)
+            finally:
+                conn.close()
+        return {"changed": changed, "removed": removed}
 
     @app.post("/api/dircard")
     def api_dircard() -> dict[str, Any]:
@@ -1361,7 +1372,7 @@ def create_app(
                     excluded,
                     root_name=rc.name,
                     decisions=settings.decision_log,
-                    tag_counts=settings.tags(config).all_tags(),
+                    tag_counts=organize.prompt_tag_counts(settings.tags(config), config.roots, oc),
                     **inbox_hints(rc, config),
                     only=only,
                     force=force,

@@ -14,6 +14,7 @@ import logging
 import os
 import sqlite3
 import threading
+import time
 import unicodedata
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
@@ -148,6 +149,55 @@ def store(conn: sqlite3.Connection, sha256: str, ex: extract.Extracted) -> None:
             " note = excluded.note, created_at = excluded.created_at",
             (sha256, ex.method, ex.text, ex.note, utcnow()),
         )
+
+
+# どの存在中のファイルの内容でもなくなった本文を、消えてからこの日数だけ残す
+# （この間に同じ内容のファイルが戻ってくれば、読み直さずに済む。内容ハッシュで移動を結び付ける期間の既定と同じ）
+ORPHAN_DAYS = 30
+
+
+def prune(conn: sqlite3.Connection, config: Config, *, keep_days: int = ORPHAN_DAYS) -> int:
+    """要らなくなった本文（と読み取りの結果）を消し、消した本文の数を返す。
+
+    - 書き換えた・削除したファイルの古い本文: その内容ハッシュを持つファイルが今は無く、消えてから keep_days 日を過ぎたもの
+      （消したはずの内容が検索に出続けないように。索引の肥大も防ぐ）
+    - 「本文を索引に入れない」にしたフォルダ（F-EX-7）の中にしか無い内容の本文（切り替える前に読み取った分）
+
+    読めなかった記録（method = error・none など）も同じ基準で消える（対応するファイルが無くなれば不要）。
+    """
+    import datetime as dt
+
+    cutoff = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=keep_days)).isoformat(timespec="seconds")
+    # 索引に入れないフォルダの中にしか無い内容（どのルートでも、外に同じ内容のファイルが1つも無いもの）
+    inside: set[str] = set()
+    outside: set[str] = set()
+    for row in conn.execute("SELECT id FROM roots").fetchall():
+        closed = [unicodedata.normalize("NFC", p) for p in _no_extract(config, int(row["id"]), conn)]
+        for r in conn.execute(
+            "SELECT e.sha256, e.relpath FROM entries e JOIN extracts x ON x.sha256 = e.sha256"
+            " WHERE e.root_id = ? AND e.gone_at IS NULL AND e.is_dir = 0",
+            (int(row["id"]),),
+        ):
+            rel = unicodedata.normalize("NFC", str(r["relpath"]))
+            (inside if any(rel.startswith(c + "/") for c in closed) else outside).add(str(r["sha256"]))
+    closed_only = sorted(inside - outside)
+    removed = 0
+    with conn:
+        for i in range(0, len(closed_only), 500):
+            chunk = closed_only[i : i + 500]
+            removed += conn.execute(f"DELETE FROM extracts WHERE sha256 IN ({','.join('?' * len(chunk))})", chunk).rowcount
+        live = "SELECT sha256 FROM entries WHERE sha256 IS NOT NULL AND (gone_at IS NULL OR gone_at >= ?)"
+        removed += conn.execute(f"DELETE FROM extracts WHERE sha256 NOT IN ({live})", (cutoff,)).rowcount
+        conn.execute(f"DELETE FROM analyses WHERE sha256 NOT IN ({live})", (cutoff,))
+    if removed:
+        log.info("要らなくなった本文を索引から消しました: %s 件", f"{removed:,}")
+    return removed
+
+
+def retry_errors(conn: sqlite3.Connection) -> int:
+    """読めなかった記録（時間切れ・壊れたファイルなど。書き起こしの失敗も含む）を消し、次の抽出で読み直させる。消した数を返す。"""
+    with conn:
+        return conn.execute("DELETE FROM extracts WHERE method = 'error'").rowcount
 
 
 def extract_item(root: Path, item: Pending, cfg: ExtractConfig, ocr_lang: str | None) -> extract.Extracted | None:
@@ -411,6 +461,10 @@ def snippets(conn: sqlite3.Connection, shas: Iterable[str], terms: list[str], wi
 # ---------- 裏で抽出し続ける ----------
 
 
+# 裏の処理が、要らなくなった本文を掃除する間隔（秒）
+PRUNE_INTERVAL = 24 * 3600.0
+
+
 class ExtractWorker:
     """Web の画面を動かしている間、裏で本文を抽出し続ける（[extract] enabled）。
 
@@ -446,6 +500,8 @@ class ExtractWorker:
         self._thread: threading.Thread | None = None
         self.current: str | None = None
         self.done = 0
+        # 要らなくなった本文を最後に掃除した時刻（time.monotonic）
+        self._pruned_at: float | None = None
 
     def start(self) -> None:
         """裏のスレッドを始める。"""
@@ -504,6 +560,10 @@ class ExtractWorker:
                     self.done += 1
                 if items:
                     return True
+            # 抽出するものが無い。要らなくなった本文を、1日に1回だけ掃除する
+            if self._pruned_at is None or time.monotonic() - self._pruned_at >= PRUNE_INTERVAL:
+                self._pruned_at = time.monotonic()
+                prune(conn, config)
             return False
         finally:
             self.current = None

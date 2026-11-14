@@ -58,14 +58,27 @@ def _run(cmd: list[str], timeout: float = 60) -> subprocess.CompletedProcess[byt
     return subprocess.run(cmd, capture_output=True, timeout=timeout, check=False)
 
 
-def _decode(data: bytes) -> str:
-    """文字コードを推測して読む（UTF-8 → Shift_JIS 系 → 置き換え）。"""
+def _decode(data: bytes, truncated: bool = False) -> str:
+    """文字コードを推測して読む（UTF-8 → Shift_JIS 系 → 置き換え）。
+
+    Args:
+        truncated: ファイルの途中で切ったデータか。切れ目が複数バイトの文字の途中だと、正しい文字コードでも
+            復号に失敗して全文が化けるので、末尾を数バイトまで削って試す。
+    """
     for enc in ("utf-8-sig", "cp932", "euc-jp"):
-        try:
-            return data.decode(enc)
-        except UnicodeDecodeError:
-            continue
+        for cut in range(4 if truncated else 1):
+            try:
+                return data[: len(data) - cut].decode(enc)
+            except UnicodeDecodeError:
+                continue
     return data.decode("utf-8", errors="replace")
+
+
+def _read_head(path: Path, limit: int) -> str:
+    """テキストファイルの先頭 limit バイトを読んで復号する。"""
+    with path.open("rb") as f:
+        data = f.read(limit + 1)
+    return _decode(data[:limit], truncated=len(data) > limit)
 
 
 def _squeeze(text: str, limit: int) -> str:
@@ -103,17 +116,17 @@ def extract(path: Path, max_chars: int = 4000, use_images: bool = True) -> Extra
         if ext in OFFICE_PARTS:
             parts: list[str] = []
             with zipfile.ZipFile(path) as z:
-                for name in sorted(z.namelist()):
-                    if OFFICE_PARTS[ext].match(name):
-                        xml = z.read(name).decode("utf-8", errors="replace")
+                for info in sorted(z.infolist(), key=lambda i: i.filename):
+                    if OFFICE_PARTS[ext].match(info.filename):
+                        if info.file_size > MAX_OFFICE_PART:
+                            return Extracted("none", note=f"中の XML が大きすぎる: {info.filename}")
+                        xml = z.read(info).decode("utf-8", errors="replace")
                         # 段落・行の区切りを改行にしてから、タグを除く
                         xml = re.sub(r"</(w:p|a:p|si)>", "\n", xml)
                         parts.append(re.sub(r"<[^>]+>", "", xml))
             return Extracted("office", _squeeze("\n".join(parts), max_chars))
         if ext in TEXT_EXTS:
-            with path.open("rb") as f:
-                data = f.read(max_chars * 4)
-            return Extracted("text", _squeeze(_decode(data), max_chars))
+            return Extracted("text", _squeeze(_read_head(path, max_chars * 4), max_chars))
         if ext in IMAGE_EXTS:
             if not use_images:
                 return Extracted("none", note="画像（モデルに見せない設定）")
@@ -278,9 +291,7 @@ def extract_text(
                     parts.append(html.unescape(re.sub(r"<[^>]+>", "", xml)))
             return Extracted("office", normalize_text("\n".join(parts), max_chars))
         if ext in TEXT_EXTS:
-            with path.open("rb") as f:
-                data = f.read(max_chars * 4)
-            return Extracted("text", normalize_text(_decode(data), max_chars))
+            return Extracted("text", normalize_text(_read_head(path, max_chars * 4), max_chars))
         if ext in OCR_IMAGE_EXTS and ocr_images:
             if not ocr_lang:
                 return Extracted("scan", note="画像（OCR を使えるようになったら読み直す）")

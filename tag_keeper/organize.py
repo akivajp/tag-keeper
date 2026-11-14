@@ -34,11 +34,11 @@ from typing import Any, TypeVar
 
 from tag_keeper import rules
 from tag_keeper.catalog import utcnow
-from tag_keeper.config import OrganizeConfig
+from tag_keeper.config import OrganizeConfig, RootConfig
 from tag_keeper.extract import Extracted, extract
 from tag_keeper.decisions import DecisionLog, ExampleIndex, load_examples
 from tag_keeper.hashing import sha256_file
-from tag_keeper.tags import TagError, normalize_tag
+from tag_keeper.tags import TagError, TagStore, normalize_tag
 from tag_keeper.textindex import TfIdf, bigrams
 
 log = logging.getLogger(__name__)
@@ -67,6 +67,9 @@ class ModelUnavailable(OllamaError):
 
 # 応答しなかったモデルに、この秒数のあいだは問い合わせず、手元のモデルを使う（1件ごとに失敗を待たないため）
 UNAVAILABLE_COOLDOWN = 600.0
+# 送った内容のほうが悪いことを表す HTTP の状態（読めない画像・大きすぎる入力など）。そのファイルだけの失敗にして、
+# モデルが応答しない扱い（しばらく手元のモデルに切り替える）にはしない
+REQUEST_ERRORS = frozenset({400, 413, 415, 422})
 # 応答しなかったモデル → 再び問い合わせてよくなる時刻（time.monotonic）
 _unavailable_until: dict[str, float] = {}
 
@@ -309,6 +312,18 @@ def parse_json_answer(text: str) -> dict[str, Any]:
     raise OllamaError(f"モデルの答えを JSON として読めません: {text[:200]}")
 
 
+def _http_failure(e: urllib.error.HTTPError, where: str, model: str) -> OllamaError:
+    """HTTP のエラーを例外にする。入力が悪いだけなら OllamaError、それ以外は ModelUnavailable（手元のモデルに切り替える合図）。"""
+    try:
+        detail = e.read(500).decode("utf-8", errors="replace").strip()
+    except OSError:
+        detail = ""
+    message = f"{where} が HTTP {e.code} を返しました（{model}）" + (f": {detail[:200]}" if detail else "")
+    if e.code in REQUEST_ERRORS:
+        return OllamaError(message)
+    return ModelUnavailable(message, model)
+
+
 def effective_think(config: OrganizeConfig, model: str) -> str:
     """そのモデルに使う思考の設定（think があればそれ、無ければ手元のモデルには local_think）。
 
@@ -317,7 +332,7 @@ def effective_think(config: OrganizeConfig, model: str) -> str:
     """
     if config.think:
         return config.think
-    if model.endswith("@") or not sends_outside(config, model):
+    if model.endswith("@") or not is_cloud_model(model):
         return config.local_think
     return ""
 
@@ -377,8 +392,12 @@ def openai_generate(base_url: str, model: str, config: OrganizeConfig, prompt: s
     try:
         with urllib.request.urlopen(req, timeout=config.timeout) as res:
             data = json.load(res)
+    except urllib.error.HTTPError as e:
+        raise _http_failure(e, base_url, f"{model}@") from e
     except (urllib.error.URLError, TimeoutError, OSError) as e:
         raise ModelUnavailable(f"{base_url} に問い合わせられません: {e}", f"{model}@") from e
+    except ValueError as e:
+        raise OllamaError(f"{base_url} の答えを JSON として読めません: {e}") from e
     try:
         text = str(data["choices"][0]["message"].get("content") or "")
     except (KeyError, IndexError, TypeError) as e:
@@ -427,9 +446,16 @@ def ollama_generate(
     try:
         with urllib.request.urlopen(req, timeout=config.timeout) as res:
             data = json.load(res)
+    except urllib.error.HTTPError as e:
+        # クラウドの利用上限（429）などは手元のモデルに切り替える合図に、入力が悪いだけ（400 など）はそのファイルの失敗にする
+        raise _http_failure(e, f"ollama（{config.ollama_url}）", body["model"]) from e
     except (urllib.error.URLError, TimeoutError, OSError) as e:
-        # クラウドの利用上限（429）・ollama が止まっている・時間切れなど。手元のモデルに切り替える合図にする
+        # ollama が止まっている・時間切れなど。手元のモデルに切り替える合図にする
         raise ModelUnavailable(f"ollama に問い合わせられません（{config.ollama_url}・{body['model']}）: {e}", body["model"]) from e
+    except ValueError as e:
+        raise OllamaError(f"ollama の答えを JSON として読めません: {e}") from e
+    if not isinstance(data, dict):
+        raise OllamaError(f"ollama の答えの形が想定と違います: {str(data)[:200]}")
     return parse_json_answer(str(data.get("response", "")))
 
 
@@ -488,6 +514,7 @@ def image_model(config: OrganizeConfig) -> str | None:
 
 def is_cloud_model(name: str) -> bool:
     """ollama のクラウドのモデルか（内容が外部に送られる）。"""
+    name = name.lower()
     return name.endswith(":cloud") or name.endswith("-cloud") or ":cloud" in name
 
 
@@ -499,6 +526,12 @@ def model_for_root(config: OrganizeConfig, allow_cloud: bool, requested: str | N
     """
     model = requested or config.model
     if not allow_cloud and sends_outside(config, model):
+        if not config.local_model or sends_outside(config, config.local_model):
+            # 代わりの local_model もクラウドのモデルか、手元でない送り先（ollama_url を含む）。送ってしまわずに断る
+            raise OllamaError(
+                "このルートは内容を外部へ送らない設定（allow_cloud = false）ですが、[organize] local_model"
+                f"（{config.local_model or '未設定'}）も手元のモデルではありません。手元の ollama のモデルか、手元の送り先のモデルを設定してください"
+            )
         return config.local_model, f"このルートは内容を外部へ送らない設定なので、{model} の代わりに {config.local_model} を使います"
     return model, ""
 
@@ -515,11 +548,25 @@ def config_for_root(config: OrganizeConfig, allow_cloud: bool, requested: str | 
 
 
 def sends_outside(config: OrganizeConfig, model: str) -> bool:
-    """そのモデルに問い合わせると、内容が手元の外へ出るか（ollama のクラウドのモデルか、手元でない送り先）。"""
+    """そのモデルに問い合わせると、内容が手元の外へ出るか（ollama のクラウドのモデルか、手元でない送り先）。
+
+    ollama のモデルは、ollama_url が手元（ループバック・LAN・Tailscale）でなければ、名前に関係なく外へ出る。
+    """
     ep = endpoint_of(config, model)
     if ep is not None:
         return not _is_local_url(ep[0])
-    return is_cloud_model(model)
+    return is_cloud_model(model) or not _is_local_url(config.ollama_url)
+
+
+def prompt_tag_counts(tags: TagStore, roots: Iterable[RootConfig], config: OrganizeConfig) -> Counter[str]:
+    """指示文に「既存のタグ」として載せるタグと件数。
+
+    タグの名前には取引先の名前などが入る。外へ送るモデルを使うときは、外部へ送らないルート（allow_cloud = false）で
+    しか使っていないタグを載せない（そのルートの分を数えない）。
+    """
+    if any(m and sends_outside(config, m) for m in (config.model, config.vision_model)):
+        return tags.all_tags(roots=[r.name for r in roots if r.allow_cloud])
+    return tags.all_tags()
 
 
 def fallback_config(config: OrganizeConfig) -> OrganizeConfig | None:
@@ -527,9 +574,14 @@ def fallback_config(config: OrganizeConfig) -> OrganizeConfig | None:
 
     画像のモデルも、外へ送るものなら外す（手元のモデルが画像を読めれば、それで読む）。
     """
+    import dataclasses
+
     if not config.fallback or not config.local_model or config.model == config.local_model:
         return None
-    return config_for_root(config, False, config.local_model)[0]
+    vision = config.vision_model
+    if vision and sends_outside(config, vision):
+        vision = ""
+    return dataclasses.replace(config, model=config.local_model, vision_model=vision)
 
 
 def fallback_model(config: OrganizeConfig) -> str:
@@ -640,7 +692,19 @@ NAMING_PROMPT = """あなたはファイルの整理を手伝います。次の�
 # 答え方（JSON）
 {{"date": "YYYYMMDD または null", "date_source": "content / file_date / none", "title": "題名", "new_name": "拡張子なしの新しい名前", "summary": "一文の要約", "doc_type": "書類の種類（請求書・領収書・契約書・写真・スクリーンショットなど）", "destinations": [{{"index": 候補の番号, "reason": "理由"}}], "tags": ["名前空間:値"]}}"""
 
-_BAD_CHARS = re.compile(r'[\\/:*?"<>|\x00-\x1f]')
+# ファイル名に使わない文字: 区切り・Windows で使えない記号・制御文字（DEL を含む）・文字の向きを変える制御文字
+_BAD_CHARS = re.compile(r'[\\/:*?"<>|\x00-\x1f\x7f\u202a-\u202e\u2066-\u2069]')
+# 名前（拡張子を除く）の上限。文字数と、UTF-8 でのバイト数（日本語は1文字3バイト。名前の上限は多くの所で 255 バイト）
+NAME_MAX_CHARS = 150
+NAME_MAX_BYTES = 200
+
+
+def _truncate_name(stem: str) -> str:
+    """名前を上限の文字数・バイト数に切る（文字の途中では切らない）。"""
+    stem = stem[:NAME_MAX_CHARS]
+    while len(stem.encode("utf-8")) > NAME_MAX_BYTES:
+        stem = stem[:-1]
+    return stem.rstrip(" .")
 
 
 def clean_name(new_name: str, original: str) -> str:
@@ -653,7 +717,7 @@ def clean_name(new_name: str, original: str) -> str:
     stem = re.sub(r"\s+", " ", stem)
     if not stem:
         stem = Path(original).stem
-    return stem[:150] + ext
+    return (_truncate_name(stem) or Path(original).stem) + ext
 
 
 @dataclass
@@ -819,7 +883,8 @@ def suggest_file(
         if tag not in sug.tags and len(sug.tags) < 5:
             sug.tags.append(tag)
     seen: set[str] = set()
-    for d in out.get("destinations") or []:
+    dests = out.get("destinations")
+    for d in dests if isinstance(dests, list) else []:
         try:
             i = int(d.get("index")) if isinstance(d, dict) else int(d)
         except (TypeError, ValueError):

@@ -156,8 +156,12 @@ class SuggestQueue:
         tags = self.tags(config)
         scan_id = conn.execute("SELECT MAX(id) FROM scans WHERE root_id = ?", (root_id,)).fetchone()[0]
         log_stamp = tuple((f.name, f.stat().st_size) for f in sorted(decisions.log_dir.glob("*.jsonl"))) if decisions.log_dir.exists() else ()
-        stamp = (scan_id, log_stamp, sum(tags.all_tags().values()))
-        hit = self._contexts.get(root_name)
+        # 指示文に載せる既存のタグ（外へ送るモデルのときは、外部へ送らないルートのタグを除く）
+        tag_counts = organize.prompt_tag_counts(tags, config.roots, oc)
+        # 材料は、ルートと「外へ送るモデルか」の組ごとに持つ（手元のモデル用の材料を、外へ送るモデルに使い回さない）
+        key = f"{root_name}\0{int(organize.sends_outside(oc, oc.model))}"
+        stamp = (scan_id, log_stamp, sum(tag_counts.values()))
+        hit = self._contexts.get(key)
         if hit is not None and hit[1] == stamp and time.time() - hit[0] < CONTEXT_TTL:
             return hit[2]
         rc = config.find_root(root_name)
@@ -168,10 +172,10 @@ class SuggestQueue:
         types = tags.dir_types_of(rc.name)
         excluded += dirtypes.closed_dirs(conn, root_id, types)
         ctx = organize.build_context(
-            conn, root_id, rc.name, oc, excluded, decisions=decisions, tag_counts=tags.all_tags(),
+            conn, root_id, rc.name, oc, excluded, decisions=decisions, tag_counts=tag_counts,
             inbox_dirs=dirtypes.inbox_dirs(types), cards=tags.dir_cards_of(rc.name),
         )
-        self._contexts[root_name] = (time.time(), stamp, ctx)
+        self._contexts[key] = (time.time(), stamp, ctx)
         return ctx
 
     def _process(self, conn: Any, req: Request) -> organize.Suggestion:

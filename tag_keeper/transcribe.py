@@ -24,6 +24,7 @@ import sys
 import sysconfig
 import tempfile
 import threading
+import time
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from pathlib import Path
@@ -113,6 +114,21 @@ def _fmt_time(sec: float) -> str:
 # ---------- 子のプロセス（faster-whisper を読み込む側） ----------
 
 
+def media_duration(path: str) -> float | None:
+    """音声・動画の長さ（秒）を、中身をデコードせずに読む。分からなければ None。
+
+    faster-whisper は書き起こしの前に全体を float32 にデコードする（10時間の録音で約 2.3GB）。
+    上限より長いものを飛ばす判定は、その前に済ませる。
+    """
+    try:
+        import av  # faster-whisper の依存として入っている
+
+        with av.open(path) as container:
+            return container.duration / 1_000_000 if container.duration else None
+    except Exception:  # noqa: BLE001 - 長さを読めないだけなら、これまでどおり書き起こしの中で判定する
+        return None
+
+
 def _child(job_file: Path, out_file: Path) -> int:
     """子のプロセスの本体。job_file の設定とファイルの一覧を読み、1件ずつ書き起こして out_file に JSONL で書く。"""
     job = json.loads(job_file.read_text(encoding="utf-8"))
@@ -123,9 +139,19 @@ def _child(job_file: Path, out_file: Path) -> int:
 
     model = WhisperModel(opts.model, device=device, device_index=opts.device_index, compute_type=compute)
     with out_file.open("a", encoding="utf-8") as out:
+        # モデルを読み込めた印（親は、これより前に落ちたら「どのファイルのせいでもない失敗」として扱う）
+        out.write(json.dumps({"ready": True}) + "\n")
+        out.flush()
         for path in job["paths"]:
             res: dict[str, Any] = {"path": path, "device": device}
             try:
+                length = media_duration(path)
+                if length is not None and length > opts.max_minutes * 60:
+                    res["duration"] = length
+                    res["skipped"] = f"{int(length // 60)} 分あり、上限（{opts.max_minutes} 分）より長い"
+                    out.write(json.dumps(res, ensure_ascii=False) + "\n")
+                    out.flush()
+                    continue
                 segments, info = model.transcribe(
                     path,
                     language=opts.language or None,
@@ -160,7 +186,15 @@ def child_command() -> list[str]:
 
 
 def run_batch(paths: list[Path], opts: Options, *, on_result: Callable[[Result], None] | None = None, timeout: float = 6 * 3600) -> list[Result]:
-    """ファイルをまとめて、別のプロセスで書き起こす。GPU のプロセスが途中で落ちたら、残りを CPU でやり直す。"""
+    """ファイルをまとめて、別のプロセスで書き起こす。GPU のプロセスが途中で落ちたら、残りを CPU でやり直す。
+
+    最後の手段（CPU）のプロセスも途中で止まったら、そのとき扱っていた1件だけを失敗にする。残りは結果を返さない
+    （失敗として保存されず、次の機会に試される）。モデルを読み込む前に止まったとき（ダウンロードの失敗など）は、
+    どのファイルのせいでもないので、1件も失敗にしない。
+
+    Args:
+        timeout: 1つのプロセスに許す時間（秒）。過ぎたら止めて、途中で止まったものとして扱う。
+    """
     results: dict[str, Result] = {}
     todo = [str(p) for p in paths]
     devices = [resolve_device(opts)]
@@ -170,7 +204,7 @@ def run_batch(paths: list[Path], opts: Options, *, on_result: Callable[[Result],
         if not todo:
             break
         with tempfile.TemporaryDirectory(prefix="tag-keeper-transcribe-") as tmp:
-            job_file, out_file = Path(tmp) / "job.json", Path(tmp) / "out.jsonl"
+            job_file, out_file, err_file = Path(tmp) / "job.json", Path(tmp) / "out.jsonl", Path(tmp) / "stderr.txt"
             job_file.write_text(json.dumps({"options": opts.__dict__, "device": device, "paths": todo}, ensure_ascii=False), encoding="utf-8")
             env = dict(os.environ)
             if device == "cuda":
@@ -179,8 +213,14 @@ def run_batch(paths: list[Path], opts: Options, *, on_result: Callable[[Result],
             # 他の処理の邪魔をしないよう、優先度を下げる
             cmd = (["nice", "-n", "10"] if shutil.which("nice") else []) + child_command() + [str(job_file), str(out_file)]
             seen = 0
+            started = False  # モデルを読み込めたか（印か、1件でも結果があれば）
+            timed_out = False
+            proc: subprocess.Popen[bytes] | None = None
+            deadline = time.monotonic() + timeout
             try:
-                proc = subprocess.Popen(cmd, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+                # stderr はファイルに書かせる（パイプだと、子が多く書いたときに親が読まずに双方が止まる）
+                with err_file.open("wb") as err:
+                    proc = subprocess.Popen(cmd, env=env, stdout=subprocess.DEVNULL, stderr=err)
                 # 結果のファイルを読みながら待つ（1件ごとに知らせる）
                 while True:
                     try:
@@ -192,6 +232,9 @@ def run_batch(paths: list[Path], opts: Options, *, on_result: Callable[[Result],
                         lines = out_file.read_text(encoding="utf-8").splitlines()
                         for line in lines[seen:]:
                             d = json.loads(line)
+                            started = True
+                            if "path" not in d:
+                                continue  # モデルを読み込めた印
                             r = Result(d["path"], d.get("text", ""), d.get("language", ""), float(d.get("duration") or 0), d.get("error", ""), d.get("skipped", ""))
                             results[r.path] = r
                             if on_result is not None:
@@ -199,20 +242,35 @@ def run_batch(paths: list[Path], opts: Options, *, on_result: Callable[[Result],
                         seen = len(lines)
                     if done:
                         break
-                stderr = proc.stderr.read() if proc.stderr else ""
+                    if time.monotonic() > deadline:
+                        timed_out = True
+                        break
                 code = proc.returncode
             except OSError as e:
-                stderr, code = str(e), -1
+                err_file.write_text(str(e), encoding="utf-8")
+                code = -1
+            finally:
+                # 時間切れのときや、結果の保存で例外が出たときに、子のプロセスを残さない
+                if proc is not None and proc.poll() is None:
+                    proc.kill()
+                    proc.wait()
+            try:
+                stderr = err_file.read_text(encoding="utf-8", errors="replace")[-4000:]
+            except OSError:
+                stderr = ""
             todo = [p for p in todo if p not in results]
             if todo:
-                last = (stderr.strip().splitlines() or [f"終了コード {code}"])[-1][:300]
+                last = "時間切れ" if timed_out else (stderr.strip().splitlines() or [f"終了コード {code}"])[-1][:300]
                 log.warning("書き起こしのプロセスが途中で止まりました（%s・残り %d 件）: %s", device, len(todo), last)
                 if device == devices[-1]:
-                    for p in todo:
-                        r = Result(p, error=f"書き起こしのプロセスが止まりました: {last}")
-                        results[p] = r
-                        if on_result is not None:
-                            on_result(r)
+                    if not started:
+                        log.error("書き起こしを始められませんでした（モデルを読み込めないなど）。直してからやり直してください: %s", last)
+                        break
+                    # 止まったときに扱っていた1件だけを失敗にする。残りは次の機会に試す
+                    r = Result(todo[0], error=f"書き起こしのプロセスが止まりました: {last}")
+                    results[r.path] = r
+                    if on_result is not None:
+                        on_result(r)
     return [results[str(p)] for p in paths if str(p) in results]
 
 

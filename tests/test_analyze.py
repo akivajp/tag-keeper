@@ -242,3 +242,100 @@ def test_check_falls_back_when_endpoint_is_down(monkeypatch: pytest.MonkeyPatch)
     organize.check_ollama(oc)
     assert checked == ["qwen@strata", "gemma4:12b"]
     assert organize.active_config(oc)[0].model == "gemma4:12b"
+
+
+def test_what_counts_as_sending_content_outside() -> None:
+    """手元かどうかは、モデルの名前だけでなく ollama の置き場所でも決まる。代わりのモデルも外へ出るなら、送らずに断る。"""
+    oc = OrganizeConfig(model="gemma4:12b")
+    assert not organize.sends_outside(oc, "gemma4:12b")
+    assert organize.sends_outside(oc, "gemma4:31b-CLOUD") and organize.is_cloud_model("glm:Cloud")
+    # 手元でない ollama に置いたモデルは、名前に関係なく外へ出る
+    far = dataclasses_replace(oc, ollama_url="https://ollama.example.com")
+    assert organize.sends_outside(far, "gemma4:12b")
+    with pytest.raises(organize.OllamaError, match="allow_cloud"):
+        organize.config_for_root(far, False)
+    # LAN・Tailscale の ollama は手元
+    assert not organize.sends_outside(dataclasses_replace(oc, ollama_url="http://192.168.1.5:11434"), "gemma4:12b")
+    assert not organize.sends_outside(dataclasses_replace(oc, ollama_url="http://zefat.tail70f1a2.ts.net:11434"), "gemma4:12b")
+    # local_model にクラウドのモデルを書いてしまったら、外部へ送らないルートでは使わない
+    wrong = OrganizeConfig(model="gemma4:31b-cloud", local_model="glm-5.3-flash:cloud")
+    with pytest.raises(organize.OllamaError, match="local_model"):
+        organize.config_for_root(wrong, False)
+    assert organize.config_for_root(wrong, True)[0].model == "gemma4:31b-cloud"
+
+
+def test_tags_of_local_only_roots_stay_out_of_prompts_sent_outside(tmp_path: Path) -> None:
+    store = TagStore(tmp_path / "tags")
+    store.add("work", ["a.pdf"], "会社:極秘クライアント")
+    store.add("personal", ["b.pdf"], "種別:請求書")
+    roots = [RootConfig("work", tmp_path / "w", allow_cloud=False), RootConfig("personal", tmp_path / "p")]
+    cloud = OrganizeConfig(model="gemma4:31b-cloud")
+    assert set(organize.prompt_tag_counts(store, roots, cloud)) == {"種別:請求書"}
+    # 手元のモデルなら、どのルートのタグも使う
+    assert set(organize.prompt_tag_counts(store, roots, OrganizeConfig(model="gemma4:12b"))) == {"会社:極秘クライアント", "種別:請求書"}
+    # 画像のモデルだけが外へ送るときも除く
+    assert set(organize.prompt_tag_counts(store, roots, OrganizeConfig(model="gemma4:12b", vision_model="qwen-vl:cloud"))) == {"種別:請求書"}
+
+
+def test_a_bad_request_does_not_switch_every_file_to_the_local_model(monkeypatch: pytest.MonkeyPatch) -> None:
+    """1つのファイルの入力が悪いだけ（HTTP 400）なら、そのファイルの失敗にする。モデルが応答しない扱いにはしない。"""
+    import io
+    import urllib.error
+
+    monkeypatch.setattr(organize, "_unavailable_until", {})
+    code = 400
+
+    def fake_urlopen(req: object, timeout: float = 0) -> object:
+        raise urllib.error.HTTPError("http://x", code, "err", {}, io.BytesIO(b'{"error": "image: unknown format"}'))  # type: ignore[arg-type]
+
+    monkeypatch.setattr(organize.urllib.request, "urlopen", fake_urlopen)
+    oc = OrganizeConfig(model="big-cloud", local_model="gemma4:12b", endpoints={"strata": "http://127.0.0.1:18080/v1"})
+    for model in ("big-cloud", "qwen@strata"):
+        with pytest.raises(organize.OllamaError) as e:
+            organize.with_fallback(dataclasses_replace(oc, model=model), lambda c: organize.ollama_generate(c, "読んで"))
+        assert not isinstance(e.value, organize.ModelUnavailable) and "unknown format" in str(e.value)
+    assert organize._unavailable_until == {}
+    code = 429  # 利用上限は、これまでどおり手元のモデルに切り替える合図
+    with pytest.raises(organize.ModelUnavailable):
+        organize.ollama_generate(oc, "読んで")
+
+
+def test_names_from_the_model_fit_in_a_file_name() -> None:
+    name = organize.clean_name("請求書" * 100, "scan.PDF")
+    assert name.endswith(".pdf") and len(name.encode("utf-8")) <= 255 and name.startswith("請求書請求書")
+    # 文字の向きを変える制御文字や DEL は名前に入れない
+    assert organize.clean_name("invoice‮gnp\x7f", "a.exe") == "invoice_gnp_.exe"
+    assert organize.clean_name("...", "元の名前.txt") == "元の名前.txt"
+
+
+def test_odd_answers_do_not_break_reading(conn: sqlite3.Connection, root_id: int, root: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """配列でない labels・数でない金額は捨てる。モデルが応答しない失敗は保存せず、動くようになってから読み取る。"""
+    d = analyze.normalize_document({"labels": 3, "amount": "NaN"})
+    assert d["labels"] == [] and d["amount"] is None
+    assert analyze.normalize_image({"labels": "風景"})["labels"] == []
+    assert analyze.normalize_document({"amount": "inf"})["amount"] is None
+
+    write(root / "inv.txt", "請求書 合計 12,345円")
+    write(root / "repo" / "README.txt", "リポジトリの説明")
+    scan_root(conn, root_id, root, SAFETY)
+    hash_root(conn, root_id, root)
+    rc = RootConfig(name="test", path=root)
+    config = Config(roots=[rc])
+    config.tags.dir = tmp_path / "tags"
+    fulltext.run_pending(conn, root_id, root, config)
+    # 本文を索引に入れないフォルダの中は、読み取りの対象にもしない
+    TagStore(config.tags.dir).set_extract("test", "repo", False)
+    assert [t.relpath for t in analyze.pending(conn, root_id, no_extract=["repo"])] == ["inv.txt"]
+
+    def down(oc: OrganizeConfig, prompt: str, image: bytes | None = None, **kw: object) -> dict:
+        raise organize.ModelUnavailable("ollama に問い合わせられません", oc.model)
+
+    monkeypatch.setattr(organize, "_unavailable_until", {})
+    monkeypatch.setattr(organize, "ollama_generate", down)
+    config.organize.fallback = False
+    with pytest.raises(organize.ModelUnavailable):
+        analyze.run_pending(conn, root_id, rc, config)
+    assert conn.execute("SELECT COUNT(*) FROM analyses").fetchone()[0] == 0  # 失敗として保存していない
+    monkeypatch.setattr(organize, "ollama_generate", lambda oc, prompt, image=None, **kw: {"doc_type": "請求書", "labels": 3})
+    done = analyze.run_pending(conn, root_id, rc, config)
+    assert [(a.error, a.data["doc_type"], a.data["labels"]) for a in done] == [("", "請求書", [])]

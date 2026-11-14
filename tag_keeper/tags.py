@@ -1213,11 +1213,12 @@ class TagStore:
                         implied[anc] = t
             return {"direct": direct, "inherited": inherited, "implied": [{"tag": k, "via": v} for k, v in sorted(implied.items())]}
 
-    def all_tags(self) -> Counter[str]:
-        """使われているタグと、直接付いている件数。"""
+    def all_tags(self, roots: Iterable[str] | None = None) -> Counter[str]:
+        """使われているタグと、直接付いている件数。roots を渡すと、そのルートのアイテムに付いた分だけを数える。"""
+        only = None if roots is None else set(roots)
         with self.lock:
             self.reload_if_changed()
-            return Counter(t for tags in self.items.values() for t in tags)
+            return Counter(t for (root, _path), tags in self.items.items() if only is None or root in only for t in tags)
 
     def items_with(self, tag: str, root: str | None = None) -> list[tuple[str, str]]:
         """そのタグが直接付いたアイテム（ルート名, 相対パス）。フォルダなら配下も検索結果になる。"""
