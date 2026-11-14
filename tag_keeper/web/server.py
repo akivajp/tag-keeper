@@ -272,6 +272,45 @@ def create_app(
             raise fail(409, str(e)) from e
         return job.to_dict()
 
+    def int_param(value: Any, default: int, name: str) -> int:
+        """リクエストの数の項目を読む。無ければ default、数でなければ 400（500 にしない）。"""
+        if value is None or value == "":
+            return default
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            raise fail(400, f"{name} は整数にしてください: {value!r}") from None
+
+    def ensure_idle() -> None:
+        """別のジョブが動いていれば 409。プランを書いたり、判断を記録したりする前に断るために使う。"""
+        job = jobs.latest()
+        if job is not None and jobs.busy():
+            raise fail(409, f"別の処理が動いています: {job.title}")
+
+    def ensure_not_running(plan_id: str) -> None:
+        """そのプランを対象にしたジョブ（実行・取り消しなど）が動いていれば 409。
+
+        実行を始めてから最初の実行記録が書かれるまで（スナップショットと同期の待ち）は、状態が「下書き」に見える。
+        その間に編集・削除されると、動かしたものを画面から取り消せなくなる。
+        """
+        job = jobs.latest()
+        if job is not None and jobs.busy() and job.target == plan_id:
+            raise fail(409, f"このプランは処理の途中です: {job.title}")
+
+    # 同じ秒に作ったプランが同じ ID になり、前のプランを上書きしないようにする
+    plan_save_lock = threading.Lock()
+
+    def save_new_plan(plan: Plan) -> Path:
+        """新しいプランを書き出す。同じ ID のプランか実行記録が既にあれば、ID に連番を足す。"""
+        with plan_save_lock:
+            base, n = plan.id, 1
+            while (settings.plans_dir / f"{plan.id}.toml").exists() or journal_path(settings.journal_dir, plan.id).exists():
+                n += 1
+                plan.id = f"{base}-{n}"
+            path = settings.plans_dir / f"{plan.id}.toml"
+            write_plan(plan, path)
+            return path
+
     # --- 画面（静的ファイル） ---
 
     @app.route("/")
@@ -422,14 +461,14 @@ def create_app(
     @app.route("/api/jobs/current")
     def api_job_current() -> dict[str, Any]:
         job = jobs.latest()
-        return {"job": job.to_dict(lines=int(bottle.request.query.get("lines", 50))) if job else None}
+        return {"job": job.to_dict(lines=int_param(bottle.request.query.get("lines"), 50, "lines")) if job else None}
 
     @app.route("/api/jobs/<job_id>")
     def api_job(job_id: str) -> dict[str, Any]:
         job = jobs.get(job_id)
         if job is None:
             raise fail(404, f"ジョブがありません: {job_id}")
-        return {"job": job.to_dict(lines=int(bottle.request.query.get("lines", 200)))}
+        return {"job": job.to_dict(lines=int_param(bottle.request.query.get("lines"), 200, "lines"))}
 
     # --- ルートに対する処理 ---
 
@@ -466,7 +505,7 @@ def create_app(
             rep.phase("対象の状態の記録", total=len(report.findings))
             plan = build_plan(report, rc.name, rc.path, categories, include_review=include_review)
             rep.set_done(len(report.findings))
-            write_plan(plan, settings.plans_dir / f"{plan.id}.toml")
+            save_new_plan(plan)
             return {"plan_id": plan.id, "ops": len(plan.ops)}
 
         return start("plan", f"プランの作成: {rc.name}", run, target=rc.name)
@@ -474,6 +513,7 @@ def create_app(
     @app.post("/api/plans/<plan_id>/skips")
     def api_plan_skips(plan_id: str) -> dict[str, Any]:
         path = plan_file(plan_id)
+        ensure_not_running(plan_id)
         if plan_info(path, settings.journal_dir).state != "draft":
             raise fail(409, "実行したプランは編集できません")
         skip = body().get("skip") or []
@@ -485,6 +525,7 @@ def create_app(
     @app.post("/api/plans/<plan_id>/delete")
     def api_plan_delete(plan_id: str) -> dict[str, Any]:
         path = plan_file(plan_id)
+        ensure_not_running(plan_id)
         if plan_info(path, settings.journal_dir).state != "draft":
             raise fail(409, "実行したプランは消せません（実行記録と対応しているため）")
         path.unlink()
@@ -703,7 +744,10 @@ def create_app(
             raise fail(404, f"ファイルがありません: {rel}")
         mime, inline = serve_kind(path)
         download = bool(q.get("download")) or not inline
-        res = bottle.static_file(path.name, root=str(path.parent), mimetype=mime, download=path.name if download else False)
+        res = bottle.static_file(path.name, root=str(path.parent), mimetype=mime, download=False)
+        if download and res.status_code in (200, 206):
+            # 名前は自分で組み立てる（改行などの制御文字を含む名前で 500 にしない。日本語の名前は filename* で正しく伝える）
+            res.set_header("Content-Disposition", content_disposition(path.name))
         if mime == "text/plain":
             res.set_header("Content-Type", "text/plain; charset=utf-8")
         return res
@@ -891,14 +935,15 @@ def create_app(
         conn = open_db()
         try:
             root_id = root_id_of(conn, rc)
-            row = conn.execute("SELECT relpath, sha256 FROM entries WHERE id = ? AND root_id = ?", (int(data.get("new_id", 0)), root_id)).fetchone()
+            new_id, old_id = int_param(data.get("new_id"), 0, "new_id"), int_param(data.get("old_id"), 0, "old_id")
+            row = conn.execute("SELECT relpath, sha256 FROM entries WHERE id = ? AND root_id = ?", (new_id, root_id)).fetchone()
             if row is None:
                 raise fail(404, "カタログに見つかりません")
             if data.get("skip"):
                 store.skip_relink(rc.name, str(row["relpath"]), str(row["sha256"] or ""))
                 return {"skipped": row["relpath"]}
             try:
-                old_rel, new_rel = link_move(conn, root_id, int(data.get("new_id", 0)), int(data.get("old_id", 0)))
+                old_rel, new_rel = link_move(conn, root_id, new_id, old_id)
             except ValueError as e:
                 raise fail(409, str(e)) from e
         finally:
@@ -919,7 +964,7 @@ def create_app(
         config = settings.config()
         rc = root_config(config, root)
         paths = [clean_relpath(str(p)) for p in data.get("paths") or []] or None
-        limit = max(1, min(int(data.get("limit") or 20), 500))
+        limit = max(1, min(int_param(data.get("limit"), 20, "limit"), 500))
 
         def run(rep: JobReporter) -> dict[str, Any]:
             conn = open_db()
@@ -957,7 +1002,7 @@ def create_app(
         config = settings.config()
         rc = root_config(config, root)
         paths = [clean_relpath(str(p)) for p in data.get("paths") or []] or None
-        limit = max(1, min(int(data.get("limit") or 10), 200))
+        limit = max(1, min(int_param(data.get("limit"), 10, "limit"), 200))
 
         def run(rep: JobReporter) -> dict[str, Any]:
             conn = open_db()
@@ -1064,7 +1109,7 @@ def create_app(
         if action == "dismiss":
             settings.snapwatch.dismiss(rc.name, str(data.get("newer", "")))
             return {"dismissed": True}
-        min_mb = max(1, int(data.get("min_mb") or 100))
+        min_mb = max(1, int_param(data.get("min_mb"), 100, "min_mb"))
 
         def run(rep: JobReporter) -> dict[str, Any]:
             conn = open_db()
@@ -1411,8 +1456,13 @@ def create_app(
         config = settings.config()
         rc = root_config(config, root)
         items = data.get("items") or []
+        if not isinstance(items, list) or not all(isinstance(it, dict) for it in items):
+            raise fail(400, "items は { path, dest } の配列にしてください")
         if not items:
             raise fail(400, "採用した提案がありません")
+        if data.get("apply"):
+            # すぐ実行する指定なのに別の処理が動いていれば、プランも採用の記録も残さずに断る
+            ensure_idle()
         plan = Plan(
             id=new_plan_id(rc.name, "organize"),
             root=rc.name,
@@ -1454,11 +1504,16 @@ def create_app(
             )
         if not plan.ops:
             raise fail(400, "動かすものがありません（名前も場所も変わらない）")
-        write_plan(plan, settings.plans_dir / f"{plan.id}.toml")
-        _log_accepts(settings, config, rc, plan, items)
+        plan_path = save_new_plan(plan)
         out: dict[str, Any] = {"plan_id": plan.id, "ops": len(plan.ops)}
         if data.get("apply"):
-            out["job"] = start_apply(plan)
+            try:
+                out["job"] = start_apply(plan)
+            except bottle.HTTPResponse:
+                # 確かめた後に別の処理が始まった。実行しなかったプランを残さない
+                plan_path.unlink(missing_ok=True)
+                raise
+        _log_accepts(settings, config, rc, plan, items)
         return out
 
     # --- 1件ずつの提案（待ち行列） ---
@@ -1559,7 +1614,7 @@ def create_app(
         mode = "or" if q.get("mode") == "or" else "and"
         word = q.getunicode("q", "").strip().lower()
         files_only = q.get("folders") != "1"
-        limit = max(1, min(int(q.get("limit", 500)), 5000))
+        limit = max(1, min(int_param(q.get("limit"), 500, "limit"), 5000))
         if not include and not exclude:
             raise fail(400, "タグを選んでください")
         conn = open_db()
@@ -1839,6 +1894,10 @@ def create_app(
         if op_kind not in ("rename", "move", "delete"):
             raise fail(400, f"操作が不明です: {op_kind}")
         items = data.get("items") or []
+        if not isinstance(items, list) or not all(isinstance(it, dict) for it in items):
+            raise fail(400, "items は { path } の配列にしてください")
+        # 別の処理が動いていれば、プランも「採用した」という記録も残さずに断る
+        ensure_idle()
         dest_dir = clean_relpath(str(data.get("dest_dir", ""))) if op_kind == "move" else ""
         if op_kind == "move":
             problem = rules.cloud_name_problem(dest_dir) if dest_dir else None
@@ -1904,11 +1963,17 @@ def create_app(
                 )
         if not plan.ops:
             raise fail(400, "変えるものがありません（名前も場所も同じ）")
-        write_plan(plan, settings.plans_dir / f"{plan.id}.toml")
+        plan_path = save_new_plan(plan)
+        try:
+            job = start_apply(plan)
+        except bottle.HTTPResponse:
+            # 確かめた後に別の処理が始まった。実行しなかったプランを残さない
+            plan_path.unlink(missing_ok=True)
+            raise
         if op_kind in ("rename", "move"):
-            # 利用者が決めた名前・置き場所は、提案の手本になる（ファイルだけ）
+            # 利用者が決めた名前・置き場所は、提案の手本になる（ファイルだけ）。実行を始められたときだけ記録する
             _log_accepts(settings, config, rc, plan, items, source=f"browser-{op_kind}")
-        return {"plan_id": plan.id, "ops": len(plan.ops), "job": start_apply(plan)}
+        return {"plan_id": plan.id, "ops": len(plan.ops), "job": job}
 
     # 予期できる失敗は 400 番台の JSON にして、画面にそのまま表示できるようにする
     def json_errors(callback: Any) -> Any:
@@ -1945,6 +2010,19 @@ def _local_models(oc: Any) -> list[str]:
         except (urllib.error.URLError, TimeoutError, OSError, ValueError, KeyError):
             continue
     return out
+
+
+def content_disposition(name: str) -> str:
+    """ダウンロードさせるときの Content-Disposition。
+
+    制御文字（改行など）は "_" にする。ASCII でない名前は、古いブラウザ向けの filename（ASCII だけ）と、
+    RFC 5987 の filename*（UTF-8 のパーセント符号化）の両方で伝える。
+    """
+    from urllib.parse import quote
+
+    clean = "".join(ch if ch >= " " and ch != "\x7f" else "_" for ch in name) or "download"
+    fallback = clean.encode("ascii", "replace").decode("ascii").replace('"', "_").replace("\\", "_")
+    return f"attachment; filename=\"{fallback}\"; filename*=UTF-8''{quote(clean, safe='')}"
 
 
 def _log_accepts(

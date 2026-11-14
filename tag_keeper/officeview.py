@@ -14,15 +14,22 @@ LibreOffice（soffice）が入っていれば、PDF に変換してレイアウ�
 from __future__ import annotations
 
 import datetime as dt
+import io
 import logging
+import os
 import re
 import shutil
+import signal
 import subprocess
 import tempfile
+import time
 import zipfile
+import zlib
+from collections.abc import Iterator
 from pathlib import Path, PurePosixPath
-from typing import Any
+from typing import IO, Any
 from xml.etree import ElementTree as ET
+from xml.parsers import expat
 
 log = logging.getLogger(__name__)
 
@@ -62,9 +69,65 @@ def _xml(z: zipfile.ZipFile, name: str) -> ET.Element | None:
     if info.file_size > MAX_PART_BYTES:
         raise OfficeError(f"中の部品が大きすぎます: {name}")
     data = z.read(name)
-    if b"<!DOCTYPE" in data or b"<!ENTITY" in data:
-        raise OfficeError(f"DTD を含む XML は読みません: {name}")
+    _refuse_dtd(io.BytesIO(data), name)
     return ET.fromstring(data)
+
+
+class _PrologEnd(Exception):
+    """XML の最初の要素まで読んだ（DTD はその前にしか書けないので、そこで確認を終える）。"""
+
+
+def _refuse_dtd(f: IO[bytes], name: str) -> None:
+    """DTD（実体の宣言）を含む XML なら OfficeError。
+
+    バイト列の中の "<!DOCTYPE" を探す方法は、UTF-16 で書かれた XML では素通りするので、XML として読んで確かめる。
+    DTD は最初の要素より前にしか書けないので、最初の要素まで読んだら終える。
+    """
+    parser = expat.ParserCreate()
+
+    def doctype(*_args: Any) -> None:
+        raise OfficeError(f"DTD を含む XML は読みません: {name}")
+
+    def first_element(*_args: Any) -> None:
+        raise _PrologEnd
+
+    parser.StartDoctypeDeclHandler = doctype
+    parser.StartElementHandler = first_element
+    try:
+        while chunk := f.read(65536):
+            parser.Parse(chunk, False)
+        parser.Parse(b"", True)
+    except _PrologEnd:
+        return
+    except expat.ExpatError as e:
+        raise ET.ParseError(str(e)) from e
+
+
+def _stream(z: zipfile.ZipFile, name: str, tag: str) -> Iterator[ET.Element]:
+    """ZIP の中の XML を先頭から順に読み、tag の要素を1つずつ返す（全体を木にしない。無ければ何も返さない）。
+
+    行数の多いシートは、展開すると数十 MB の XML になり、全体を木にすると 2GB 近く使う。表示するのは先頭の
+    数百行だけなので、読み終えた要素を捨てながら進み、呼び出し側が打ち切れるようにする。
+    """
+    try:
+        z.getinfo(name)
+    except KeyError:
+        return
+    with z.open(name) as f:
+        _refuse_dtd(f, name)
+    with z.open(name) as f:
+        root: ET.Element | None = None
+        for event, elem in ET.iterparse(f, events=("start", "end")):
+            if event == "start":
+                if root is None:
+                    root = elem
+                continue
+            if elem.tag == tag:
+                yield elem
+                elem.clear()
+                # 親に残る空の要素も捨てる（数十万行あると、それだけで大きくなる）
+                if root is not None and elem is not root:
+                    root.clear()
 
 
 def _rels(z: zipfile.ZipFile, part: str) -> dict[str, str]:
@@ -104,10 +167,13 @@ def _date_styles(z: zipfile.ZipFile) -> set[int]:
     return out
 
 
-def _col_index(ref: str) -> int:
-    """セル番地の列（A=0, B=1, …）。"""
+def _col_index(ref: str | None, default: int) -> int:
+    """セル番地の列（A=0, B=1, …）。番地が無い（省略できる）・読めないときは default（前のセルの次の列）。"""
+    m = re.match(r"[A-Z]+", ref or "")
+    if m is None:
+        return default
     n = 0
-    for ch in re.match(r"[A-Z]+", ref).group(0):  # type: ignore[union-attr]
+    for ch in m.group(0):
         n = n * 26 + ord(ch) - 64
     return n - 1
 
@@ -119,45 +185,55 @@ def _excel_date(value: float) -> str:
     return d.strftime("%Y-%m-%d %H:%M" if value % 1 else "%Y-%m-%d")
 
 
+def _cell_text(c: ET.Element, shared: list[str], dates: set[int]) -> str:
+    """セルの表示用の文字（共有文字列・その場の文字列・真偽値・日付を解釈する）。"""
+    kind, v = c.get("t"), c.find("s:v", NS)
+    text = v.text if v is not None and v.text is not None else ""
+    if kind == "s" and text:
+        try:
+            i = int(text)
+        except ValueError:
+            return ""
+        return shared[i] if 0 <= i < len(shared) else ""
+    if kind == "inlineStr":
+        return "".join(t.text or "" for t in c.iter(f"{{{NS['s']}}}t"))
+    if kind == "b":
+        return "TRUE" if text == "1" else "FALSE"
+    if kind is None and text:
+        try:
+            if int(c.get("s", "0")) in dates:
+                return _excel_date(float(text))
+        except (ValueError, OverflowError):
+            pass
+    return text
+
+
 def _xlsx(z: zipfile.ZipFile) -> dict[str, Any]:
-    shared: list[str] = []
-    sst = _xml(z, "xl/sharedStrings.xml")
-    if sst is not None:
-        for si in sst.findall("s:si", NS):
-            shared.append("".join(t.text or "" for t in si.iter(f"{{{NS['s']}}}t")))
+    ns = f"{{{NS['s']}}}"
+    # 共有文字列も、全体を木にせずに順に読む
+    shared = ["".join(t.text or "" for t in si.iter(f"{ns}t")) for si in _stream(z, "xl/sharedStrings.xml", f"{ns}si")]
     dates = _date_styles(z)
     wb = _xml(z, "xl/workbook.xml")
     rels = _rels(z, "xl/workbook.xml")
     sheets = []
     for sh in (wb.findall("s:sheets/s:sheet", NS) if wb is not None else [])[:MAX_SHEETS]:
         part = rels.get(sh.get(f"{{{NS['r']}}}id", ""), "")
-        root = _xml(z, part) if part else None
         rows: list[list[str]] = []
         truncated = False
-        for row in root.findall("s:sheetData/s:row", NS) if root is not None else []:
+        # 行を1つずつ読み、表示する行数に達したらそこで打ち切る（残りは展開もしない）
+        for row in _stream(z, part, f"{ns}row") if part else ():
             if len(rows) >= MAX_ROWS:
                 truncated = True
                 break
             cells: dict[int, str] = {}
+            col = -1
             for c in row.findall("s:c", NS):
-                col = _col_index(c.get("r", "A1"))
+                # 番地（r）は省略できる。そのときは前のセルの次の列
+                col = _col_index(c.get("r"), col + 1)
                 if col >= MAX_COLS:
                     truncated = True
                     continue
-                kind, v = c.get("t"), c.find("s:v", NS)
-                text = v.text if v is not None and v.text is not None else ""
-                if kind == "s" and text:
-                    text = shared[int(text)] if int(text) < len(shared) else ""
-                elif kind == "inlineStr":
-                    text = "".join(t.text or "" for t in c.iter(f"{{{NS['s']}}}t"))
-                elif kind == "b":
-                    text = "TRUE" if text == "1" else "FALSE"
-                elif kind is None and text and int(c.get("s", "0")) in dates:
-                    try:
-                        text = _excel_date(float(text))
-                    except ValueError:
-                        pass
-                cells[col] = text
+                cells[col] = _cell_text(c, shared, dates)
             if cells:
                 width = max(cells) + 1
                 rows.append([cells.get(i, "") for i in range(width)])
@@ -309,7 +385,8 @@ def preview(path: Path) -> dict[str, Any]:
             if ext in (".docx", ".docm"):
                 return _docx(z)
             return _pptx(z)
-    except (zipfile.BadZipFile, ET.ParseError, KeyError, ValueError, IndexError) as e:
+    except (zipfile.BadZipFile, zlib.error, EOFError, ET.ParseError, KeyError, ValueError, IndexError) as e:
+        # 圧縮が壊れたもの（同期の途中のファイルなど）も、読めない文書として扱う
         raise OfficeError(f"Office 文書として読めません: {e}") from e
 
 
@@ -328,6 +405,10 @@ def to_pdf(path: Path, sha256: str, cache_dir: Path, timeout: float = 120) -> Pa
         raise OfficeError("LibreOffice（soffice）が入っていません")
     out = cache_dir / f"{sha256}.pdf"
     if out.exists():
+        try:
+            os.utime(out)  # 使ったことを更新日時で記録する（容量の上限で消す順番に使う）
+        except OSError:
+            pass
         return out
     cache_dir.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory() as tmp:
@@ -336,12 +417,54 @@ def to_pdf(path: Path, sha256: str, cache_dir: Path, timeout: float = 120) -> Pa
         # 利用者の LibreOffice の設定を汚さないよう、使い捨ての設定フォルダで動かす
         profile = Path(tmp) / "profile"
         cmd = [exe, f"-env:UserInstallation=file://{profile}", "--headless", "--convert-to", "pdf", "--outdir", tmp, str(src)]
+        # soffice は起動用の小さなプロセスから本体（soffice.bin）を起こす。時間切れのときに本体まで止められるよう、
+        # 別のプロセスグループで動かして、グループごと止める
+        proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
         try:
-            subprocess.run(cmd, capture_output=True, timeout=timeout, check=False)
+            proc.wait(timeout=timeout)
         except subprocess.TimeoutExpired as e:
+            # 起動用のプロセスがまだ生きている間に、グループごと止める（本体を残さない）
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+            proc.wait()
             raise OfficeError("PDF への変換が時間内に終わりませんでした") from e
         pdf = Path(tmp) / "in.pdf"
         if not pdf.exists():
             raise OfficeError("PDF に変換できませんでした")
-        shutil.move(str(pdf), out)
+        # 保存先には別名で書いてから置き換える（書いている途中のものを、同時に来た別のリクエストに返さない）
+        part = cache_dir / f"{sha256}.{os.getpid()}.part"
+        try:
+            shutil.copyfile(pdf, part)
+            os.replace(part, out)
+        finally:
+            part.unlink(missing_ok=True)
+    _prune_pdf_cache(cache_dir, keep=out)
     return out
+
+
+# 保存する PDF の合計の上限（超えたら、しばらく開いていないものから消す）
+PDF_CACHE_MAX_BYTES = 1024**3
+
+
+def _prune_pdf_cache(cache_dir: Path, keep: Path, max_bytes: int = PDF_CACHE_MAX_BYTES) -> None:
+    """保存した PDF の合計が上限を超えていれば、古い順に消す（keep は残す）。作りかけ（.part）の残りも消す。"""
+    try:
+        for part in cache_dir.glob("*.part"):
+            if time.time() - part.stat().st_mtime > 3600:
+                part.unlink(missing_ok=True)
+        files = sorted((p.stat().st_mtime, p.stat().st_size, p) for p in cache_dir.glob("*.pdf"))
+    except OSError:
+        return
+    total = sum(size for _m, size, _p in files)
+    for _mtime, size, path in files:
+        if total <= max_bytes:
+            break
+        if path == keep:
+            continue
+        try:
+            path.unlink()
+        except OSError:
+            continue
+        total -= size

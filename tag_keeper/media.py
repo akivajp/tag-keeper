@@ -15,6 +15,7 @@ import os
 import re
 import shutil
 import subprocess
+import tempfile
 import threading
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -131,6 +132,10 @@ class MediaConverter:
             return
         total = sum(size for _m, size, _p in files)
         busy = {self.output_path(sha) for sha, job in self.jobs.items() if job.state == "running"}
+        # 変換の途中で止めた（サーバーを止めた）ときの作りかけは、だれも使わないので消す
+        for part in self.cache_dir.glob("*.part.mp4"):
+            if part.with_name(part.name[: -len(".part.mp4")] + ".mp4") not in busy:
+                part.unlink(missing_ok=True)
         for _mtime, size, path in sorted(files):
             if total <= self.max_bytes:
                 break
@@ -181,22 +186,32 @@ class MediaConverter:
             tmp = out.with_suffix(".part.mp4")
             cmd = ["ffmpeg", "-nostdin", "-y", "-v", "error", "-i", str(path), *args, "-progress", "pipe:1", str(tmp)]
             log.info("動画を再生用に変換します（%s）: %s", job.mode, path.name)
-            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-            assert proc.stdout is not None
-            for line in proc.stdout:
-                m = re.match(r"out_time_us=(\d+)", line)
-                if m and info["duration"] > 0:
-                    job.progress = min(0.99, int(m.group(1)) / 1e6 / info["duration"])
-            err = proc.stderr.read() if proc.stderr else ""
-            if proc.wait() != 0 or not tmp.exists():
+            # エラーの出力は一時ファイルに書かせる（パイプだと、壊れた動画で多く書かれたときに、
+            # 進み具合だけを読んでいるこちらと ffmpeg が互いに待って止まる）
+            with tempfile.TemporaryFile() as errf:
+                proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=errf, text=True)
+                try:
+                    assert proc.stdout is not None
+                    for line in proc.stdout:
+                        m = re.match(r"out_time_us=(\d+)", line)
+                        if m and info["duration"] > 0:
+                            job.progress = min(0.99, int(m.group(1)) / 1e6 / info["duration"])
+                    code = proc.wait()
+                finally:
+                    if proc.poll() is None:
+                        proc.kill()
+                        proc.wait()
+                errf.seek(0)
+                err = errf.read()[-2000:].decode("utf-8", errors="replace")
+            if code != 0 or not tmp.exists():
                 tmp.unlink(missing_ok=True)
-                raise MediaError(f"ffmpeg が失敗しました: {err.strip()[:300]}")
+                raise MediaError(f"ffmpeg が失敗しました: {err.strip()[-300:]}")
             tmp.replace(out)
             job.output, job.progress, job.state = out, 1.0, "done"
             log.info("動画を変換しました: %s", path.name)
             with self.lock:
                 self._prune(keep=out)
-        except (MediaError, OSError, ValueError) as e:
+        except Exception as e:  # noqa: BLE001 - 想定外の失敗でも「変換中」のまま残さず、画面からやり直せるようにする
             job.state, job.error = "error", str(e)
             log.warning("動画を変換できませんでした: %s: %s", path.name, e)
         finally:

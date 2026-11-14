@@ -146,3 +146,62 @@ def test_embedded_images(tmp_path: Path) -> None:
         image_part(f, "word/media/image2.emf")
     with pytest.raises(OfficeError):
         image_part(f, "word/document.xml")
+
+
+S_NS = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+R_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+WORKBOOK = {
+    "xl/workbook.xml": f'<workbook xmlns="{S_NS}" xmlns:r="{R_NS}"><sheets><sheet name="s1" sheetId="1" r:id="rId1"/></sheets></workbook>',
+    "xl/_rels/workbook.xml.rels": '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+    '<Relationship Id="rId1" Target="worksheets/sheet1.xml"/></Relationships>',
+}
+
+
+def sheet_xml(rows: str) -> str:
+    return f'<worksheet xmlns="{S_NS}"><sheetData>{rows}</sheetData></worksheet>'
+
+
+def test_xlsx_with_unusual_cells(tmp_path: Path) -> None:
+    """番地（r）を省いたセルは順に並べる。読めない番地や、範囲の外の共有文字列の番号でも落ちない。"""
+    rows = (
+        "<row><c><v>1</v></c><c><v>2</v></c><c><v>3</v></c></row>"  # 番地なし（省略できる）
+        '<row><c r="B2"><v>x</v></c><c><v>y</v></c></row>'  # 途中から番地なし
+        '<row><c r="??"><v>z</v></c><c r="A3" t="s"><v>99</v></c><c r="B3" t="s"><v>abc</v></c></row>'
+    )
+    out = preview(make_zip(tmp_path / "a.xlsx", {**WORKBOOK, "xl/worksheets/sheet1.xml": sheet_xml(rows)}))
+    assert out["sheets"][0]["rows"] == [["1", "2", "3"], ["", "x", "y"], ["", ""]]
+
+
+def test_large_sheet_is_read_only_as_far_as_it_is_shown(tmp_path: Path) -> None:
+    """行数の多いシートは、表示する行数まで読んだら打ち切る（全体を木にすると、数十 MB の XML で 2GB 近く使う）。"""
+    import resource
+
+    row = "".join(f'<c r="{c}1"><v>12345</v></c>' for c in "ABCDEFGHIJ")
+    path = make_zip(tmp_path / "big.xlsx", {**WORKBOOK, "xl/worksheets/sheet1.xml": sheet_xml(f"<row>{row}</row>" * 100_000)})
+    before = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    out = preview(path)
+    grown_mb = (resource.getrusage(resource.RUSAGE_SELF).ru_maxrss - before) / 1024
+    sheet = out["sheets"][0]
+    assert len(sheet["rows"]) == 500 and sheet["truncated"] and sheet["rows"][0] == ["12345"] * 10
+    assert grown_mb < 100  # 直す前は 27MB の XML で 600MB 以上増えた
+
+
+def test_dtd_in_utf16_xml_and_broken_archives_are_refused(tmp_path: Path) -> None:
+    """UTF-16 で書いた XML の DTD も断る（バイト列の検索では素通りする）。圧縮が壊れた文書は、読めない文書として扱う。"""
+    bomb = '<?xml version="1.0" encoding="UTF-16"?><!DOCTYPE x [<!ENTITY a "aaaa">]><w:document xmlns:w="x">&a;</w:document>'
+    path = tmp_path / "u.docx"
+    with zipfile.ZipFile(path, "w") as z:
+        z.writestr("word/document.xml", bomb.encode("utf-16"))
+    with pytest.raises(OfficeError, match="DTD"):
+        preview(path)
+    # シートの XML（順に読む経路）でも同じ
+    with pytest.raises(OfficeError, match="DTD"):
+        preview(make_zip(tmp_path / "s.xlsx", {**WORKBOOK, "xl/worksheets/sheet1.xml": '<!DOCTYPE x [<!ENTITY a "b">]>' + sheet_xml("")}))
+    # 同期の途中などで、圧縮したデータが壊れている
+    good = make_zip(tmp_path / "ok.xlsx", {**WORKBOOK, "xl/worksheets/sheet1.xml": sheet_xml("<row><c><v>1</v></c></row>" * 2000)})
+    data = bytearray(good.read_bytes())
+    at = data.index(b"xl/worksheets/sheet1.xml") + 40
+    data[at : at + 20] = b"\xff" * 20
+    (tmp_path / "broken.xlsx").write_bytes(bytes(data))
+    with pytest.raises(OfficeError):
+        preview(tmp_path / "broken.xlsx")

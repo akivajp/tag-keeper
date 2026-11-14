@@ -10,6 +10,7 @@ Web の画面は、ここに保持した進み具合を1秒ごとに読み出し
 from __future__ import annotations
 
 import logging
+import os
 import threading
 import time
 import traceback
@@ -159,6 +160,10 @@ class _JobLogHandler(logging.Handler):
             self.job.lines.append(line)
 
 
+# ジョブごとのログのファイルを残す日数（自動で最新にするたびに1つ増えるので、古いものは消す）
+LOG_KEEP_DAYS = 30
+
+
 class JobManager:
     """ジョブを1つずつ裏で動かし、進み具合と直近の履歴を保持する。"""
 
@@ -224,14 +229,22 @@ class JobManager:
         handler = _JobLogHandler(job, threading.get_ident())
         root_logger.addHandler(handler)
         file_handler: logging.Handler | None = None
-        if job.log_file is not None:
-            job.log_file.parent.mkdir(parents=True, exist_ok=True)
-            file_handler = logging.FileHandler(job.log_file, encoding="utf-8")
-            file_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
-            file_handler.addFilter(lambda r: r.thread == handler.thread_id)
-            root_logger.addHandler(file_handler)
         if root_logger.level == logging.NOTSET or root_logger.level > logging.INFO:
             root_logger.setLevel(logging.INFO)
+        if job.log_file is not None:
+            try:
+                job.log_file.parent.mkdir(parents=True, exist_ok=True)
+                self._prune_logs()
+                file_handler = logging.FileHandler(job.log_file, encoding="utf-8")
+                file_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+                file_handler.addFilter(lambda r: r.thread == handler.thread_id)
+                root_logger.addHandler(file_handler)
+            except OSError as e:
+                # ログを開けない（ディスクが一杯・権限が無い）だけで、ジョブを「実行中」のまま固まらせない。
+                # ファイルには残せないが、処理は続ける（画面のログには出る）
+                file_handler = None
+                job.log_file = None
+                log.warning("ジョブのログを開けません（処理は続けます）: %s", e)
         log.info("開始: %s", job.title)
         try:
             result = fn(JobReporter(job))
@@ -255,6 +268,21 @@ class JobManager:
             if file_handler is not None:
                 root_logger.removeHandler(file_handler)
                 file_handler.close()
+
+    def _prune_logs(self) -> None:
+        """LOG_KEEP_DAYS 日より古いジョブのログを消す（消せなくても、ジョブは止めない）。"""
+        cutoff = time.time() - LOG_KEEP_DAYS * 86400
+        try:
+            with os.scandir(self.log_dir) as it:
+                old = [de.path for de in it if de.name.endswith(".log") and de.is_file(follow_symlinks=False)
+                       and de.stat(follow_symlinks=False).st_mtime < cutoff]
+        except OSError:
+            return
+        for path in old:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
 
     def wait(self, timeout: float = 30.0) -> Job | None:
         """動いているジョブが終わるまで待つ（テスト用）。"""

@@ -847,3 +847,147 @@ def test_digest_and_snapwatch_api(env: dict) -> None:
     d = app.get("/api/snapwatch/data").json
     assert set(d) == {"latest", "alerts", "snapshot_only", "snapper"}
     app.post_json("/api/snapwatch/data/protect", {"snapshot": "x; rm"}, headers={"Origin": f"http://{HOST}"}, status=400)
+
+
+ORIGIN = {"Origin": f"http://{HOST}"}
+
+
+def test_job_runs_even_when_its_log_cannot_be_opened(tmp_path: Path) -> None:
+    """ジョブのログを開けなくても（ディスクが一杯・権限が無い）、ジョブは実行して終わる。「実行中」のまま固まらない。"""
+    blocker = write(tmp_path / "not-a-dir", "x")  # ログの置き場所の親がファイルなので、フォルダを作れない
+    jobs = JobManager(blocker / "logs")
+    job = jobs.start("test", "ログを開けない処理", lambda rep: {"ok": True})
+    jobs.wait()
+    assert (job.status, job.result) == ("done", {"ok": True}) and not jobs.busy()
+    # 次のジョブも始められる
+    jobs.start("test", "次の処理", lambda rep: None)
+    jobs.wait()
+
+
+def test_old_job_logs_are_removed(tmp_path: Path) -> None:
+    import os
+
+    from tag_keeper import jobs as jobs_mod
+
+    logs = tmp_path / "logs"
+    old, recent = write(logs / "20260101-000000-1-refresh.log", "old"), write(logs / "20261101-000000-2-refresh.log", "recent")
+    keep = write(logs / "notes.txt", "ログではないものは消さない")
+    long_ago = time.time() - (jobs_mod.LOG_KEEP_DAYS + 1) * 86400
+    os.utime(old, (long_ago, long_ago))
+    os.utime(keep, (long_ago, long_ago))
+    jobs = JobManager(logs)
+    jobs.start("test", "処理", lambda rep: None)
+    jobs.wait()
+    assert not old.exists() and recent.exists() and keep.exists()
+    assert len(list(logs.glob("*-test.log"))) == 1
+
+
+def test_busy_file_operation_leaves_no_plan_and_no_decision(env: dict) -> None:
+    """別の処理が動いている間の名前の変更は 409。実行しなかったプランも、「採用した」という判断の記録も残さない。"""
+    import threading
+
+    app, jobs, settings = env["app"], env["jobs"], env["settings"]
+    run_job(env, "/api/roots/data/refresh")
+    gate = threading.Event()
+    jobs.start("refresh", "自動で最新にする: data", lambda rep: gate.wait(10))
+    try:
+        rename = {"root": "data", "op": "rename", "items": [{"path": "docs/report.pdf", "new_name": "renamed.pdf"}]}
+        res = app.post_json("/api/fileops", rename, headers=ORIGIN, status=409)
+        assert "自動で最新にする" in res.json["error"]
+        app.post_json("/api/organize/data/plan", {"apply": True, "items": [{"path": "docs/report.pdf", "dest": "docs/x.pdf"}]}, headers=ORIGIN, status=409)
+    finally:
+        gate.set()
+        jobs.wait()
+    assert list(settings.plans_dir.glob("*.toml")) == [] if settings.plans_dir.exists() else True
+    assert settings.decision_log.read() == []
+    assert (env["root"] / "docs" / "report.pdf").exists()
+    # 形の合わない items は 400
+    app.post_json("/api/fileops", {"root": "data", "op": "delete", "items": ["docs/report.pdf"]}, headers=ORIGIN, status=400)
+
+
+def test_plan_cannot_be_deleted_or_edited_while_it_runs(env: dict, monkeypatch: pytest.MonkeyPatch) -> None:
+    """実行を始めてから最初の実行記録が書かれるまでの間も、そのプランは消せない（消すと、画面から取り消せなくなる）。"""
+    from tag_keeper.web import server
+
+    app, jobs = env["app"], env["jobs"]
+    run_job(env, "/api/roots/data/refresh")
+    plan_id = run_job(env, "/api/plans", {"root": "data", "categories": ["os-junk"]})["result"]["plan_id"]
+    real = server.apply_plan
+
+    def slow_apply(*a: Any, **kw: Any) -> Any:  # 実行前のスナップショット・同期の待ちの代わり
+        time.sleep(0.5)
+        return real(*a, **kw)
+
+    monkeypatch.setattr(server, "apply_plan", slow_apply)
+    app.post_json(f"/api/plans/{plan_id}/apply", {}, headers=ORIGIN)
+    app.post_json(f"/api/plans/{plan_id}/delete", {}, headers=ORIGIN, status=409)
+    app.post_json(f"/api/plans/{plan_id}/skips", {"skip": []}, headers=ORIGIN, status=409)
+    jobs.wait()
+    assert app.get(f"/api/plans/{plan_id}").json["info"]["state"] == "applied"
+    run_job(env, f"/api/plans/{plan_id}/undo")
+    assert (env["root"] / "docs" / "Thumbs.db").exists()
+
+
+def test_plans_made_in_the_same_second_get_different_ids(env: dict, monkeypatch: pytest.MonkeyPatch) -> None:
+    """同じ秒に2つの操作をしても、プランと実行記録が混ざらない（それぞれを別々に取り消せる）。"""
+    from tag_keeper.web import server
+
+    app, jobs, root = env["app"], env["jobs"], env["root"]
+    write(root / "docs" / "a.txt", "a")
+    write(root / "docs" / "b.txt", "b")
+    run_job(env, "/api/roots/data/refresh")
+    monkeypatch.setattr(server, "new_plan_id", lambda root_name, kind="", when=None: f"20261115-070000-{root_name}-{kind}")
+    ids = []
+    for name in ("a.txt", "b.txt"):
+        ids.append(app.post_json("/api/fileops", {"root": "data", "op": "delete", "items": [{"path": f"docs/{name}"}]}, headers=ORIGIN).json["plan_id"])
+        assert jobs.wait().status == "done"
+    assert ids == ["20261115-070000-data-delete", "20261115-070000-data-delete-2"]
+    run_job(env, f"/api/plans/{ids[0]}/undo")
+    assert (root / "docs" / "a.txt").exists() and not (root / "docs" / "b.txt").exists()
+
+
+def test_bad_numbers_and_awkward_download_names(env: dict) -> None:
+    from tag_keeper.web.server import content_disposition
+
+    app, root = env["app"], env["root"]
+    run_job(env, "/api/roots/data/refresh")
+    # 数でない値は 400（500 にしない）
+    app.get("/api/jobs/current?lines=abc", status=400)
+    app.post_json("/api/analyze/data", {"limit": "many"}, headers=ORIGIN, status=400)
+    app.post_json("/api/relink/data", {"new_id": "x"}, headers=ORIGIN, status=400)
+    # 日本語の名前は filename* で伝える。改行などの制御文字を含む名前でも失敗しない
+    write(root / "docs" / "議事録 2026.txt", "memo")
+    res = app.get("/api/file", {"root": "data", "path": "docs/議事録 2026.txt", "download": "1"})
+    assert res.headers["Content-Disposition"] == "attachment; filename=\"??? 2026.txt\"; filename*=UTF-8''%E8%AD%B0%E4%BA%8B%E9%8C%B2%202026.txt"
+    assert content_disposition('a\nb"c.txt') == "attachment; filename=\"a_b_c.txt\"; filename*=UTF-8''a_b%22c.txt"
+    write(root / "docs" / "line\nbreak.txt", "x")
+    assert app.get("/api/file", {"root": "data", "path": "docs/line\nbreak.txt", "download": "1"}).status_int == 200
+
+
+def test_video_conversion_survives_noisy_ffmpeg(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """ffmpeg がエラーの出力を多く書いても、変換が固まらない（偽の ffmpeg で確かめる）。作りかけの残りは掃除する。"""
+    import os
+
+    from tag_keeper.media import MediaConverter
+
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    probe = '{"format": {"duration": "10.0", "format_name": "matroska"}, "streams": [{"codec_type": "video", "codec_name": "h264"}, {"codec_type": "audio", "codec_name": "aac"}]}'
+    scripts = {
+        "ffprobe": f"#!/bin/sh\necho '{probe}'\n",
+        # パイプの容量（64KB）を超える量を stderr に書いてから、出力のファイルを作る
+        "ffmpeg": '#!/bin/sh\ni=0; while [ $i -lt 5000 ]; do echo "[error] broken frame at $i ............................" >&2; i=$((i+1)); done\n'
+        'for last; do :; done\necho out_time_us=5000000\necho video > "$last"\n',
+    }
+    for name, body in scripts.items():
+        write(bindir / name, body).chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bindir}:{os.environ['PATH']}")
+    cache = tmp_path / "cache"
+    stale = write(cache / "0000.part.mp4", "half")  # 前に途中で止めた変換の残り
+    mc = MediaConverter(cache)
+    job = mc.status(write(tmp_path / "v.mkv", b"x"), "abc")
+    deadline = time.time() + 20
+    while job.state == "running" and time.time() < deadline:
+        time.sleep(0.05)
+    assert job.state == "done", job.error
+    assert (cache / "abc.mp4").exists() and not stale.exists()

@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 import logging
 import subprocess
+import threading
 from collections.abc import Callable, Iterable
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -83,6 +84,10 @@ def compare(root_name: str, root_path: Path, older: Any, newer: Any, *, exclude:
     return c
 
 
+# 状態のファイルを「読んで・直して・書く」あいだを守る（裏の見張りと、画面からの操作が同時に書くため）
+_STATE_LOCK = threading.Lock()
+
+
 class Watch:
     """ルートごとに、最新のスナップショットの組の比べた結果を保存して使い回す（データのフォルダの snapwatch.json）。"""
 
@@ -120,33 +125,38 @@ class Watch:
         if not force and cur and cur.get("older") == older.id and cur.get("newer") == newer.id:
             return cur
         c = compare(root_name, root_path, older, newer, exclude=exclude, exclude_paths=exclude_paths).to_dict()
-        entry = data.setdefault(root_name, {})
-        entry["latest"] = c
-        if c["alert"]:
-            # 警告は消さずに残す（次の組を比べた後も、守るかどうかを決められるように）
-            alerts = entry.setdefault("alerts", [])
-            if not any(a.get("newer") == c["newer"] for a in alerts):
-                alerts.append(c)
-                log.warning("スナップショットのあいだで大きな変化: %s（#%s → #%s）: %s", root_name, older.id, newer.id, c["alert"])
-            entry["alerts"] = alerts[-20:]
-        self._save(data)
+        with _STATE_LOCK:
+            # 比べるのには時間がかかる。その間に画面で警告を消した・守ったかもしれないので、読み直してから書く
+            data = self._load()
+            entry = data.setdefault(root_name, {})
+            entry["latest"] = c
+            if c["alert"]:
+                # 警告は消さずに残す（次の組を比べた後も、守るかどうかを決められるように）
+                alerts = entry.setdefault("alerts", [])
+                if not any(a.get("newer") == c["newer"] for a in alerts):
+                    alerts.append(c)
+                    log.warning("スナップショットのあいだで大きな変化: %s（#%s → #%s）: %s", root_name, older.id, newer.id, c["alert"])
+                entry["alerts"] = alerts[-20:]
+            self._save(data)
         return c
 
     def alerts(self, root_name: str) -> list[dict[str, Any]]:
         return list(self._load().get(root_name, {}).get("alerts", []))
 
     def mark_protected(self, root_name: str, snapshot_id: str) -> None:
-        data = self._load()
-        for a in data.get(root_name, {}).get("alerts", []):
-            if a.get("older") == snapshot_id or a.get("newer") == snapshot_id:
-                a.setdefault("protected", []).append(snapshot_id)
-        self._save(data)
+        with _STATE_LOCK:
+            data = self._load()
+            for a in data.get(root_name, {}).get("alerts", []):
+                if a.get("older") == snapshot_id or a.get("newer") == snapshot_id:
+                    a.setdefault("protected", []).append(snapshot_id)
+            self._save(data)
 
     def dismiss(self, root_name: str, newer: str) -> None:
-        data = self._load()
-        entry = data.get(root_name, {})
-        entry["alerts"] = [a for a in entry.get("alerts", []) if a.get("newer") != newer]
-        self._save(data)
+        with _STATE_LOCK:
+            data = self._load()
+            entry = data.get(root_name, {})
+            entry["alerts"] = [a for a in entry.get("alerts", []) if a.get("newer") != newer]
+            self._save(data)
 
 
 def protect(snapper_config: str, snapshot_id: str, *, command: str = "snapper") -> None:
