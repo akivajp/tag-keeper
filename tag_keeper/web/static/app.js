@@ -29,6 +29,24 @@ function h(tag, attrs, ...children) {
 /** 要素の中身を入れ替える（null・undefined・false は飛ばす。replaceChildren は "null" と表示してしまうため）。 */
 function setChildren(el, ...children) {
   el.replaceChildren(...children.flat(Infinity).filter((c) => c !== null && c !== undefined && c !== false));
+  // 描画ごとの入れ物（route を参照）は、最初に中身が入ったときに画面に出す
+  if (el.onFirstFill) {
+    const show = el.onFirstFill;
+    el.onFirstFill = null;
+    show();
+  }
+}
+
+/**
+ * 画面から外れた要素か。裏の問い合わせや、キー操作の待ち受けをやめる判定に使う。
+ * まだ一度も画面に入っていない要素は、描画の途中かもしれないので 30 秒まで待つ
+ * （待たずに「外れた」とすると、描画が終わる前に来た応答で、待ち受けをやめてしまう）。
+ */
+function detached(el) {
+  if (el.isConnected) { el.wasConnected = true; return false; }
+  if (el.wasConnected) return true;
+  el.firstChecked = el.firstChecked || Date.now();
+  return Date.now() - el.firstChecked > 30000;
 }
 
 /** バイト数を読みやすい単位にする。 */
@@ -88,8 +106,14 @@ function confirmDialog(title, body, okLabel = '実行する', danger = false) {
   const ok = document.getElementById('confirm-ok');
   ok.textContent = okLabel;
   ok.className = danger ? 'danger' : 'primary';
+  // 既に開いている（キー操作などで重ねて呼ばれた）なら、後から来たほうは実行しない
+  if (dlg.open) return Promise.resolve(false);
+  // 「やめる」は送信ボタンではないので（index.html を参照）、押したら自分で閉じる
+  document.getElementById('confirm-cancel').onclick = () => dlg.close('cancel');
   return new Promise((resolve) => {
     dlg.addEventListener('close', () => resolve(dlg.returnValue === 'ok'), { once: true });
+    // 前回の結果を持ち越さない（Esc で閉じたときに、前の「実行」が残らないように）
+    dlg.returnValue = '';
     dlg.showModal();
   });
 }
@@ -230,7 +254,9 @@ async function pollSync() {
     if (before[it.root] && !busy(it)) {
       if (it.state === 'idle') toast(t('同期が終わりました: {root}', { root: it.root }), 'info');
       else toast(t('同期が失敗しました: {root}: {message}', { root: it.root, message: it.message || it.state }), 'danger');
-      if (app.render) app.render();
+      // 描き直すのは、同期の状態を出しているルートの一覧だけ。ほかの画面では、操作の途中のもの
+      // （選んだファイル・絞り込み・入力中の名前・開いた詳細）が、定期の同期のたびに消えてしまう
+      if (onRootsPage() && app.render) app.render();
     }
   }
   syncTimer = setTimeout(pollSync, items.some(busy) || Date.now() < syncFastUntil ? 2000 : 15000);
@@ -290,8 +316,8 @@ async function onJobFinished(job) {
   if (job.auto) {
     if (job.status === 'done') { app.jobDismissed = job.id; renderJob(); }
     await refreshState();
-    const onRoots = !location.hash || location.hash === '#' || location.hash === '#/';
-    if (onRoots && app.render) app.render();
+    // ジョブが動いている間に描いた画面は、ボタンを押せなくしたままなので描き直す
+    if ((onRootsPage() || app.renderedWhileBusy) && app.render) app.render();
     return;
   }
   if (job.status === 'failed') toast(t('失敗しました: {title}: {error}', { title: translateString(job.title), error: translateString(job.error || '') }), 'danger');
@@ -335,9 +361,20 @@ function renderJob() {
   }
   figures.push(h('span', { class: 'muted' }, t('経過 {elapsed}', { elapsed: dur(job.elapsed) })));
 
+  // 終わったジョブは問い合わせのたびに同じ内容が返る。作り直すと、開いたログ・文字の選択・フォーカスが消えるので、
+  // 前に描いたものと同じなら何もしない（言語を切り替えたときは描き直す）
+  const signature = JSON.stringify([job.id, job.status, job.error, phases, job.lines, job.status === 'running' ? job.elapsed : null, i18n.lang]);
+  if (holder.dataset.signature === signature && holder.firstChild) return;
+  holder.dataset.signature = signature;
+  const before = holder.querySelector('details');
+  const wasOpen = before && before.dataset.job === job.id ? before.open : null;
+  const wasAtBottom = before ? (() => { const pre = before.querySelector('pre'); return !pre || pre.scrollTop + pre.clientHeight >= pre.scrollHeight - 4; })() : true;
+  const scrollWas = before && before.querySelector('pre') ? before.querySelector('pre').scrollTop : 0;
+
   const lines = h('pre', {}, (job.lines || []).join('\n'));
-  const details = h('details', {}, h('summary', { class: 'muted' }, t('ログ（{file}）', { file: job.log_file || '' })), lines);
-  if (job.status === 'failed') details.open = true;
+  const details = h('details', { 'data-job': job.id }, h('summary', { class: 'muted' }, t('ログ（{file}）', { file: job.log_file || '' })), lines);
+  // 開いたログは開いたままにする。初めて描くときは、失敗したジョブだけ開く
+  details.open = wasOpen !== null ? wasOpen : job.status === 'failed';
 
   setChildren(holder, 
     h('div', { class: 'head' },
@@ -352,11 +389,14 @@ function renderJob() {
     job.error ? h('div', { class: 'alert danger' }, job.error) : null,
     details,
   );
-  // ログは最新の行が見えるように下端へ寄せる
-  lines.scrollTop = lines.scrollHeight;
+  // ログは最新の行が見えるように下端へ寄せる（利用者が上へ戻して読んでいるときは、その位置のままにする）
+  lines.scrollTop = wasAtBottom ? lines.scrollHeight : scrollWas;
 }
 
 function jobRunning() { return app.job && app.job.status === 'running'; }
+
+/** 今の画面がルートの一覧か。 */
+function onRootsPage() { return !location.hash || location.hash === '#' || location.hash === '#/'; }
 
 // ---------- 画面: ルートの一覧 ----------
 
@@ -410,6 +450,13 @@ async function pageRoots(main) {
         h('button', { class: 'primary', disabled: jobRunning(), onclick: () => startJob(`/api/roots/${enc(r.name)}/refresh`) }, '最新にする（走査＋ハッシュ）'),
         h('button', { disabled: jobRunning(), onclick: () => startJob(`/api/roots/${enc(r.name)}/scan`) }, '走査だけ'),
         r.scanned ? h('a', { class: 'button', href: `#/report/${enc(r.name)}` }, 'レポートとプランの作成') : null,
+        // 上部のメニュー（ファイル・整理・検索・確認）は最初のルートを開く。ルートが複数あるときは、ここから各ルートを開く
+        ...(r.scanned && st.roots.length > 1 ? [
+          h('a', { class: 'button', href: `#/browse/${enc(r.name)}` }, 'ファイル'),
+          h('a', { class: 'button', href: `#/organize/${enc(r.name)}` }, '整理'),
+          h('a', { class: 'button', href: `#/search?root=${enc(r.name)}` }, '検索'),
+          h('a', { class: 'button', href: `#/review/${enc(r.name)}` }, '確認'),
+        ] : []),
         r.sync && r.sync.can_trigger ? h('button', { disabled: r.sync.state === 'running' || r.sync.state === 'waiting', onclick: () => startSync(r.name) }, '今すぐ同期') : null,
       ));
   });
@@ -900,6 +947,29 @@ async function pagePlan(main, id) {
 
 // ---------- 画面の切り替え ----------
 
+/** 入力の途中の欄（フォーカスのある input・textarea）の、位置・文字・選択範囲。無ければ null。 */
+function focusedField(container) {
+  const el = document.activeElement;
+  if (!el || !container.contains(el) || !['INPUT', 'TEXTAREA'].includes(el.tagName) || ['checkbox', 'radio'].includes(el.type)) return null;
+  const index = [...container.querySelectorAll(el.tagName)].indexOf(el);
+  let start = null;
+  let end = null;
+  try { start = el.selectionStart; end = el.selectionEnd; } catch { /* 選択範囲を持たない種類（date など） */ }
+  return { tag: el.tagName, index, placeholder: el.placeholder, value: el.value, start, end };
+}
+
+/** focusedField で覚えた欄を、描き直した画面の同じ位置の欄に引き継ぐ（同じ欄と確かめられたときだけ）。 */
+function restoreField(container, field) {
+  const el = container.querySelectorAll(field.tag)[field.index];
+  if (!el || el.placeholder !== field.placeholder) return;
+  if (el.value !== field.value) {
+    el.value = field.value;
+    el.dispatchEvent(new Event('input', { bubbles: true }));
+  }
+  el.focus({ preventScroll: true });
+  try { if (field.start !== null) el.setSelectionRange(field.start, field.end); } catch { /* 選択範囲を持たない種類 */ }
+}
+
 async function route() {
   const main = document.getElementById('main');
   // # の後ろは「パス?問い合わせ」（例: #/browse/onedrive/99_Inbox?at=17533）
@@ -909,19 +979,40 @@ async function route() {
   // #/tags は前の版の URL（ブックマーク）のため。検索の画面を開く
   const navOf = { report: 'roots', relink: 'roots', browse: 'browse', organize: 'organize', search: 'search', tags: 'search', review: 'review', plans: 'plans' };
   document.querySelectorAll('[data-nav]').forEach((a) => a.classList.toggle('active', (navOf[parts[0]] || 'roots') === a.dataset.nav));
+  // 検索の画面は、条件を1つ変えるたびに URL を変えて描き直す。その間に次の欄へ入力を始めていても、
+  // 文字とフォーカスが消えないよう、描き直した画面の同じ欄に引き継ぐ
+  const kind = parts[0] === 'tags' ? 'search' : (parts[0] || '');
+  let carryField = kind === 'search' && app.pageKind === 'search';
+  app.pageKind = kind;
   let render;
-  if (parts[0] === 'browse') render = () => pageBrowse(main, parts[1], parts.slice(2).join('/'), params);
-  else if (parts[0] === 'organize') render = () => pageOrganize(main, parts[1]);
-  else if (parts[0] === 'search' || parts[0] === 'tags') render = () => pageTags(main, params);
-  else if (parts[0] === 'report' && parts[1]) render = () => pageReport(main, parts[1]);
-  else if (parts[0] === 'relink' && parts[1]) render = () => pageRelink(main, parts[1]);
-  else if (parts[0] === 'review') render = () => pageReview(main, parts[1]);
-  else if (parts[0] === 'plans' && parts[1]) render = () => pagePlan(main, parts[1]);
-  else if (parts[0] === 'plans') render = () => pagePlans(main);
-  else render = () => pageRoots(main);
+  if (parts[0] === 'browse') render = (view) => pageBrowse(view, parts[1], parts.slice(2).join('/'), params);
+  else if (parts[0] === 'organize') render = (view) => pageOrganize(view, parts[1]);
+  else if (parts[0] === 'search' || parts[0] === 'tags') render = (view) => pageTags(view, params);
+  else if (parts[0] === 'report' && parts[1]) render = (view) => pageReport(view, parts[1]);
+  else if (parts[0] === 'relink' && parts[1]) render = (view) => pageRelink(view, parts[1]);
+  else if (parts[0] === 'review') render = (view) => pageReview(view, parts[1]);
+  else if (parts[0] === 'plans' && parts[1]) render = (view) => pagePlan(view, parts[1]);
+  else if (parts[0] === 'plans') render = (view) => pagePlans(view);
+  else render = (view) => pageRoots(view);
   app.render = async () => {
-    try { await render(); }
-    catch (e) { setChildren(main, h('div', { class: 'alert danger' }, e.message)); }
+    // 描画ごとに別の入れ物に描き、最初に中身が入ったときに画面のものと差し替える。
+    // 前の描画（遅い応答を待っていた別のフォルダ・別の画面）が後から終わっても、外した入れ物に描くだけで、
+    // 今の画面を上書きしない
+    const gen = (app.renderGen = (app.renderGen || 0) + 1);
+    const view = h('div', { class: 'view' });
+    const carry = carryField;
+    carryField = false;
+    const show = () => {
+      if (gen !== app.renderGen || view.parentNode === main) return;
+      const field = carry ? focusedField(main) : null;
+      main.replaceChildren(view);
+      if (field) restoreField(view, field);
+    };
+    view.onFirstFill = show;
+    app.renderedWhileBusy = jobRunning();
+    try { await render(view); }
+    catch (e) { setChildren(view, h('div', { class: 'alert danger' }, e.message)); }
+    show();
   };
   await app.render();
 }

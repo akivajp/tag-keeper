@@ -36,7 +36,9 @@
       <h2 id="confirm-title"></h2>
       <div id="confirm-body"></div>
       <div class="actions">
-        <button value="cancel" class="secondary">やめる</button>
+        <!-- 「やめる」は送信ボタンにしない。入力欄で Enter を押したときの既定のボタンを「実行する」にするため
+             （送信ボタンにすると、先頭にあるこちらが既定になり、理由や名前を入れて Enter を押すと取りやめになる） -->
+        <button type="button" value="cancel" id="confirm-cancel" class="secondary">やめる</button>
         <button value="ok" id="confirm-ok" class="primary">実行する</button>
       </div>
     </form>

@@ -29,7 +29,7 @@ function joinPath(dir, name) { return dir ? `${dir}/${name}` : name; }
 
 function tagChip(tag, onRemove, kind = '') {
   return h('span', { class: `chip ${kind}` }, tag,
-    onRemove ? h('button', { class: 'chip-x', title: t('タグを外す'), onclick: (e) => { e.stopPropagation(); onRemove(); } }, '×') : null);
+    onRemove ? h('button', { type: 'button', class: 'chip-x', title: t('タグを外す'), onclick: (e) => { e.stopPropagation(); onRemove(); } }, '×') : null);
 }
 
 /** 既存のタグの候補（入力の補完用）。 */
@@ -241,8 +241,14 @@ async function pageBrowse(main, root, path, params) {
 
   const tagInput = h('input', { list: 'tag-options', placeholder: '選んだものに付けるタグ（例: 種別:請求書）', disabled: !live });
 
+  // 詳細の描画の通し番号（続けて別のファイルを選んだとき、先に選んだほうの遅い応答で上書きしないため）
+  let detailGen = 0;
+
   async function showDetail(rel, entry) {
+    const gen = ++detailGen;
     setChildren(detail, h('p', { class: 'muted' }, '読み込み中…'));
+    // 狭い画面では詳細が一覧の下に出るので、そこまで送る（送らないと、選んでも何も起きないように見える）
+    if (detail.isConnected && window.matchMedia('(max-width: 900px)').matches) detail.scrollIntoView({ block: 'start', behavior: 'smooth' });
     const name = rel.split('/').pop();
     const url = fileUrl(root, rel, at);
     const parts = [h('h2', { class: 'path' }, name), h('div', { class: 'muted mono' }, rel)];
@@ -302,6 +308,7 @@ async function pageBrowse(main, root, path, params) {
       } }, t('この書類・画像を読み取る（種類・日付・相手・金額など）'))));
     }
     parts.push(h('h3', {}, '版の履歴'), await historyBlock(rel));
+    if (gen !== detailGen) return; // この間に別のファイルが選ばれた
     setChildren(detail, parts);
   }
 
@@ -423,7 +430,6 @@ async function moveConfirm(root, paths, dest) {
 async function moveDialog(root, paths, current) {
   const input = h('input', { class: 'name-input', value: current, list: `folders-${enc(root)}`, placeholder: t('移動先のフォルダ（/ でルート直下）') });
   input.addEventListener('input', () => folderSuggest(root, input.value));
-  input.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); document.getElementById('confirm').close('ok'); } });
   folderSuggest(root, current);
   setTimeout(() => { input.focus(); input.select(); }, 50);
   const ok = await confirmDialog(t('{n} 件を移動しますか？', { n: paths.length }), [
@@ -440,7 +446,6 @@ async function moveDialog(root, paths, current) {
 /** フォルダの作成のダイアログ。 */
 async function mkdirDialog(root, parent) {
   const input = h('input', { class: 'name-input', placeholder: t('新しいフォルダの名前') });
-  input.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); document.getElementById('confirm').close('ok'); } });
   setTimeout(() => input.focus(), 50);
   const ok = await confirmDialog(t('フォルダを作る'), [h('p', { class: 'muted path' }, `${parent || '/'}`), input], t('作る'));
   const name = input.value.trim();
@@ -479,8 +484,6 @@ async function runFileOp(root, op, items, extra = {}) {
 async function renameDialog(root, rel, isDir) {
   const name = rel.split('/').pop();
   const input = h('input', { class: 'name-input', value: name });
-  // Enter で「実行する」にする（フォームの既定は最初のボタン＝「やめる」になるため）
-  input.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); document.getElementById('confirm').close('ok'); } });
   const useSuggestion = isDir ? null : h('button', {
     type: 'button',
     onclick: async () => {
@@ -553,8 +556,7 @@ function mediaPreview(ctx, name) {
 
   async function poll(retry = false) {
     clearTimeout(timer);
-    if (!holder.isConnected && holder.dataset.started) return; // 別のファイルを選んだら問い合わせをやめる
-    holder.dataset.started = '1';
+    if (detached(holder)) return; // 別のファイルを選んだら問い合わせをやめる（画面に入る前は、入るのを待つ）
     let st;
     try { st = await api(`/api/media/status?${q}${retry ? '&retry=1' : ''}`); }
     catch (e) { setChildren(holder, h('p', { class: 'muted' }, t('この種類はプレビューできません。'), ' ', e.message)); return; }
@@ -975,16 +977,26 @@ function searchApiQuery(state, root, limit) {
   return q;
 }
 
+// 検索の画面の「タグを探す」の文字（条件を変えるたびに画面を描き直すので、画面の外に持つ）
+let tagListFilter = '';
+
 async function pageTags(main, params) {
   // 検索の条件は URL に持つ（#/search?t=含むタグ&not=除くタグ&mode=and|or&q=名前&text=本文&kind=種類&under=場所
   // &after=&before=（更新日）&min=&max=（大きさ）&attr=属性の条件&gone=1&nocollapse=1&folders=1）。#/tags は前の版の URL
   const state = searchState(params);
-  const go = () => { const q = searchQuery(state).toString(); location.hash = `#/search${q ? '?' + q : ''}`; };
-  const root = await firstRoot();
+  // 探すルート（#/search?root=名前。指定が無ければ最初のルート）。条件を変えても同じルートで探す
+  const rootParam = params.get('root') || '';
+  const go = () => {
+    const query = searchQuery(state);
+    if (rootParam) query.set('root', rootParam);
+    const q = query.toString();
+    location.hash = `#/search${q ? '?' + q : ''}`;
+  };
+  const root = rootParam || await firstRoot();
   const meta = await api('/api/tags');
   const { tags } = meta;
   const attrDefs = meta.attrs || [];
-  let filter = '';
+  let filter = tagListFilter;
   const listEl = h('div', { class: 'tag-list' });
 
   function toggle(list, tag) {
@@ -994,7 +1006,6 @@ async function pageTags(main, params) {
 
   async function renameTag(tag) {
     const input = h('input', { class: 'name-input', value: tag, list: 'tag-options' });
-    input.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); document.getElementById('confirm').close('ok'); } });
     setTimeout(() => { input.focus(); input.select(); }, 50);
     const ok = await confirmDialog(t('タグの名前を変える'), [
       h('p', { class: 'muted' }, t('「{tag}」が付いたすべてのファイル・フォルダで名前を変えます。', { tag })),
@@ -1168,7 +1179,7 @@ async function pageTags(main, params) {
     h('div', { class: 'card' }, h('h2', {}, '保存した検索'), savedList),
     h('div', { class: 'card' },
       h('h2', {}, 'タグ'),
-      h('input', { type: 'search', placeholder: t('タグを探す'), oninput: (e) => { filter = e.target.value; renderList(); } }),
+      h('input', { type: 'search', placeholder: t('タグを探す'), value: filter, oninput: (e) => { filter = tagListFilter = e.target.value; renderList(); } }),
       h('p', { class: 'muted small' }, t('＋ で検索に含め、⊘ で除きます。件数は直接付いている数です。')),
       listEl),
     h('div', { class: 'card' },
@@ -1339,7 +1350,8 @@ const suggestWatch = {
       pending = requests.some((r) => r.state === 'queued' || r.state === 'running');
       for (const fn of this.listeners) fn(before, this.byPath);
     } catch { /* 次の問い合わせで回復する */ }
-    this.timer = setTimeout(() => this.poll(), pending ? 1000 : 4000);
+    // 見ている画面（待ち受け）が無くなったら、問い合わせを続けない（次に画面を開いたときに watch で始め直す）
+    if (this.listeners.size) this.timer = setTimeout(() => this.poll(), pending ? 1000 : 4000);
   },
   watch(root) { if (this.root !== root) { this.root = root; this.byPath = {}; } this.poll(); },
 };
@@ -1444,7 +1456,11 @@ function suggestionPanel(root, path, { auto = true, onAccept = null } = {}) {
       toast(t('採用リストに入れました: {name}', { name: newName }));
       if (onAccept) onAccept();
     }
-    nameInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); accept(); } });
+    nameInput.addEventListener('keydown', (e) => {
+      // かな漢字変換を確定する Enter では採用しない（変換の途中の名前で採用されてしまう）
+      if (e.isComposing || e.keyCode === 229) return;
+      if (e.key === 'Enter') { e.preventDefault(); accept(); }
+    });
 
     setChildren(holder,
       h('div', { class: 'muted small' }, `${s.doc_type || ''}${s.model ? ` ／ ${s.model}` : ''}${s.cached ? '' : ''}`),
@@ -1465,7 +1481,7 @@ function suggestionPanel(root, path, { auto = true, onAccept = null } = {}) {
   }
 
   const listener = (_before, now) => {
-    if (!holder.isConnected) { suggestWatch.listeners.delete(listener); return; }
+    if (detached(holder)) { suggestWatch.listeners.delete(listener); return; }
     const r = now[path];
     if (!loaded && r) load();
   };
@@ -1616,7 +1632,7 @@ async function pageOrganize(main, root) {
 
   // 一覧の印（待ち・作成中・提案あり）を、待ち行列の様子に合わせて更新する
   const listener = (_b, now) => {
-    if (!listBody.isConnected) { suggestWatch.listeners.delete(listener); return; }
+    if (detached(listBody)) { suggestWatch.listeners.delete(listener); return; }
     for (const f of files) if (now[f.path] && now[f.path].state === 'done' && !f.suggestion) f.suggestion = { new_name: '…' };
     renderList();
   };
@@ -1624,8 +1640,10 @@ async function pageOrganize(main, root) {
   suggestWatch.watch(root);
 
   const keyHandler = (e) => {
-    if (!listBody.isConnected) { document.removeEventListener('keydown', keyHandler); return; }
+    if (detached(listBody)) { document.removeEventListener('keydown', keyHandler); return; }
     if (['INPUT', 'TEXTAREA', 'SELECT'].includes(document.activeElement?.tagName)) return;
+    // 確認のダイアログが開いている間と、修飾キーつき（Ctrl+J・Ctrl+K などブラウザの操作）は扱わない
+    if (document.getElementById('confirm').open || e.ctrlKey || e.metaKey || e.altKey) return;
     if (e.key === 'ArrowDown' || e.key === 'j') { e.preventDefault(); move(1); }
     if (e.key === 'ArrowUp' || e.key === 'k') { e.preventDefault(); move(-1); }
     if (e.key === 'Delete' && current) { e.preventDefault(); deleteCurrent(); }

@@ -104,3 +104,28 @@ def test_badges_inside_paths_are_translated() -> None:
     for m in re.finditer(r"class: 'badge[^']*' \}, '([^']+)'\)", pages):
         if re.search(r"[\u3040-\u30ff\u4e00-\u9fff]", m.group(1)):
             assert m.group(1) in keys, m.group(1)
+
+
+def test_dialogs_leave_enter_to_the_form() -> None:
+    """確認のダイアログで、入力欄の Enter が「実行する」になり、かな漢字変換を確定する Enter では実行しない。
+
+    - 「やめる」は送信ボタンにしない（先頭の送信ボタンが Enter の既定になり、名前や理由を入れて Enter を押すと取りやめになる）
+    - keydown で Enter を見て実行するときは、変換の途中（isComposing）を除く。ダイアログは keydown で閉じず、フォームに任せる
+    """
+    html = (STATIC / "index.html").read_text(encoding="utf-8")
+    cancel = re.search(r"<button[^>]*id=\"confirm-cancel\"[^>]*>", html)
+    assert cancel is not None and 'type="button"' in cancel.group(0)
+    for name in ("app.js", "pages.js"):
+        lines = (STATIC / name).read_text(encoding="utf-8").splitlines()
+        for i, line in enumerate(lines):
+            if "'Enter'" not in line:
+                continue
+            assert ".close('ok')" not in line, f"{name}:{i + 1}: Enter でダイアログを閉じている（フォームの既定のボタンに任せる）"
+            assert any("isComposing" in x for x in lines[max(0, i - 3) : i + 1]), f"{name}:{i + 1}: 変換を確定する Enter を除いていない"
+
+
+def test_buttons_inside_chips_do_not_submit_forms() -> None:
+    """タグの × ボタンは type=button にする（ダイアログのフォームの中では、送信ボタンとして働いて閉じてしまう）。"""
+    js = (STATIC / "pages.js").read_text(encoding="utf-8")
+    chip = re.search(r"function tagChip\(.*?\n}\n", js, flags=re.DOTALL)
+    assert chip is not None and "type: 'button'" in chip.group(0)

@@ -190,6 +190,12 @@ dialog ul { padding-left: 1.2rem; }
 @media (max-width: 640px) {
   .hide-narrow { display: none; }
   main { padding: .5rem; }
+  /* 上部のバー: メニューが1文字ずつ縦に折れたり、言語とテーマの欄が画面の外へはみ出したりしないよう、行を折り返す */
+  .topbar { flex-wrap: wrap; gap: .4rem 1rem; }
+  .topbar nav { flex-wrap: wrap; gap: .3rem .9rem; }
+  .topbar nav a { white-space: nowrap; }
+  /* 絞り込みなどのツールバーは、高さがあって上部のバーの下に潜るので、固定しない */
+  .toolbar { position: static; }
 }
 
 /* タグのチップ */
