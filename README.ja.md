@@ -286,6 +286,11 @@ exclude = ["*.partial"]              # 走査しない（ルートからの相�
 allow = ["archive/**"]               # 報告しない（「残す」と判断したもの）
 device_names = ["zefat", "hermon"]   # 同期クライアントが競合コピーに付ける端末名
 app_data_names = ["MyLauncher"]      # 既定に加えて、アプリのデータとみなすフォルダ名
+app_data_min_files = 500             # この数以上のファイルを抱え、拡張子の無いものが過半数のフォルダをアプリのデータとみなす
+disabled = ["stale-large"]           # 使わない検出ルール（カテゴリの短い名前）
+stale_min_mb = 500                   # 「大きくて長く触れていないもの」の大きさ（MB）
+stale_days = 365                     # …と、触れていない日数
+fanout_max = 200                     # 構造の見直しで「直下のファイルが多すぎる」とする数
 
 [safety]
 mass_missing_ratio = 0.2             # これを超える割合が消えたら、削除の記録を保留する
@@ -342,6 +347,8 @@ fallback = true                          # 主のモデルが応答しない（�
 use_images = true
 max_chars = 4000                         # モデルに渡す本文の上限
 candidates = 15                          # モデルに選ばせる移動先の候補の数
+temperature = 0.2                        # 低いほど毎回同じ提案になる
+timeout = 300                            # 1件の問い合わせの待ち時間の上限（秒）
 
 [organize.endpoints]                     # OpenAI 互換の API の送り先。モデルを「モデル名@名前」で指定する
 strata = "http://127.0.0.1:18080/v1"     # 例: model = "qwen3.8-flash-next-iq3_s@strata"
@@ -350,6 +357,8 @@ strata = "http://127.0.0.1:18080/v1"     # 例: model = "qwen3.8-flash-next-iq3_
 auto = false                             # 新しい音声・動画を裏で書き起こす
 model = "large-v3-turbo"                 # faster-whisper のモデル
 device = "auto"                          # auto（使えれば GPU）・cuda・cpu
+device_index = 0                         # GPU が複数あるときの番号
+compute_type = "auto"                    # auto なら GPU は float16、CPU は int8
 language = ""                            # 空なら自動で判定
 vad_threshold = 0.2                      # 下げるほど小さな声も拾う（下げすぎると物音に作文する）
 max_minutes = 240                        # これより長いものは書き起こさない

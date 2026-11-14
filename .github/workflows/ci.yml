@@ -12,8 +12,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # 対応を宣言している下限・中間・最新の Python で確かめる
-        python-version: ['3.11', '3.12', '3.13']
+        # 対応を宣言しているすべての Python で確かめる
+        python-version: ['3.11', '3.12', '3.13', '3.14', '3.15']
     steps:
       - uses: actions/checkout@v7
 

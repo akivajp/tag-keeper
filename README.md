@@ -368,6 +368,11 @@ exclude = ["*.partial"]              # never scanned (glob on the path relative 
 allow = ["archive/**"]               # never reported ("I decided to keep these")
 device_names = ["zefat", "hermon"]   # suffixes your sync client adds to conflict copies
 app_data_names = ["MyLauncher"]      # extra folder names to treat as application data
+app_data_min_files = 500             # a folder with this many files, most without an extension, counts as application data
+disabled = ["stale-large"]           # detection rules to turn off (short category names)
+stale_min_mb = 500                   # "large and untouched for long": the size (MB)…
+stale_days = 365                     # …and the days without a change
+fanout_max = 200                     # structure review: "too many files directly in a folder"
 
 [safety]
 mass_missing_ratio = 0.2             # hold deletions when more than this share vanishes
@@ -424,6 +429,8 @@ fallback = true                          # use local_model when the main model d
 use_images = true
 max_chars = 4000                         # text passed to the model
 candidates = 15                          # destination folders the model chooses from
+temperature = 0.2                        # lower gives the same suggestion every time
+timeout = 300                            # seconds to wait for one answer
 
 [organize.endpoints]                     # OpenAI-compatible servers; use a model as "model-id@name"
 strata = "http://127.0.0.1:18080/v1"     # e.g. model = "qwen3.8-flash-next-iq3_s@strata"
@@ -432,6 +439,8 @@ strata = "http://127.0.0.1:18080/v1"     # e.g. model = "qwen3.8-flash-next-iq3_
 auto = false                             # transcribe new audio and video in the background
 model = "large-v3-turbo"                 # faster-whisper model
 device = "auto"                          # auto (GPU when possible) / cuda / cpu
+device_index = 0                         # which GPU, when there are several
+compute_type = "auto"                    # auto: float16 on a GPU, int8 on the CPU
 language = ""                            # "" = detect automatically
 vad_threshold = 0.2                      # lower catches quieter voices; too low invents text over noise
 max_minutes = 240                        # longer recordings are skipped

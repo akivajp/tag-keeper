@@ -15,6 +15,8 @@ jobs:
     permissions:
       # Trusted Publishing に必要
       id-token: write
+      # GitHub のリリースを作るのに必要
+      contents: write
     steps:
       - uses: actions/checkout@v7
 
@@ -36,3 +38,16 @@ jobs:
 
       - name: Publish
         uses: pypa/gh-action-pypi-publish@release/v1
+
+      # CHANGELOG の該当の版の節を本文にして、GitHub のリリースを作る
+      # （手作業だと作り忘れるため。既にあれば何もしない）
+      - name: Create GitHub release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          awk -v v="$version" 'index($0, "## [" v "]")==1 {on=1; next} on && index($0, "## [")==1 {exit} on {print}' CHANGELOG.md > notes.md
+          test -s notes.md || { echo "CHANGELOG.md に ${version} の節がありません"; exit 1; }
+          gh release view "$GITHUB_REF_NAME" > /dev/null 2>&1 \
+            || gh release create "$GITHUB_REF_NAME" --verify-tag --title "tag-keeper ${version}" --notes-file notes.md
