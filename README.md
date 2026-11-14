@@ -166,7 +166,7 @@ and the theme (system, light or dark).
 - Writes require a same-origin request, and without auth the `Host` header must name the
   bound address (against DNS rebinding).
 - One job runs at a time. Each job also writes its own log under
-  `~/.local/share/tag-keeper/logs/jobs/`.
+  `~/.local/share/tag-keeper/logs/jobs/` (logs older than 30 days are removed).
 - **Kept up to date by itself.** While the server runs, each root is refreshed (scan, hash
   and the content-hash move matching) every 60 minutes and after every cloud-sync run
   (`[scan]`), and documents are read into the full-text index in the background at low
@@ -219,17 +219,20 @@ and the theme (system, light or dark).
 - **Export and import** the whole management data (tags, attributes, relations, the tag
   dictionary, saved searches) as JSONL with `tag-keeper export` / `import` (also *Export* at
   `/api/export`). Importing skips what is already there.
-- All of this is scriptable: `tag-keeper tags`, `tag`, `alias`, `parent`, `attr`, `relate`,
-  `export`, `import` cover what the pages do.
+- Tags, aliases, parents, attributes, relations, export and import are scriptable:
+  `tag-keeper tags`, `tag`, `alias`, `parent`, `attr`, `relate`, `export`, `import`.
 - **Keep a folder's text out of the index** (a repository, an app library) from the folder's
-  type and card panel; transcripts follow the same switch.
+  type and card panel; transcripts and model readings follow the same switch, and turning it
+  on also removes the text already indexed.
 - **Search** by name and folder, by the text inside documents, by kind (documents, PDF,
   Office, images, videos and so on) and by tags, in any combination. Full-text search covers
   PDF, Office and text files; scanned PDFs without text are read with tesseract when it is
   installed. Text is stored by content hash in an SQLite FTS5 index (trigram, so Japanese
   works without word splitting; one- and two-letter words are searched without the index),
   and the matches are highlighted in the results. Rebuildable folders such as `node_modules`
-  and application data are left out.
+  and application data are left out. Text of files that were rewritten, or deleted more than 30
+  days ago, is removed from the index; `tag-keeper extract --retry-errors` re-reads files that
+  could not be read before.
 - **Narrow it down** by folder, modification date, size and attributes; group identical
   files into one row (the other places are listed under it); include files that are gone —
   deleted, or moved away from that path — which link to the version history. **Save** any set
@@ -358,6 +361,9 @@ $ uv run --extra dev pytest
 
 Optional. `~/.config/tag-keeper/config.toml`:
 
+Unknown sections and keys (typos) and values of the wrong type (`allow_cloud = "false"`) are
+reported as errors instead of being ignored.
+
 ```toml
 [[roots]]
 name = "onedrive"
@@ -420,7 +426,7 @@ dir = "~/.local/share/tag-keeper/tags"   # where the per-machine tag logs live
 inbox_patterns = ["tmp", "temp", "*未整理*", "*inbox*"]  # case-insensitive globs on folder names
 ollama_url = "http://127.0.0.1:11434"
 model = "gemma4:12b"                     # e.g. "gemma4:31b-cloud" (content is sent to ollama's cloud)
-vision_model = ""                        # model for images when `model` cannot read them
+vision_model = ""                        # model that reads images (empty: `model` reads them)
 model_choices = ["gemma4:31b-cloud"]     # extra models offered on the page
 local_model = "gemma4:12b"               # used instead of a cloud model for roots with allow_cloud = false
 think = ""                               # "true" / "false" for thinking models; "" = model default (local_think for local models)
@@ -457,7 +463,8 @@ batch = 10                               # items per background round
 ```
 
 With roots configured, `tag-keeper scan` (no arguments) scans all of them.
-Every command accepts `--log-file PATH` to keep a timestamped log.
+Every command accepts `--log-file PATH` to keep a timestamped log (put it before the
+subcommand: `tag-keeper --log-file scan.log scan`).
 
 Besides ollama, any OpenAI-compatible server (Strata, Project Maya, llama.cpp, vLLM…) can be
 used: list it under `[organize.endpoints]` and name a model `model-id@name`; its models also

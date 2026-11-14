@@ -7,6 +7,76 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.22.0] - 2026-11-15
+
+A review of the whole code base. Nothing new to learn; many things that could go wrong no
+longer do.
+
+### Changed
+
+- **The config file is checked.** Unknown sections and keys (typos such as `allow-cloud`) and
+  values of the wrong type (`allow_cloud = "false"`, `exclude = "*.partial"`) are errors with a
+  did-you-mean hint. Before, they were ignored, so a root meant to keep its content local could
+  still be sent to a cloud model. `think` / `local_think` also accept TOML booleans.
+- A model on an ollama server that is not on a local address counts as sending content
+  outside, whatever its name. For a root with `allow_cloud = false`, a `local_model` that would
+  itself send content outside is refused instead of used.
+- Job logs older than 30 days are removed; the PDF preview cache is kept under 1 GB.
+
+### Added
+
+- `tag-keeper extract --retry-errors` re-reads files that could not be read before.
+- Text of rewritten files, and of files deleted more than 30 days ago, is removed from the
+  full-text index. Keeping a folder out of the index also removes what was already indexed.
+- With several roots, each root card links to its Files, Inbox, Search and Review pages
+  (`#/search?root=name`).
+- CI runs on Python 3.14 and 3.15, and publishing creates the GitHub release from this file.
+
+### Fixed
+
+Plans — things that could quarantine the wrong file:
+
+- A file changed after the scan that judged it (an empty file since written, a copy since
+  edited) is left out of the plan.
+- A copy or old version is quarantined only while the original or newer version is still
+  there unchanged; this is checked again right before the move.
+- Keeping (or allow-listing) a candidate no longer makes its parent folder the next candidate.
+- The quarantine is journaled right after the move, so a failure while detaching tags can be
+  undone. Plans made in the same second no longer overwrite each other, a plan cannot be
+  deleted while it runs, and a refused rename leaves no draft plan behind.
+
+Scan and tags:
+
+- Entries whose attributes cannot be read are not recorded as deleted.
+- A folder move is inferred only when most of its files moved with it (one shared `LICENSE`
+  used to carry a folder's tags and type onto an unrelated folder); empty files are not linked
+  by hash; identical files that come back to their paths are linked without asking.
+- Folders kept out of the index, review decisions and declined relinks follow moves. Tags
+  added under an alias on another host are found again. Folder types work for NFD names.
+
+Models, extraction, transcription:
+
+- Tag names used only in `allow_cloud = false` roots are left out of prompts sent outside.
+- A bad request (HTTP 400) fails that file only instead of switching every file to the local
+  model for 10 minutes; readings that fail because the model is down are retried later instead
+  of being stored as errors; odd answers (non-list labels, `NaN`) no longer raise.
+- Suggested names fit in 255 bytes. Shift_JIS text cut mid-character is no longer garbled.
+- Folders kept out of the index are honoured by `tag-keeper transcribe` and by readings.
+- Transcription no longer hangs on a noisy child, enforces its time limit, fails only the file
+  being read when the process crashes, and skips over-long recordings before decoding them.
+
+Web UI:
+
+- A slow response for the previous folder or file no longer overwrites the current screen.
+- A finished cloud sync no longer redraws the page being worked on (ticked rows, filters and
+  half-typed names were lost on every sync).
+- In dialogs, Enter confirms instead of cancelling, and the Enter that commits an IME
+  conversion no longer confirms.
+- A job whose log cannot be opened no longer blocks every later job. Excel preview of a
+  workbook with a huge sheet no longer takes gigabytes. Video conversion no longer hangs on a
+  noisy ffmpeg. Bad numbers return 400, and downloads of non-ASCII names keep their names.
+- Narrow screens: the top bar wraps, and choosing a file scrolls to its details.
+
 ## [0.21.1] - 2026-11-08
 
 ### Added
@@ -416,7 +486,8 @@ First release. The web UI and messages are in Japanese.
 - **Decision log.** Accepted suggestions, tag accept and reject, and undone plans are
   appended per machine; the closest past decisions are given to the model as examples.
 
-[Unreleased]: https://github.com/akivajp/tag-keeper/compare/v0.21.1...HEAD
+[Unreleased]: https://github.com/akivajp/tag-keeper/compare/v0.22.0...HEAD
+[0.22.0]: https://github.com/akivajp/tag-keeper/compare/v0.21.1...v0.22.0
 [0.21.1]: https://github.com/akivajp/tag-keeper/compare/v0.21.0...v0.21.1
 [0.21.0]: https://github.com/akivajp/tag-keeper/compare/v0.20.0...v0.21.0
 [0.20.0]: https://github.com/akivajp/tag-keeper/compare/v0.19.0...v0.20.0
