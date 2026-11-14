@@ -60,6 +60,7 @@ from tag_keeper.config import (
     load_config,
 )
 from tag_keeper.dirtypes import scan_exclusions
+from tag_keeper import fulltext as fulltext_mod
 from tag_keeper.fulltext import KINDS, Pending, app_data_names, find_entries, query_terms, run_pending, snippets
 from tag_keeper.hashing import hash_root
 from tag_keeper.plan import (
@@ -287,6 +288,8 @@ def cmd_extract(args: argparse.Namespace, config: Config) -> int:
     ocr = extract_mod.ocr_languages(config.extract.ocr_lang) if config.extract.ocr else None
     log.info("OCR: %s", ocr or ("tesseract が無いので使いません" if config.extract.ocr else "使いません"))
     conn = connect(args.db)
+    if args.retry_errors:
+        log.info("前に読めなかった記録を消しました（読み直します）: %s 件", f"{fulltext_mod.retry_errors(conn):,}")
     for rc in resolve_roots(config, args.roots):
         root_id = ensure_root(conn, rc.name, rc.path)
         with Progress(
@@ -316,6 +319,8 @@ def cmd_extract(args: argparse.Namespace, config: Config) -> int:
             f"{res.errors:,}",
             f"{res.skipped:,}",
         )
+    # 書き換えた・削除したファイルの古い本文などを掃除する
+    fulltext_mod.prune(conn, config)
     return 0
 
 
@@ -352,7 +357,8 @@ def cmd_transcribe(args: argparse.Namespace, config: Config) -> int:
                     log.warning("書き起こせませんでした: %s（%s）", t.relpath, r.error)
 
             transcribe.run_pending(conn, root_id, rc.path, opts, limit=args.limit, paths=args.path or None, force=bool(args.path),
-                                   app_data=app_data_names(config), on_start=on_start, on_item=on_item)
+                                   app_data=app_data_names(config), no_extract=TagStore(config.tags.dir).no_extract_of(rc.name),
+                                   on_start=on_start, on_item=on_item)
     return status
 
 
@@ -380,8 +386,13 @@ def cmd_snapwatch(args: argparse.Namespace, config: Config) -> int:
     data_dir = args.db.parent
     watch = snapwatch.Watch(data_dir / "snapwatch.json")
     if args.protect:
-        snapwatch.protect(config.plan.snapper_config, args.protect)
-        for rc in config.roots:
+        try:
+            snapwatch.protect(config.plan.snapper_config, args.protect)
+        except RuntimeError as e:
+            # snapper の設定が無い・snapper が失敗した。トレースバックではなく、メッセージで知らせる
+            raise ConfigError(str(e)) from e
+        # 印を付けるのは、指定したルート（省略時は全ルート）
+        for rc in resolve_roots(config, args.roots):
             watch.mark_protected(rc.name, args.protect)
         log.info("スナップショット #%s を自動削除の対象から外しました", args.protect)
         return 0
@@ -596,7 +607,11 @@ def cmd_export(args: argparse.Namespace, config: Config) -> int:
 def cmd_import(args: argparse.Namespace, config: Config) -> int:
     """export で書き出した JSONL を読み込む（この端末のタグのログに追記する。既にあるものは飛ばす）。"""
     events = []
-    for n, line in enumerate(args.file.read_text(encoding="utf-8").splitlines(), 1):
+    try:
+        lines = args.file.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeDecodeError) as e:
+        raise ConfigError(f"{args.file} を読めません: {e}") from e
+    for n, line in enumerate(lines, 1):
         if not line.strip():
             continue
         try:
@@ -1036,6 +1051,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("roots", nargs="*", metavar="ROOT", help="ルート名かフォルダのパス（省略時は全ルート）")
     p.add_argument("--limit", type=int, default=None, help="この回に抽出する件数の上限（書類・新しいものから）")
     p.add_argument("--no-ocr", action="store_true", help="tesseract があっても OCR を使わない（スキャンは後で読み直す）")
+    p.add_argument("--retry-errors", action="store_true", help="前に読めなかったもの（時間切れ・壊れたファイル・書き起こしの失敗）を読み直す")
     p.set_defaults(func=cmd_extract)
 
     p = sub.add_parser("transcribe", help="音声・動画を書き起こして、全文検索の索引に入れる（faster-whisper が要る）")
@@ -1199,6 +1215,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
     setup_logging(args.log_file, args.verbose)
     args.db = args.db or default_db_path()
+    if args.config is not None and not args.config.exists():
+        # 綴りの違うパスを渡しても、黙って既定値で動いてしまわないように知らせる
+        log.warning("設定ファイルがありません: %s（既定の設定で動きます）", args.config)
     try:
         config = load_config(args.config)
         return int(args.func(args, config))

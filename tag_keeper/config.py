@@ -59,6 +59,7 @@
 
 from __future__ import annotations
 
+import difflib
 import os
 import socket
 import tomllib
@@ -251,7 +252,7 @@ class OrganizeConfig:
 
     # 受け皿とみなすフォルダ名。大文字・小文字を区別しない glob で、フォルダ名（パスの最後）に照合する
     inbox_patterns: list[str] = field(default_factory=lambda: ["tmp", "temp", "*未整理*", "*inbox*"])
-    # ollama の API の URL（外部のサービスには送らない。手元のモデルだけを使う）
+    # ollama の API の URL。手元（ループバック・LAN・Tailscale）でなければ、ollama のどのモデルも「外部へ送る」扱いになる
     ollama_url: str = "http://127.0.0.1:11434"
     # 名前と移動先の提案に使うモデル（既定は手元のモデル）。
     # ollama のクラウドのモデル（例: "glm-5.3-flash:cloud"）も使えるが、その場合はファイルの内容が ollama のクラウドに送られる
@@ -327,8 +328,104 @@ def _replicas(path: Path, i: int, raw: object) -> dict[str, str]:
     return out
 
 
+class _Table:
+    """設定ファイルの1つの表。値を型を確かめながら取り出し、最後に知らないキーが残っていないかを確かめる。
+
+    綴りの違うキー（allow-cloud など）や型の違う値（allow_cloud = "false"）を黙って受け入れると、
+    「外部へ送らない」のような守りの設定が効かないまま動いてしまうので、どちらも ConfigError にする。
+    """
+
+    def __init__(self, path: Path, where: str, raw: object) -> None:
+        if not isinstance(raw, dict):
+            raise ConfigError(f"{path}: {where} は表（キー = 値 の並び）で書いてください")
+        self.path = path
+        self.where = where
+        self.raw: dict[str, Any] = raw
+        # 取り出そうとしたキー（書かれていなくても記録する。知らないキーの判定と、綴りの候補に使う）
+        self.known: set[str] = set()
+
+    def has(self, key: str) -> bool:
+        """そのキーが書かれているか。"""
+        self.known.add(key)
+        return key in self.raw
+
+    def _bad(self, key: str, want: str) -> ConfigError:
+        return ConfigError(f"{self.path}: {self.where} の {key} は{want}で書いてください: {self.raw[key]!r}")
+
+    def get_bool(self, key: str, default: bool) -> bool:
+        """真偽値（true / false）。文字列の "false" などは受け付けない。"""
+        if not self.has(key):
+            return default
+        v = self.raw[key]
+        if not isinstance(v, bool):
+            raise self._bad(key, " true か false（引用符なし）")
+        return v
+
+    def get_int(self, key: str, default: int) -> int:
+        """整数。"""
+        if not self.has(key):
+            return default
+        v = self.raw[key]
+        if isinstance(v, bool) or not isinstance(v, int):
+            raise self._bad(key, "整数")
+        return v
+
+    def get_float(self, key: str, default: float) -> float:
+        """数（整数か小数）。"""
+        if not self.has(key):
+            return default
+        v = self.raw[key]
+        if isinstance(v, bool) or not isinstance(v, (int, float)):
+            raise self._bad(key, "数")
+        return float(v)
+
+    def get_str(self, key: str, default: str) -> str:
+        """文字列。"""
+        if not self.has(key):
+            return default
+        v = self.raw[key]
+        if not isinstance(v, str):
+            raise self._bad(key, "文字列（引用符つき）")
+        return v
+
+    def get_str_list(self, key: str, default: list[str]) -> list[str]:
+        """文字列の配列。文字列を1つだけ書いたもの（1文字ずつの配列として読めてしまう）は受け付けない。"""
+        if not self.has(key):
+            return default
+        v = self.raw[key]
+        if not isinstance(v, list) or not all(isinstance(x, str) for x in v):
+            raise self._bad(key, "文字列の配列（[\"…\", \"…\"]）")
+        return list(v)
+
+    def get_switch(self, key: str, default: str) -> str:
+        """"true" / "false" / 空 の3通りの文字列（think など）。TOML の真偽値で書いたものも受け付ける。"""
+        if not self.has(key):
+            return default
+        v = self.raw[key]
+        if isinstance(v, bool):
+            return "true" if v else "false"
+        if not isinstance(v, str) or v.strip().lower() not in ("", "true", "false"):
+            raise self._bad(key, " \"true\"・\"false\" か空")
+        return v.strip().lower()
+
+    def finish(self) -> None:
+        """知らないキーが書かれていれば ConfigError（似た名前のキーがあれば添える）。"""
+        for key in self.raw:
+            if key in self.known:
+                continue
+            near = difflib.get_close_matches(str(key), sorted(self.known), n=1)
+            hint = f"（{near[0]} の間違いではありませんか）" if near else ""
+            raise ConfigError(f"{self.path}: {self.where} に知らない設定があります: {key}{hint}")
+
+
+# 設定ファイルに書ける節（これ以外は、綴りの違いとみなして知らせる）
+_SECTIONS = ("roots", "hygiene", "safety", "scan", "plan", "tags", "extract", "organize", "ai", "transcribe", "digest")
+
+
 def load_config(path: Path | None = None) -> Config:
     """設定ファイルを読み込む。ファイルが無ければ既定値の設定を返す。
+
+    知らない節・キーと、型の合わない値は ConfigError にする（黙って既定値のまま動かさない）。
 
     Args:
         path: 設定ファイルのパス。None なら既定のパスを使う。
@@ -336,146 +433,165 @@ def load_config(path: Path | None = None) -> Config:
     path = path or default_config_path()
     if not path.exists():
         return Config()
-    with path.open("rb") as f:
-        data = tomllib.load(f)
+    try:
+        with path.open("rb") as f:
+            data = tomllib.load(f)
+    except tomllib.TOMLDecodeError as e:
+        raise ConfigError(f"{path}: TOML として読めません: {e}") from e
+    except (OSError, UnicodeDecodeError) as e:
+        raise ConfigError(f"{path}: 読めません: {e}") from e
+    for key in data:
+        if key not in _SECTIONS:
+            near = difflib.get_close_matches(str(key), _SECTIONS, n=1)
+            hint = f"（{near[0]} の間違いではありませんか）" if near else ""
+            raise ConfigError(f"{path}: 知らない節があります: [{key}]{hint}")
 
+    def table(name: str) -> _Table:
+        return _Table(path, f"[{name}]", data.get(name, {}))
+
+    raw_roots = data.get("roots", [])
+    if not isinstance(raw_roots, list):
+        raise ConfigError(f"{path}: roots は [[roots]] の形で書いてください")
     roots: list[RootConfig] = []
-    for i, item in enumerate(data.get("roots", [])):
-        if "name" not in item or "path" not in item:
+    for i, item in enumerate(raw_roots):
+        t = _Table(path, f"roots[{i}]", item)
+        if not t.has("name") or not t.has("path"):
             raise ConfigError(f"{path}: roots[{i}] には name と path が必要です")
-        sync_client = str(item.get("sync_client", ""))
+        sync_client = t.get_str("sync_client", "")
         if sync_client not in ("", "onedrive", "cloud-sync"):
             raise ConfigError(f"{path}: roots[{i}] の sync_client は \"onedrive\"・\"cloud-sync\" か空にしてください: {sync_client}")
-        sync_guard = str(item.get("sync_guard", "auto"))
+        sync_guard = t.get_str("sync_guard", "auto")
         if sync_guard not in ("auto", "always"):
             raise ConfigError(f"{path}: roots[{i}] の sync_guard は \"auto\" か \"always\" にしてください: {sync_guard}")
         roots.append(
             RootConfig(
-                name=str(item["name"]),
-                path=_expand(str(item["path"])),
-                exclude=[str(p) for p in item.get("exclude", [])],
+                name=t.get_str("name", ""),
+                path=_expand(t.get_str("path", "")),
+                exclude=t.get_str_list("exclude", []),
                 sync_client=sync_client,
-                sync_service=str(item.get("sync_service", "onedrive.service")),
+                sync_service=t.get_str("sync_service", "onedrive.service"),
                 sync_guard=sync_guard,
-                replicas=_replicas(path, i, item.get("replicas", {})),
-                allow_cloud=bool(item.get("allow_cloud", True)),
+                replicas=_replicas(path, i, item["replicas"] if t.has("replicas") else {}),
+                allow_cloud=t.get_bool("allow_cloud", True),
             )
         )
+        t.finish()
     names = [r.name for r in roots]
     if len(names) != len(set(names)):
         raise ConfigError(f"{path}: roots の name が重複しています")
 
-    hy = data.get("hygiene", {})
+    hy = table("hygiene")
     hygiene = HygieneConfig()
-    if "allow" in hy:
-        hygiene.allow = [str(p) for p in hy["allow"]]
-    if "device_names" in hy:
-        hygiene.device_names = [str(n) for n in hy["device_names"]]
-    if "app_data_names" in hy:
-        hygiene.app_data_names = [str(n) for n in hy["app_data_names"]]
-    if "app_data_min_files" in hy:
-        hygiene.app_data_min_files = int(hy["app_data_min_files"])
-    if "disabled" in hy:
-        hygiene.disabled = [str(x) for x in hy["disabled"]]
-    for key in ("stale_min_mb", "stale_days", "fanout_max"):
-        if key in hy:
-            setattr(hygiene, key, int(hy[key]))
+    hygiene.allow = hy.get_str_list("allow", hygiene.allow)
+    hygiene.device_names = hy.get_str_list("device_names", hygiene.device_names)
+    hygiene.app_data_names = hy.get_str_list("app_data_names", hygiene.app_data_names)
+    hygiene.app_data_min_files = hy.get_int("app_data_min_files", hygiene.app_data_min_files)
+    hygiene.disabled = hy.get_str_list("disabled", hygiene.disabled)
+    hygiene.stale_min_mb = hy.get_int("stale_min_mb", hygiene.stale_min_mb)
+    hygiene.stale_days = hy.get_int("stale_days", hygiene.stale_days)
+    hygiene.fanout_max = hy.get_int("fanout_max", hygiene.fanout_max)
+    hy.finish()
 
-    sf = data.get("safety", {})
+    sf = table("safety")
     safety = SafetyConfig()
-    if "mass_missing_ratio" in sf:
-        safety.mass_missing_ratio = float(sf["mass_missing_ratio"])
-    if "mass_missing_min" in sf:
-        safety.mass_missing_min = int(sf["mass_missing_min"])
+    safety.mass_missing_ratio = sf.get_float("mass_missing_ratio", safety.mass_missing_ratio)
+    safety.mass_missing_min = sf.get_int("mass_missing_min", safety.mass_missing_min)
+    sf.finish()
 
-    sc = data.get("scan", {})
+    sc = table("scan")
     scan = ScanConfig()
-    if "auto_refresh" in sc:
-        scan.auto_refresh = int(sc["auto_refresh"])
-    if "after_sync" in sc:
-        scan.after_sync = bool(sc["after_sync"])
-    if "relink_days" in sc:
-        scan.relink_days = int(sc["relink_days"])
+    scan.auto_refresh = sc.get_int("auto_refresh", scan.auto_refresh)
+    scan.after_sync = sc.get_bool("after_sync", scan.after_sync)
+    scan.relink_days = sc.get_int("relink_days", scan.relink_days)
+    sc.finish()
     if scan.auto_refresh < 0 or scan.relink_days < 0:
         raise ConfigError(f"{path}: [scan] の auto_refresh と relink_days は 0 以上にしてください")
 
-    pl = data.get("plan", {})
+    pl = table("plan")
     plan = PlanConfig()
-    if "quarantine_dir" in pl:
-        plan.quarantine_dir = _expand(str(pl["quarantine_dir"]))
-    if "snapper_config" in pl:
-        plan.snapper_config = str(pl["snapper_config"])
+    if pl.has("quarantine_dir"):
+        plan.quarantine_dir = _expand(pl.get_str("quarantine_dir", ""))
+    plan.snapper_config = pl.get_str("snapper_config", plan.snapper_config)
+    pl.finish()
 
-    tg = data.get("tags", {})
+    tg = table("tags")
     tags = TagsConfig()
-    if "dir" in tg:
-        tags.dir = _expand(str(tg["dir"]))
+    if tg.has("dir"):
+        tags.dir = _expand(tg.get_str("dir", ""))
+    tg.finish()
 
-    ex = data.get("extract", {})
+    ex = table("extract")
     extract = ExtractConfig()
-    for key, conv in (
-        ("enabled", bool),
-        ("ocr", bool),
-        ("ocr_images", bool),
-        ("ocr_lang", str),
-        ("ocr_pages", int),
-        ("max_chars", int),
-        ("max_mb", int),
-    ):
-        if key in ex:
-            setattr(extract, key, conv(ex[key]))
+    extract.enabled = ex.get_bool("enabled", extract.enabled)
+    extract.ocr = ex.get_bool("ocr", extract.ocr)
+    extract.ocr_images = ex.get_bool("ocr_images", extract.ocr_images)
+    extract.ocr_lang = ex.get_str("ocr_lang", extract.ocr_lang)
+    extract.ocr_pages = ex.get_int("ocr_pages", extract.ocr_pages)
+    extract.max_chars = ex.get_int("max_chars", extract.max_chars)
+    extract.max_mb = ex.get_int("max_mb", extract.max_mb)
+    ex.finish()
     if extract.ocr_pages < 1 or extract.max_chars < 1 or extract.max_mb < 1:
         raise ConfigError(f"{path}: [extract] の ocr_pages・max_chars・max_mb は 1 以上にしてください")
 
-    og = data.get("organize", {})
+    og = table("organize")
     organize = OrganizeConfig()
-    if "inbox_patterns" in og:
-        organize.inbox_patterns = [str(x) for x in og["inbox_patterns"]]
-    if "model_choices" in og:
-        organize.model_choices = [str(x) for x in og["model_choices"]]
-    if "endpoints" in og:
-        if not isinstance(og["endpoints"], dict):
+    organize.inbox_patterns = og.get_str_list("inbox_patterns", organize.inbox_patterns)
+    organize.model_choices = og.get_str_list("model_choices", organize.model_choices)
+    if og.has("endpoints"):
+        raw_eps = og.raw["endpoints"]
+        if not isinstance(raw_eps, dict) or not all(isinstance(v, str) for v in raw_eps.values()):
             raise ConfigError(f"{path}: [organize.endpoints] は 名前 = \"URL\" の形で書いてください")
-        organize.endpoints = {str(k): str(v).rstrip("/") for k, v in og["endpoints"].items()}
-    for key, conv in (
-        ("ollama_url", str),
-        ("model", str),
-        ("vision_model", str),
-        ("local_model", str),
-        ("think", str),
-        ("local_think", str),
-        ("fallback", bool),
-        ("use_images", bool),
-        ("max_chars", int),
-        ("candidates", int),
-        ("temperature", float),
-        ("timeout", float),
-    ):
-        if key in og:
-            setattr(organize, key, conv(og[key]))
+        organize.endpoints = {str(k): v.rstrip("/") for k, v in raw_eps.items()}
+    organize.ollama_url = og.get_str("ollama_url", organize.ollama_url)
+    organize.model = og.get_str("model", organize.model)
+    organize.vision_model = og.get_str("vision_model", organize.vision_model)
+    organize.local_model = og.get_str("local_model", organize.local_model)
+    organize.think = og.get_switch("think", organize.think)
+    organize.local_think = og.get_switch("local_think", organize.local_think)
+    organize.fallback = og.get_bool("fallback", organize.fallback)
+    organize.use_images = og.get_bool("use_images", organize.use_images)
+    organize.max_chars = og.get_int("max_chars", organize.max_chars)
+    organize.candidates = og.get_int("candidates", organize.candidates)
+    organize.temperature = og.get_float("temperature", organize.temperature)
+    organize.timeout = og.get_float("timeout", organize.timeout)
+    og.finish()
+    if organize.max_chars < 1 or organize.candidates < 1 or organize.timeout <= 0:
+        raise ConfigError(f"{path}: [organize] の max_chars・candidates は 1 以上、timeout は 0 より大きくしてください")
 
-    ai_raw = data.get("ai", {})
+    ai_raw = table("ai")
     ai = AiConfig()
-    for key, conv in (("auto", bool), ("images", bool), ("batch", int)):
-        if key in ai_raw:
-            setattr(ai, key, conv(ai_raw[key]))
-    tr = data.get("transcribe", {})
+    ai.auto = ai_raw.get_bool("auto", ai.auto)
+    ai.images = ai_raw.get_bool("images", ai.images)
+    ai.batch = ai_raw.get_int("batch", ai.batch)
+    ai_raw.finish()
+
+    tr = table("transcribe")
     transcribe = TranscribeConfig()
-    for key, conv in (
-        ("auto", bool), ("model", str), ("device", str), ("device_index", int), ("compute_type", str),
-        ("language", str), ("vad_threshold", float), ("max_minutes", int), ("batch", int),
-    ):
-        if key in tr:
-            setattr(transcribe, key, conv(tr[key]))
+    transcribe.auto = tr.get_bool("auto", transcribe.auto)
+    transcribe.model = tr.get_str("model", transcribe.model)
+    transcribe.device = tr.get_str("device", transcribe.device)
+    transcribe.device_index = tr.get_int("device_index", transcribe.device_index)
+    transcribe.compute_type = tr.get_str("compute_type", transcribe.compute_type)
+    transcribe.language = tr.get_str("language", transcribe.language)
+    transcribe.vad_threshold = tr.get_float("vad_threshold", transcribe.vad_threshold)
+    transcribe.max_minutes = tr.get_int("max_minutes", transcribe.max_minutes)
+    transcribe.batch = tr.get_int("batch", transcribe.batch)
+    tr.finish()
     if transcribe.device not in ("auto", "cuda", "cpu"):
         raise ConfigError(f"{path}: [transcribe] の device は auto・cuda・cpu のどれかにしてください: {transcribe.device}")
-    dg = data.get("digest", {})
+
+    dg = table("digest")
     digest = DigestConfig()
-    if "path" in dg:
-        digest.path = str(_expand(str(dg["path"]))) if str(dg["path"]) else ""
-    for key in ("every_hours", "days"):
-        if key in dg:
-            setattr(digest, key, int(dg[key]))
+    if dg.has("path"):
+        raw_path = dg.get_str("path", "")
+        digest.path = str(_expand(raw_path)) if raw_path else ""
+    digest.every_hours = dg.get_int("every_hours", digest.every_hours)
+    digest.days = dg.get_int("days", digest.days)
+    dg.finish()
+    if ai.batch < 0 or transcribe.batch < 0 or transcribe.max_minutes < 1 or digest.every_hours < 1 or digest.days < 1:
+        raise ConfigError(
+            f"{path}: [ai] batch・[transcribe] batch は 0 以上、[transcribe] max_minutes・[digest] every_hours・days は 1 以上にしてください"
+        )
     return Config(
         roots=roots, hygiene=hygiene, safety=safety, scan=scan, plan=plan, tags=tags, extract=extract, organize=organize, ai=ai,
         transcribe=transcribe, digest=digest,
