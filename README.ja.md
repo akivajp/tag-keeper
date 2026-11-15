@@ -264,6 +264,7 @@ $ tag-keeper --help
 | LibreOffice | Office 文書のレイアウトどおりのプレビュー（PDF） |
 | ffmpeg | FLV・MKV・AVI など、ブラウザが直接は再生できない動画の再生 |
 | faster-whisper（`[transcribe]`・`[transcribe-gpu]`） | 音声・動画の書き起こし |
+| anthropic の SDK（`[claude]`） | Claude API を整理の提案・読み取りのモデルに使う |
 
 ソースから使う場合:
 
@@ -353,6 +354,8 @@ max_chars = 4000                         # モデルに渡す本文の上限
 candidates = 15                          # モデルに選ばせる移動先の候補の数
 temperature = 0.2                        # 低いほど毎回同じ提案になる
 timeout = 300                            # 1件の問い合わせの待ち時間の上限（秒）
+anthropic_key_file = ""                  # Claude API のキーを書いたファイル（空なら環境変数から読む）
+claude_effort = ""                       # Claude API のエフォート: low・medium・high・xhigh・max（空ならモデルの既定）
 
 [organize.endpoints]                     # OpenAI 互換の API の送り先。モデルを「モデル名@名前」で指定する
 strata = "http://127.0.0.1:18080/v1"     # 例: model = "qwen3.8-flash-next-iq3_s@strata"
@@ -385,6 +388,11 @@ ollama のほかに、OpenAI 互換の API を持つ推論サーバー（Strata�
 `[organize.endpoints]` に書き、モデルを「モデル名@名前」で指定します（画面のモデルの選択肢にも出ます）。
 送り先が手元（ループバック・LAN・Tailscale）でなければ、ollama のクラウドのモデルと同じく「外部へ送る」扱いになります。
 画像を読めないモデルのときは、画像は `vision_model` で読みます。
+
+**Claude API** も使えます。任意の追加の依存 `claude`（`pipx install 'tag-keeper[claude]'`）を入れ、モデルを `claude-haiku-5-5@anthropic` のように書きます。
+エフォート（考える深さ）は `claude-opus-5-5:low@anthropic` のようにモデル名に付けるか、`claude_effort` で決めます。
+API キーは `anthropic_key_file` のファイルか、環境変数 `TAG_KEEPER_ANTHROPIC_KEY`・`ANTHROPIC_API_KEY` から読みます。内容は Anthropic に送られるので、「外部へ送る」扱いです。
+使ったトークン数は記録され、`tag-keeper usage` でモデル・エフォート・用途ごとの量と料金の見積もりを見られます。
 
 主のモデルが応答しないとき（ollama のクラウドの利用上限・推論サーバーが止まっている・時間切れ）は、
 そのファイルを `local_model` で処理し直し、10分のあいだは手元のモデルで続けます（`fallback = false` で無効）。

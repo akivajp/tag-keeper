@@ -16,23 +16,25 @@
 from __future__ import annotations
 
 import base64
+import contextlib
 import datetime as dt
 import json
 import logging
 import re
 import sqlite3
+import threading
 import time
 import unicodedata
 import urllib.error
 import urllib.request
 from collections import Counter, defaultdict
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from dataclasses import asdict, dataclass, field
 from fnmatch import fnmatchcase
 from pathlib import Path
 from typing import Any, TypeVar
 
-from tag_keeper import rules
+from tag_keeper import claude, rules
 from tag_keeper.catalog import utcnow
 from tag_keeper.config import OrganizeConfig, RootConfig
 from tag_keeper.extract import Extracted, extract
@@ -405,6 +407,42 @@ def openai_generate(base_url: str, model: str, config: OrganizeConfig, prompt: s
     return parse_json_answer(_strip_thinking(text))
 
 
+# Claude API の利用の記録に残す、問い合わせの用途（呼び出し側が with purpose("analyze") のように包む）
+_purpose = threading.local()
+
+
+@contextlib.contextmanager
+def purpose(name: str) -> Iterator[None]:
+    """この中での問い合わせの用途を、利用の記録に残す。"""
+    before = getattr(_purpose, "name", "")
+    _purpose.name = name
+    try:
+        yield
+    finally:
+        _purpose.name = before
+
+
+def claude_generate(config: OrganizeConfig, model: str, prompt: str, image: bytes | None = None) -> dict[str, Any]:
+    """Claude API（「モデル名@anthropic」）に問い合わせ、JSON の答えを返す。"""
+    # 画像の種類は中身の先頭で見分ける（API は種類の申告が中身と合っていないと断る）
+    head = image[:12] if image is not None else b""
+    if head[:3] == b"\xff\xd8\xff":
+        mime = "image/jpeg"
+    elif head[:4] == b"GIF8":
+        mime = "image/gif"
+    elif head[:4] == b"RIFF" and head[8:12] == b"WEBP":
+        mime = "image/webp"
+    else:
+        mime = "image/png"
+    try:
+        text = claude.generate(config, model, prompt, image, mime=mime, purpose=getattr(_purpose, "name", ""))
+    except claude.ClaudeError as e:
+        if e.unavailable:
+            raise ModelUnavailable(str(e), model) from e
+        raise OllamaError(str(e)) from e
+    return parse_json_answer(text)
+
+
 def ollama_generate(
     config: OrganizeConfig,
     prompt: str,
@@ -417,6 +455,8 @@ def ollama_generate(
 
     ふつうは ollama の generate API に送る。「モデル名@送り先」のモデルは、[organize.endpoints] の OpenAI 互換の API に送る。
     """
+    if claude.split(model or config.model) is not None:
+        return claude_generate(config, model or config.model, prompt, image)
     ep = endpoint_of(config, model or config.model)
     if ep is not None:
         try:
@@ -465,6 +505,12 @@ def model_capabilities(config: OrganizeConfig, model: str | None = None) -> list
     クラウドのモデル（*-cloud・*:cloud）は手元の一覧（/api/tags）に出ないことがあるので、/api/show で確かめる。
     """
     name = model or config.model
+    if claude.split(name) is not None:
+        try:
+            claude.check(config, name)
+        except claude.ClaudeError as e:
+            raise OllamaError(str(e)) from e
+        return ["completion", "vision"]
     ep = endpoint_of(config, name)
     if ep is not None:
         # OpenAI 互換の API: /models の一覧にあるかと、入力の種類（画像を読めるか）を見る
@@ -552,6 +598,8 @@ def sends_outside(config: OrganizeConfig, model: str) -> bool:
 
     ollama のモデルは、ollama_url が手元（ループバック・LAN・Tailscale）でなければ、名前に関係なく外へ出る。
     """
+    if claude.split(model) is not None:
+        return True
     ep = endpoint_of(config, model)
     if ep is not None:
         return not _is_local_url(ep[0])
@@ -995,7 +1043,8 @@ def suggest_one(
         cached.relpath = item.relpath
         return cached
     try:
-        sug, _used, note = with_fallback(config, lambda c: suggest_file(root_path, item, sha, context(), c))
+        with purpose("suggest"):
+            sug, _used, note = with_fallback(config, lambda c: suggest_file(root_path, item, sha, context(), c))
     except OllamaError as e:
         return Suggestion(item.relpath, sha, config.model, error=str(e))
     if note:

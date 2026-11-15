@@ -250,6 +250,9 @@ def run_one(conn: sqlite3.Connection, root: Path, target: Target, oc: OrganizeCo
     """
     name = target.relpath.rsplit("/", 1)[-1]
     try:
+        # Claude API の利用の記録に、用途（書類・画像の読み取り）を残す
+        _purpose = organize.purpose("analyze")
+        _purpose.__enter__()
         if target.kind == "document":
             row = conn.execute("SELECT text FROM extracts WHERE sha256 = ?", (target.sha256,)).fetchone()
             text = str(row["text"]) if row is not None else ""
@@ -271,6 +274,8 @@ def run_one(conn: sqlite3.Connection, root: Path, target: Target, oc: OrganizeCo
         raise
     except (organize.OllamaError, OSError) as e:
         a = Analysis(target.sha256, target.kind, oc.model, {}, str(e), utcnow())
+    finally:
+        _purpose.__exit__(None, None, None)
     save(conn, a)
     return a
 

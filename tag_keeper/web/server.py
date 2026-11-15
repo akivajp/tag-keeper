@@ -1231,7 +1231,8 @@ def create_app(
         oc, _note = organize.config_for_root(config.organize, rc.allow_cloud, str(data.get("model", "") or config.organize.model))
         try:
             # 主のモデルが応答しなければ、手元のモデルで下書きする（[organize] fallback）
-            answer, used, _fb_note = organize.with_fallback(oc, lambda c: organize.ollama_generate(c, prompt))
+            with organize.purpose("dircard"):
+                answer, used, _fb_note = organize.with_fallback(oc, lambda c: organize.ollama_generate(c, prompt))
             model = used.model
         except OllamaError as e:
             return {"description": "", "naming": style if files else "", "model": "", "note": str(e)}

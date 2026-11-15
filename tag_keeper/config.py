@@ -283,6 +283,14 @@ class OrganizeConfig:
     temperature: float = 0.2
     # 1件の問い合わせの待ち時間の上限（秒）
     timeout: float = 300.0
+    # Claude API（「モデル名@anthropic」のモデル）の API キーを書いたファイル（1行）。空なら環境変数
+    # TAG_KEEPER_ANTHROPIC_KEY・ANTHROPIC_API_KEY から読む
+    anthropic_key_file: str = ""
+    # Claude API の送り先（環境変数 ANTHROPIC_BASE_URL は読まない。Claude Code 用のプロキシを指していることがあるため）
+    anthropic_url: str = "https://api.anthropic.com"
+    # Claude API のモデルのエフォート（low・medium・high・xhigh・max。空ならモデルの既定）。
+    # モデル名に付けたもの（claude-opus-5-5:low@anthropic）が優先
+    claude_effort: str = ""
 
 
 @dataclass
@@ -554,7 +562,14 @@ def load_config(path: Path | None = None) -> Config:
     organize.candidates = og.get_int("candidates", organize.candidates)
     organize.temperature = og.get_float("temperature", organize.temperature)
     organize.timeout = og.get_float("timeout", organize.timeout)
+    organize.anthropic_key_file = og.get_str("anthropic_key_file", organize.anthropic_key_file)
+    organize.anthropic_url = og.get_str("anthropic_url", organize.anthropic_url).rstrip("/")
+    organize.claude_effort = og.get_str("claude_effort", organize.claude_effort).strip().lower()
     og.finish()
+    if organize.claude_effort not in ("", "low", "medium", "high", "xhigh", "max"):
+        raise ConfigError(f"{path}: [organize] の claude_effort は low・medium・high・xhigh・max か空にしてください: {organize.claude_effort}")
+    if "anthropic" in organize.endpoints:
+        raise ConfigError(f"{path}: [organize.endpoints] の名前 anthropic は Claude API 用に予約されています（別の名前にしてください）")
     if organize.max_chars < 1 or organize.candidates < 1 or organize.timeout <= 0:
         raise ConfigError(f"{path}: [organize] の max_chars・candidates は 1 以上、timeout は 0 より大きくしてください")
 

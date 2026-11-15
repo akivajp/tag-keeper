@@ -347,6 +347,7 @@ Optional tools, each used only by the feature that needs it:
 | LibreOffice | Office previews as laid out (PDF) |
 | ffmpeg | playing FLV, MKV, AVI and other videos the browser cannot play |
 | faster-whisper (`[transcribe]` / `[transcribe-gpu]`) | transcripts of audio and video |
+| the anthropic SDK (`[claude]`) | the Claude API as the model for suggestions and readings |
 
 From source:
 
@@ -437,6 +438,8 @@ max_chars = 4000                         # text passed to the model
 candidates = 15                          # destination folders the model chooses from
 temperature = 0.2                        # lower gives the same suggestion every time
 timeout = 300                            # seconds to wait for one answer
+anthropic_key_file = ""                  # file holding the Claude API key (empty: read the environment)
+claude_effort = ""                       # Claude API effort: low / medium / high / xhigh / max (empty: the model's default)
 
 [organize.endpoints]                     # OpenAI-compatible servers; use a model as "model-id@name"
 strata = "http://127.0.0.1:18080/v1"     # e.g. model = "qwen3.8-flash-next-iq3_s@strata"
@@ -471,6 +474,13 @@ used: list it under `[organize.endpoints]` and name a model `model-id@name`; its
 appear in the model menu. An endpoint whose address is not local (loopback, LAN or Tailscale)
 counts as sending content outside, like ollama's cloud models. Text-only models read images
 through `vision_model`.
+
+The **Claude API** works too: install the optional extra `claude` (`pipx install 'tag-keeper[claude]'`)
+and write the model as `claude-haiku-5-5@anthropic`. Set the effort in the model name
+(`claude-opus-5-5:low@anthropic`) or with `claude_effort`. The API key comes from the file in
+`anthropic_key_file`, or from `TAG_KEEPER_ANTHROPIC_KEY` / `ANTHROPIC_API_KEY`. Content goes to
+Anthropic, so these models count as sending content outside. Token use is recorded, and
+`tag-keeper usage` shows tokens and estimated cost per model, effort and purpose.
 
 When the main model does not answer (ollama's cloud usage limit, a stopped server, a timeout),
 the file is redone with `local_model`, which keeps being used for the next 10 minutes

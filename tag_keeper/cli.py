@@ -362,6 +362,33 @@ def cmd_transcribe(args: argparse.Namespace, config: Config) -> int:
     return status
 
 
+def cmd_usage(args: argparse.Namespace, config: Config) -> int:
+    """Claude API の利用（トークン数と料金の見積もり）を、モデル・エフォート・用途ごとにまとめる。"""
+    from tag_keeper import claude
+
+    rows = claude.summarize(claude.read_usage(args.days))
+    if args.json:
+        out_console.print_json(json.dumps(rows, ensure_ascii=False))
+        return 0
+    if not rows:
+        log.info("Claude API の利用の記録がありません（%s）", claude.usage_path())
+        return 0
+    table = Table(title=f"Claude API の利用（{'直近 ' + str(args.days) + ' 日' if args.days else 'すべて'}）")
+    for name, justify in (("モデル", "left"), ("エフォート", "left"), ("用途", "left"), ("回数", "right"), ("入力", "right"),
+                          ("出力", "right"), ("秒/回", "right"), ("料金（USD）", "right"), ("1回あたり", "right")):
+        table.add_column(name, justify=justify)  # type: ignore[arg-type]
+    total = 0.0
+    for r in rows:
+        total += r["cost"]
+        # 料金表に無いモデルの分は金額を出せない
+        cost = "?" if r["unpriced"] == r["calls"] else f"{r['cost']:.4f}"
+        table.add_row(r["model"], r["effort"] or "（既定）", r["purpose"] or "-", f"{r['calls']:,}", f"{r['input_tokens']:,}", f"{r['output_tokens']:,}",
+                      f"{r['seconds'] / r['calls']:.1f}", cost, f"{r['cost'] / r['calls']:.5f}")
+    out_console.print(table)
+    out_console.print(f"合計: [bold]{total:.4f}[/bold] USD（公表の料金表からの見積もり。実際の請求は Console で確かめてください）")
+    return 0
+
+
 def cmd_digest(args: argparse.Namespace, config: Config) -> int:
     """今の状況を Markdown のレポートにまとめる（定期レポート）。"""
     from tag_keeper import digest
@@ -1065,6 +1092,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("-o", "--output", type=Path, default=None, help="書き出すファイル（省略時は標準出力）")
     p.add_argument("--days", type=int, default=7, help="「新着」とする日数")
     p.set_defaults(func=cmd_digest)
+
+    p = sub.add_parser("usage", help="Claude API の利用（トークン数と料金の見積もり）をまとめる")
+    p.add_argument("--days", type=int, default=None, help="直近のこの日数だけをまとめる（省略時はすべて）")
+    p.add_argument("--json", action="store_true", help="JSON で出す")
+    p.set_defaults(func=cmd_usage)
 
     p = sub.add_parser("snapwatch", help="最新の2つのスナップショットを比べ、大きな変化を警告する")
     p.add_argument("roots", nargs="*", metavar="ROOT", help="ルート名かフォルダのパス（省略時は全ルート）")
