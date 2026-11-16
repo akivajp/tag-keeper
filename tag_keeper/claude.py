@@ -44,6 +44,8 @@ PRICES: dict[str, tuple[float, float]] = {
 # 応じられない内容と判定されたときに、API の側で別のモデルに回す仕組み（fallbacks）に対応したモデル
 _SERVER_FALLBACK = ("claude-fable-5-2", "claude-opus-5-5", "claude-sonnet-5-5")
 _FALLBACK_BETA = "server-side-fallback-2026-07-01"
+# 答えの形の指示（ollama は API の側で JSON を強制できるが、こちらは指示で守らせる。無いと、まれに文章で答える）
+SYSTEM = "指示された JSON のオブジェクトを1つだけ出力してください。前置き・説明・見出し・コードの囲み（```）は付けません。"
 # 1回の答えの上限（トークン。考えた分も含む）。ストリーミングなしで時間切れにならない範囲
 MAX_TOKENS = 16000
 
@@ -210,7 +212,7 @@ def generate(config: OrganizeConfig, model: str, prompt: str, image: bytes | Non
         # 画像は文より前に置く
         content.append({"type": "image", "source": {"type": "base64", "media_type": mime, "data": base64.standard_b64encode(image).decode("ascii")}})
     content.append({"type": "text", "text": prompt})
-    kwargs: dict[str, Any] = {"model": model_id, "max_tokens": MAX_TOKENS, "messages": [{"role": "user", "content": content}]}
+    kwargs: dict[str, Any] = {"model": model_id, "max_tokens": MAX_TOKENS, "system": SYSTEM, "messages": [{"role": "user", "content": content}]}
     # 考える深さはエフォートで決める（今のモデルは考えることを止められず、temperature も受け付けない）
     if effort:
         kwargs["output_config"] = {"effort": effort}

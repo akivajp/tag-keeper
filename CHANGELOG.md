@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.23.0] - 2026-11-16
+
+### Added
+
+- **Claude API as a model backend** (optional extra `tag-keeper[claude]`): write the model as
+  `claude-haiku-5-5@anthropic`, with the effort in the name (`claude-opus-5-5:low@anthropic`)
+  or in `[organize] claude_effort`. The key comes from `[organize] anthropic_key_file`,
+  `TAG_KEEPER_ANTHROPIC_KEY` or `ANTHROPIC_API_KEY`. Claude models always count as sending
+  content outside; rate limits, overload and an exhausted credit balance switch to the local
+  model. `ANTHROPIC_BASE_URL` is not read (it may point at a Claude Code proxy).
+- **`tag-keeper usage`**: tokens and estimated cost per model, effort and purpose, from a log of
+  every Claude API answer.
+- `scripts/eval_models.py` compares models on inbox suggestions over a copy of the catalog,
+  with a cost estimate up front and a spending cap.
+
+In a comparison on 16 inbox files on zefat, every Claude model read dates and amounts
+correctly; one suggestion cost about $0.001 (Haiku 5.5), $0.013 (Sonnet 5.5), $0.026
+(Opus 5.5) and $0.05 (Fable 5.2) at low effort, and took 5 to 9 seconds.
+
 ## [0.22.0] - 2026-11-15
 
 A review of the whole code base. Nothing new to learn; many things that could go wrong no
@@ -486,7 +505,8 @@ First release. The web UI and messages are in Japanese.
 - **Decision log.** Accepted suggestions, tag accept and reject, and undone plans are
   appended per machine; the closest past decisions are given to the model as examples.
 
-[Unreleased]: https://github.com/akivajp/tag-keeper/compare/v0.22.0...HEAD
+[Unreleased]: https://github.com/akivajp/tag-keeper/compare/v0.23.0...HEAD
+[0.23.0]: https://github.com/akivajp/tag-keeper/compare/v0.22.0...v0.23.0
 [0.22.0]: https://github.com/akivajp/tag-keeper/compare/v0.21.1...v0.22.0
 [0.21.1]: https://github.com/akivajp/tag-keeper/compare/v0.21.0...v0.21.1
 [0.21.0]: https://github.com/akivajp/tag-keeper/compare/v0.20.0...v0.21.0

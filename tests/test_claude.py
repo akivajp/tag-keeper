@@ -73,6 +73,7 @@ def test_generate_sends_effort_and_records_usage(fake: dict[str, Any]) -> None:
     call = fake["calls"][0]
     assert call["model"] == "claude-haiku-5-5" and call["output_config"] == {"effort": "low"}
     assert "temperature" not in call and "thinking" not in call  # 今のモデルはどちらも受け付けない
+    assert "JSON" in call["system"]  # 文章で答えないよう、答えの形を指示する
     image, text = call["messages"][0]["content"]
     assert image["source"]["media_type"] == "image/jpeg" and text == {"type": "text", "text": "読んで"}
     assert fake["url"] == "https://api.anthropic.com"

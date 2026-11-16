@@ -50,6 +50,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     ap.add_argument("--root", default=None, help="ルート名（省略時は設定の最初のルート）")
     ap.add_argument("--reference", default="gemma4:31b-cloud", help="保存済みの提案を比較の基準にするモデル（既定: gemma4:31b-cloud）")
     ap.add_argument("--paths", nargs="*", default=None, help="対象のファイルを名指しする（ルートからの相対パス。--n と --seed は使わない）")
+    ap.add_argument("--paths-file", type=Path, default=None, help="対象のファイルを1行に1つ書いたファイル（--paths と同じ）")
+    ap.add_argument("--exclude", nargs="*", default=[], help="対象から外すフォルダ（ルートからの相対パス。配下ごと。外部へ送りたくない受け皿など）")
     ap.add_argument("--max-usd", type=float, default=5.0, help="料金の見積もりの合計がこれを超えたら止める（既定: 5.0）")
     ap.add_argument("--config", type=Path, default=None, help=f"設定ファイル（既定: {default_config_path()}）")
     ap.add_argument("--db", type=Path, default=None, help=f"写しの元にするカタログ（既定: {default_db_path()}）")
@@ -102,11 +104,11 @@ def pick_files(conn: sqlite3.Connection, files: list[organize.InboxFile], refere
 
 
 def estimate_usd(model: str, n: int) -> float | None:
-    """始める前の、料金のおおよその見積もり（1ファイルあたり 入力 8,000・出力 3,000 トークンと置く）。"""
+    """始める前の、料金のおおよその見積もり（1ファイルあたり 入力 5,000・出力 2,500 トークンと置く。2026-11-16 の実測に基づく）。"""
     parts = claude.split(model)
     if parts is None:
         return 0.0
-    cost = claude.cost_usd(parts[0], 8000, 3000)
+    cost = claude.cost_usd(parts[0], 5000, 2500)
     return None if cost is None else cost * n
 
 
@@ -135,9 +137,17 @@ def main(argv: list[str] | None = None) -> int:
     excluded += dirtypes.closed_dirs(conn, root_id, types)
     inbox_dirs = dirtypes.inbox_dirs(types)
     _inbox, files = organize.find_inbox(conn, root_id, config.organize.inbox_patterns, excluded, inbox_dirs)
+    if args.paths_file:
+        args.paths = [p for p in args.paths_file.read_text(encoding="utf-8").splitlines() if p.strip()]
+    if args.paths is not None and not args.paths:
+        # 名指しの指定が空のまま、無作為の選び方に落ちて意図しないファイルを送らないようにする
+        log.error("--paths / --paths-file の対象がありません")
+        return 2
     if args.paths:
         items = [it for it in (organize.catalog_item(conn, root_id, p) for p in args.paths) if it is not None]
     else:
+        skip = [e.strip("/") + "/" for e in args.exclude]
+        files = [f for f in files if not any(f.relpath.startswith(e) for e in skip)]
         items = pick_files(conn, files, args.reference, args.n, args.seed)
     log.info("対象: %d 件（受け皿 %d 件のうち）／ モデル: %s", len(items), len(files), "、".join(args.models))
 
