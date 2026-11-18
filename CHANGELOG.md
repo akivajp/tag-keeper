@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.24.1] - 2026-11-19
+
 ### Added
 
 - A Claude Code plugin that runs `tag-keeper mcp` with `uvx`:
@@ -519,7 +521,8 @@ First release. The web UI and messages are in Japanese.
 - **Decision log.** Accepted suggestions, tag accept and reject, and undone plans are
   appended per machine; the closest past decisions are given to the model as examples.
 
-[Unreleased]: https://github.com/akivajp/tag-keeper/compare/v0.24.0...HEAD
+[Unreleased]: https://github.com/akivajp/tag-keeper/compare/v0.24.1...HEAD
+[0.24.1]: https://github.com/akivajp/tag-keeper/compare/v0.24.0...v0.24.1
 [0.24.0]: https://github.com/akivajp/tag-keeper/compare/v0.23.0...v0.24.0
 [0.23.0]: https://github.com/akivajp/tag-keeper/compare/v0.22.0...v0.23.0
 [0.22.0]: https://github.com/akivajp/tag-keeper/compare/v0.21.1...v0.22.0

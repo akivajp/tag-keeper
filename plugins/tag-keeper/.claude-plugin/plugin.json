@@ -1,6 +1,6 @@
 {
   "name": "tag-keeper",
-  "version": "0.24.0",
+  "version": "0.24.1",
   "description": "Search, read and tag the files in your tag-keeper catalog from Claude Code. Runs `tag-keeper mcp` with uvx; it writes only to the tag log and never moves, renames or deletes files.",
   "author": {
     "name": "Akiva Miura"
