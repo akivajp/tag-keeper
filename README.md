@@ -333,9 +333,20 @@ Desktop. Ask the agent to "find the quotes from last year and tag them with the 
 searches the catalog, reads extracted text and adds tags and attributes. It needs the optional
 extra `mcp` (`pipx install 'tag-keeper[mcp]'`).
 
+In Claude Code the easiest way is the plugin (it runs `tag-keeper[mcp]` with `uvx`, so nothing
+needs to be installed first). Plugins live in `plugins/` and `settings.json`, so profiles that
+share those get it in one go.
+
 ```console
-$ claude mcp add tag-keeper -- tag-keeper mcp                     # register with Claude Code
-$ claude mcp add tag-keeper -- tag-keeper --config ~/my.toml mcp  # with a config file
+$ claude plugin marketplace add akivajp/tag-keeper
+$ claude plugin install tag-keeper@tag-keeper
+```
+
+Or register the MCP server directly:
+
+```console
+$ claude mcp add -s user tag-keeper -- tag-keeper mcp                     # an installed tag-keeper
+$ claude mcp add -s user tag-keeper -- tag-keeper --config ~/my.toml mcp  # with a config file
 ```
 
 | Tool | What it does |

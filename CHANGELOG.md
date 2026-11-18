@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- A Claude Code plugin that runs `tag-keeper mcp` with `uvx`:
+  `claude plugin marketplace add akivajp/tag-keeper` and `claude plugin install tag-keeper@tag-keeper`.
+
 ## [0.24.0] - 2026-11-19
 
 ### Added

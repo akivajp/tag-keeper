@@ -1,0 +1,17 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "tag-keeper",
+  "description": "Claude Code plugins for tag-keeper",
+  "owner": {
+    "name": "Akiva Miura"
+  },
+  "plugins": [
+    {
+      "name": "tag-keeper",
+      "description": "Search, read and tag the files in your tag-keeper catalog from Claude Code (MCP server; never moves or deletes files)",
+      "category": "productivity",
+      "source": "./plugins/tag-keeper",
+      "homepage": "https://github.com/akivajp/tag-keeper"
+    }
+  ]
+}

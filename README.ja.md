@@ -249,9 +249,19 @@ $ tag-keeper serve                  # http://127.0.0.1:8090/
 エージェントに「見積書を探して、取引先のタグを付けて」のように頼むと、カタログの検索・本文の読み出し・タグと属性の付け外しを行います。
 任意の追加の依存 `mcp` が要ります（`pipx install 'tag-keeper[mcp]'`）。
 
+Claude Code では、プラグインとして入れるのが手軽です（`uvx` で `tag-keeper[mcp]` を取ってきて動かします。手元に入れておく必要はありません）。
+プラグインは設定（`plugins/` と `settings.json`）に記録されるので、設定を共有している複数のプロファイルでも一度で使えます。
+
 ```console
-$ claude mcp add tag-keeper -- tag-keeper mcp            # Claude Code に登録する
-$ claude mcp add tag-keeper -- tag-keeper --config ~/my.toml mcp   # 設定ファイルを指定する場合
+$ claude plugin marketplace add akivajp/tag-keeper
+$ claude plugin install tag-keeper@tag-keeper
+```
+
+MCP サーバーとして直接登録することもできます。
+
+```console
+$ claude mcp add -s user tag-keeper -- tag-keeper mcp               # 入れてある tag-keeper を使う
+$ claude mcp add -s user tag-keeper -- tag-keeper --config ~/my.toml mcp   # 設定ファイルを指定する場合
 ```
 
 | ツール | すること |

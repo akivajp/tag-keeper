@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "tag-keeper": {
+      "command": "uvx",
+      "args": ["--from", "tag-keeper[mcp]>=0.24", "tag-keeper", "mcp"]
+    }
+  }
+}
