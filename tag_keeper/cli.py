@@ -17,6 +17,7 @@
     tag-keeper purge PLAN_ID [--yes] 隔離したものを完全に消す（隔離を空にする）
     tag-keeper sync PLAN_ID          止めたままの同期を再試行・再開する
     tag-keeper serve                 Web の画面を開く
+    tag-keeper mcp                   AI エージェント向けの MCP サーバーを標準入出力で動かす
 
 ROOT には、設定ファイルのルート名か、フォルダのパスを指定する。省略すると設定済みの全ルート。
 """
@@ -1041,6 +1042,19 @@ def cmd_serve(args: argparse.Namespace, config: Config) -> int:
     )
 
 
+def cmd_mcp(args: argparse.Namespace, config: Config) -> int:
+    """AI エージェント向けの MCP サーバーを標準入出力で動かす（検索・本文の読み出し・タグと属性の付け外し）。"""
+    try:
+        from tag_keeper.mcp_server import run_stdio
+        import mcp  # noqa: F401  任意の依存が入っているかを先に確かめる
+    except ImportError:
+        log.error("MCP の SDK がありません。pipx install 'tag-keeper[mcp]' のように追加の依存 mcp を入れてください")
+        return 2
+    # 標準出力は MCP の通信に使う。ログは標準エラー（rich）にだけ出る
+    run_stdio(args.config, args.db)
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     """コマンドラインの解析器を作る。"""
     parser = argparse.ArgumentParser(
@@ -1238,6 +1252,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="ループバック以外で待ち受けるときも、認証なしを許す（信頼できるネットワークに限ること）",
     )
     p.set_defaults(func=cmd_serve)
+
+    p = sub.add_parser(
+        "mcp",
+        help="AI エージェント（Claude Code など）向けの MCP サーバーを標準入出力で動かす（mcp が要る）",
+        description="検索・詳細・本文の読み出し・タグと属性の付け外しを MCP のツールとして渡す。"
+        "ファイルの移動・改名・削除は行わない。例: claude mcp add tag-keeper -- tag-keeper mcp",
+    )
+    p.set_defaults(func=cmd_mcp)
     return parser
 
 

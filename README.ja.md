@@ -243,6 +243,32 @@ $ tag-keeper serve                  # http://127.0.0.1:8090/
 その場合、ファイルの内容は ollama のクラウドに送られます。画面ではクラウドのモデルに ☁ を付けます。
 提案は内容ハッシュとモデルごとに保存するので、同じファイルを同じモデルで読むのは1回だけです。
 
+### AI エージェントから使う（MCP）
+
+`tag-keeper mcp` は、Claude Code・Claude Desktop などの AI エージェントから使う MCP サーバーです（標準入出力で動きます）。
+エージェントに「見積書を探して、取引先のタグを付けて」のように頼むと、カタログの検索・本文の読み出し・タグと属性の付け外しを行います。
+任意の追加の依存 `mcp` が要ります（`pipx install 'tag-keeper[mcp]'`）。
+
+```console
+$ claude mcp add tag-keeper -- tag-keeper mcp            # Claude Code に登録する
+$ claude mcp add tag-keeper -- tag-keeper --config ~/my.toml mcp   # 設定ファイルを指定する場合
+```
+
+| ツール | すること |
+|---|---|
+| `list_roots` | ルートの名前・場所・ファイル数・最後の走査 |
+| `search` | 名前・本文・種類・タグ・属性・場所・日付・大きさで探す（Web の画面の検索と同じ条件） |
+| `get_item` | 1件の詳細（直接付いた・継承したタグと属性、関係、同じ内容のファイル。フォルダなら直下の一覧） |
+| `read_text` | 抽出した本文（PDF・Office 文書・OCR・書き起こし）を読む |
+| `list_tags` | 既存のタグ（件数・別名・親）、属性の定義、保存した検索 |
+| `add_tags`・`remove_tags` | タグを付ける・外す |
+| `set_attr`・`unset_attr` | 定義済みの属性の値を付ける・外す |
+
+- ファイルそのものには書き込みません。移動・改名・削除のツールは置いていません（整理は Web の画面で行います）。
+- エージェントが付けたタグ・属性は、出所 `agent` として記録されます（人が付けた `manual`、読み取りの `ai` と見分けられます）。
+- タグのログは追記専用で、別のプロセスの変更も読み直すので、Web の画面のサーバーと同時に動かして構いません。
+- 検索の対象は走査済みのカタログです。新しいファイルを探すには、先に走査（Web の画面か `tag-keeper scan`）が要ります。
+
 ## インストール
 
 Python 3.11 以上と Linux が必要です。Web の画面は日本語と英語に対応しています（既定はブラウザの言語で、画面上部で切り替えられます）。コマンドのメッセージは日本語です。
@@ -265,6 +291,7 @@ $ tag-keeper --help
 | ffmpeg | FLV・MKV・AVI など、ブラウザが直接は再生できない動画の再生 |
 | faster-whisper（`[transcribe]`・`[transcribe-gpu]`） | 音声・動画の書き起こし |
 | anthropic の SDK（`[claude]`） | Claude API を整理の提案・読み取りのモデルに使う |
+| MCP の SDK（`[mcp]`） | AI エージェントから使う MCP サーバー（`tag-keeper mcp`） |
 
 ソースから使う場合:
 

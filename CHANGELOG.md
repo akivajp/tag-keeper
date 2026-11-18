@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`tag-keeper mcp`**: an MCP server over stdio for AI agents such as Claude Code (optional
+  extra `tag-keeper[mcp]`). Tools: `list_roots`, `search`, `get_item`, `read_text`,
+  `list_tags`, `add_tags`, `remove_tags`, `set_attr`, `unset_attr`. It writes only to the tag
+  log (source `agent`), never to files.
+
 ## [0.23.0] - 2026-11-16
 
 ### Added

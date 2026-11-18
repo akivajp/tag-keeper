@@ -50,6 +50,10 @@ transcribe = [
 claude = [
     "anthropic>=1.0",
 ]
+# AI エージェント（Claude Code・Claude Desktop など）から MCP で検索・タグ付けする分（tag-keeper mcp）
+mcp = [
+    "mcp>=2.0",
+]
 # 書き起こしを GPU（CUDA 12）で動かす分。cuDNN・cuBLAS を pip のパッケージで入れる（システムに無くてよい）
 transcribe-gpu = [
     "faster-whisper>=1.1",
@@ -62,6 +66,8 @@ dev = [
     "webtest>=3.0",
     # Claude API の経路のテスト（API には送らない）
     "anthropic>=1.0",
+    # MCP サーバーのテスト
+    "mcp>=2.0",
 ]
 
 [project.urls]

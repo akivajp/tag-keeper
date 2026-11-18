@@ -326,6 +326,35 @@ the config, including ollama's cloud models (`…:cloud`, `…-cloud`) — then 
 is sent to ollama's cloud; the page marks those models with ☁. Suggestions are stored by
 content hash and model, so a file is read once per model.
 
+### From an AI agent (MCP)
+
+`tag-keeper mcp` is an MCP server (over stdio) for AI agents such as Claude Code and Claude
+Desktop. Ask the agent to "find the quotes from last year and tag them with the client" and it
+searches the catalog, reads extracted text and adds tags and attributes. It needs the optional
+extra `mcp` (`pipx install 'tag-keeper[mcp]'`).
+
+```console
+$ claude mcp add tag-keeper -- tag-keeper mcp                     # register with Claude Code
+$ claude mcp add tag-keeper -- tag-keeper --config ~/my.toml mcp  # with a config file
+```
+
+| Tool | What it does |
+|---|---|
+| `list_roots` | root names, paths, file counts and the last scan |
+| `search` | search by name, text, kind, tags, attributes, folder, date and size (same as the Web UI) |
+| `get_item` | one item: direct and inherited tags and attributes, relations, identical files; a folder's children |
+| `read_text` | extracted text (PDF, Office documents, OCR, transcripts) |
+| `list_tags` | existing tags (counts, aliases, parents), attribute definitions, saved searches |
+| `add_tags`, `remove_tags` | add or remove tags |
+| `set_attr`, `unset_attr` | set or clear a defined attribute |
+
+- It never writes to your files: there are no move, rename or delete tools (tidy up in the Web UI).
+- Tags and attributes from the agent are recorded with the source `agent` (people's are
+  `manual`, readings are `ai`).
+- The tag log is append-only and reloads changes from other processes, so it can run alongside
+  the Web UI server.
+- It searches the scanned catalog; scan first (Web UI or `tag-keeper scan`) to find new files.
+
 ## Install
 
 Requires Python 3.11+ and Linux. The web UI is in Japanese and English (it follows the browser and can be switched in the top bar); command-line messages are in Japanese.
@@ -348,6 +377,7 @@ Optional tools, each used only by the feature that needs it:
 | ffmpeg | playing FLV, MKV, AVI and other videos the browser cannot play |
 | faster-whisper (`[transcribe]` / `[transcribe-gpu]`) | transcripts of audio and video |
 | the anthropic SDK (`[claude]`) | the Claude API as the model for suggestions and readings |
+| the MCP SDK (`[mcp]`) | the MCP server for AI agents (`tag-keeper mcp`) |
 
 From source:
 
