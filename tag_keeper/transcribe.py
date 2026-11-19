@@ -129,6 +129,17 @@ def media_duration(path: str) -> float | None:
         return None
 
 
+def has_audio(path: str) -> bool | None:
+    """音声のトラックがあるか（画面の録画などには無いことがある）。読めなければ None。"""
+    try:
+        import av  # faster-whisper と一緒に入る
+
+        with av.open(path) as container:
+            return len(container.streams.audio) > 0
+    except Exception:  # noqa: BLE001 - 読めないだけなら、これまでどおり書き起こしの中で判定する
+        return None
+
+
 def _child(job_file: Path, out_file: Path) -> int:
     """子のプロセスの本体。job_file の設定とファイルの一覧を読み、1件ずつ書き起こして out_file に JSONL で書く。"""
     job = json.loads(job_file.read_text(encoding="utf-8"))
@@ -149,6 +160,13 @@ def _child(job_file: Path, out_file: Path) -> int:
                 if length is not None and length > opts.max_minutes * 60:
                     res["duration"] = length
                     res["skipped"] = f"{int(length // 60)} 分あり、上限（{opts.max_minutes} 分）より長い"
+                    out.write(json.dumps(res, ensure_ascii=False) + "\n")
+                    out.flush()
+                    continue
+                if has_audio(path) is False:
+                    # 音声の無い動画（画面の録画など）は、書き起こしの中で IndexError になるので先に飛ばす
+                    res["duration"] = length or 0.0
+                    res["skipped"] = "音声のトラックがない"
                     out.write(json.dumps(res, ensure_ascii=False) + "\n")
                     out.flush()
                     continue

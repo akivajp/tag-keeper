@@ -440,7 +440,7 @@ async function pageRoots(main) {
         ? t('自動で最新にします（{m} 分ごと{sync}）。', { m: num(st.auto_refresh), sync: st.after_sync && r.sync && r.sync.client === 'cloud-sync' ? t('と、同期が終わるたび') : '' })
         : t('自動では最新にしません。')) : null,
       r.sync && !r.sync.error ? h('p', { class: 'muted' }, r.sync.client === 'cloud-sync'
-        ? t('同期: cloud-sync（{service}）。整理プランを実行するときは、定期の同期を止めて隔離し、削除を反映してから再開します。', { service: r.sync.service })
+        ? t('同期: cloud-sync（{service}）。整理プランを実行するときは、定期の同期を止めてから隔離・移動します。変更が多いときだけ、その場で削除を反映してから再開します（少なければ次の定期の同期に任せます）。', { service: r.sync.service })
           + (r.sync.last_ok ? ' ' + t('最後に成功: {when}', { when: when(r.sync.last_ok) }) : '')
           + (r.sync.timer && r.sync.timer !== 'active' ? ' ' + t('定期の同期は止まっています。') : '')
         : t('同期クライアント: {client}（{service}）。子が {n} 件以上のフォルダを消すときは、同期を一時停止して削除を反映してから再開します。',
@@ -780,7 +780,7 @@ async function pagePlan(main, id) {
     setChildren(syncNote, willSync(sel) ? h('div', { class: 'alert info' },
       h('strong', {}, '大量の削除になります。'),
       ' ' + (data.sync.client === 'cloud-sync'
-        ? t('実行すると、cloud-sync の定期の同期（{service}）を止め、動いている同期が終わるのを待って隔離し、削除をクラウドへ反映してから再開します。', { service: data.sync.service })
+        ? t('実行すると、cloud-sync の定期の同期（{service}）を止め、動いている同期が終わるのを待って隔離・移動します。変更が多いときだけ、その場で削除をクラウドへ反映してから再開します（少なければ次の定期の同期に任せます）。', { service: data.sync.service })
         : t('実行すると、{client} の常駐の同期（{service}）を一時停止し、隔離した後に削除をクラウドへ反映してから再開します。{client} の大量削除の安全装置（{n} 件）で同期が止まることはありません。',
           { client: data.sync.client, service: data.sync.service, n: num(data.sync.threshold) }))) : '');
   }

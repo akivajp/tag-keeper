@@ -8,6 +8,13 @@
 'use strict';
 
 const I18N_EN = {
+  '効いているファイル {files} 件（フォルダからの継承を含む）／直接付けたもの {count} 件': 'Applies to {files} files (including tags inherited from folders) / set directly on {count}',
+  '＋ で検索に含め、⊘ で除きます。件数は、そのタグが効いているファイルの数です（フォルダからの継承を含む）。': 'Use + to include and ⊘ to exclude. The count is the number of files the tag applies to (including tags inherited from folders).',
+  'タグが1つも効いていないもの（未整理）だけを出します。フォルダから継承したタグも数えます。': 'Shows only items with no tag at all (unsorted). Tags inherited from folders count as tags.',
+  'タグ無しだけ': 'Untagged only',
+  'フォルダから継承したタグを見ず、ファイルやフォルダに直接付けたタグだけで探します。': 'Ignores tags inherited from folders and matches only tags set directly on the file or folder.',
+  '直接付けたタグだけで探す': 'Match direct tags only',
+  '選んだものを削除…': 'Delete selected…', 'すべて選ぶ': 'Select all',
   // --- 上部・共通 ---
   'ルート': 'Roots', 'ルート名': 'Root', 'ファイル': 'Files', '整理': 'Inbox', 'タグ': 'Tags', 'プラン': 'Plans',
   '読み込み中…': 'Loading…', 'やめる': 'Cancel', '実行する': 'Run', '閉じる': 'Close',
@@ -45,9 +52,9 @@ const I18N_EN = {
   '転送の残り {eta}': 'Transfer {eta} left', 'エラー {n} 件': '{n} errors',
   '同期が終わりました: {root}': 'Sync finished: {root}', '同期が失敗しました: {root}: {message}': 'Sync failed: {root}: {message}',
   '同期を始めます: {root}': 'Starting sync: {root}', '今すぐ同期': 'Sync now',
-  '同期: cloud-sync（{service}）。整理プランを実行するときは、定期の同期を止めて隔離し、削除を反映してから再開します。': 'Sync: cloud-sync ({service}). When a plan is applied, the scheduled sync is stopped, items are quarantined, the deletions are reflected, and the sync is restarted.',
+  '同期: cloud-sync（{service}）。整理プランを実行するときは、定期の同期を止めてから隔離・移動します。変更が多いときだけ、その場で削除を反映してから再開します（少なければ次の定期の同期に任せます）。': 'Sync: cloud-sync ({service}). When a plan is applied, the scheduled sync is stopped before items are quarantined or moved. Only a large change is reflected right away before the sync restarts; a small one is left to the next scheduled sync.',
   '最後に成功: {when}': 'Last success: {when}', '定期の同期は止まっています。': 'The scheduled sync is stopped.',
-  '実行すると、cloud-sync の定期の同期（{service}）を止め、動いている同期が終わるのを待って隔離し、削除をクラウドへ反映してから再開します。': 'Running it stops the scheduled cloud-sync ({service}), waits for a running sync to finish, quarantines, reflects the deletions in the cloud and restarts the sync.',
+  '実行すると、cloud-sync の定期の同期（{service}）を止め、動いている同期が終わるのを待って隔離・移動します。変更が多いときだけ、その場で削除をクラウドへ反映してから再開します（少なければ次の定期の同期に任せます）。': 'Running it stops the scheduled cloud-sync ({service}), waits for a running sync to finish, then quarantines or moves. Only a large change is reflected in the cloud right away before the sync restarts; a small one is left to the next scheduled sync.',
   '同期: 稼働中': 'Sync: running', '同期: 停止中': 'Sync: stopped', '同期: 失敗': 'Sync: failed', '同期: 状態を読めません': 'Sync: unknown state',
   '撮らない': 'none',
 
@@ -280,7 +287,7 @@ const I18N_EN = {
   'OCR: tesseract が無いので使えません': 'OCR: unavailable (tesseract is not installed)', 'OCR: 使わない設定': 'OCR: turned off',
   'OCR を待っているスキャン {n} 件': '{n} scans waiting for OCR', '裏での抽出は止めてあります（[extract] enabled）': 'Reading text in the background is turned off ([extract] enabled)',
   '裏での抽出は Web の画面（serve）が動かします': 'The web UI (serve) reads the text in the background',
-  'タグを探す': 'Find a tag', '＋ で検索に含め、⊘ で除きます。件数は直接付いている数です。': '＋ includes a tag in the search, ⊘ excludes it. Counts are direct tags.',
+  'タグを探す': 'Find a tag',
   '左の一覧からタグを選ぶと、そのタグの付いたファイルを探します。フォルダに付いたタグは、中のファイルにも効きます。':
     'Pick tags on the left to find the files that carry them. A tag on a folder applies to everything inside it.',
   '除外:': 'Excluding:', '場所': 'Location', 'すべて含む（AND）': 'All of them (AND)', 'どれかを含む（OR）': 'Any of them (OR)', 'フォルダも出す': 'Include folders',

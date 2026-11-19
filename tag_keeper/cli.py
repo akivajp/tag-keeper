@@ -65,6 +65,7 @@ from tag_keeper import fulltext as fulltext_mod
 from tag_keeper.fulltext import KINDS, Pending, app_data_names, find_entries, query_terms, run_pending, snippets
 from tag_keeper.hashing import hash_root
 from tag_keeper.plan import (
+    ACTION_MOVE,
     OpOutcome,
     Plan,
     PlanError,
@@ -829,6 +830,18 @@ def _summary(result: RunResult, verb: str) -> str:
     )
 
 
+def _apply_summary(result: RunResult, moves: set[str]) -> str:
+    """apply の結果の1行の要約。隔離したものと、移動・改名したものを分けて数える。"""
+    parts = []
+    for verb, done in (
+        ("隔離した", [o for o in result.done if o.path not in moves]),
+        ("移動・改名した", [o for o in result.done if o.path in moves]),
+    ):
+        if done:
+            parts.append(f"{verb} {len(done):,} 件（ファイル {sum(o.files for o in done):,}、{human_size(sum(o.size for o in done))}）")
+    return f"{' / '.join(parts) or '動かしたものはありません'} / 飛ばした {len(result.skipped):,} 件"
+
+
 class RichReporter(Reporter):
     """進捗を rich の進捗バーで表示する（段階が変わるたびに、バーを作り直す）。"""
 
@@ -897,11 +910,16 @@ def cmd_apply(args: argparse.Namespace, config: Config) -> int:
             checks.append(OpOutcome(op.path, op.is_dir, op.files, op.size, problem is None, problem or ""))
         render_outcomes(f"確認: {plan.id}（{plan.root_path}）", checks, args.limit)
         ok = [c for c in checks if c.done]
-        out_console.print(
-            f"実行できる {len(ok):,} 件（ファイル {sum(c.files for c in ok):,}、{human_size(sum(c.size for c in ok))}）"
-            f"を {config.plan.quarantine_dir / plan.id} へ移します。"
-            f"飛ばすもの {len(checks) - len(ok):,} 件。"
-        )
+        moves = {op.path for op in plan.ops if op.action == ACTION_MOVE}
+        for label, part in (
+            (f"隔離（{config.plan.quarantine_dir / plan.id} へ移す）", [c for c in ok if c.path not in moves]),
+            ("移動・改名（ツリーの中で動かす）", [c for c in ok if c.path in moves]),
+        ):
+            if part:
+                out_console.print(
+                    f"{label}: {len(part):,} 件（ファイル {sum(c.files for c in part):,}、{human_size(sum(c.size for c in part))}）"
+                )
+        out_console.print(f"実行できる {len(ok):,} 件、飛ばすもの {len(checks) - len(ok):,} 件。")
         out_console.print("[bold]確認だけで、何も動かしていません。[/bold]実行するには --yes を付けてください。")
         return 0
     with _rich_progress() as progress:
@@ -916,7 +934,8 @@ def cmd_apply(args: argparse.Namespace, config: Config) -> int:
             tags=TagStore(config.tags.dir),
         )
     render_outcomes(f"実行結果: {plan.id}", result.outcomes, args.limit)
-    log.info("%s", _summary(result, "隔離した"))
+    moves = {op.path for op in plan.ops if op.action == ACTION_MOVE}
+    log.info("%s", _apply_summary(result, moves))
     log.info(
         "スナップショット: 実行前 %s / 実行後 %s。取り消すには: tag-keeper undo %s --yes",
         result.pre_snapshot if result.pre_snapshot is not None else "なし",

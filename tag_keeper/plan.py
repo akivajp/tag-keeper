@@ -586,6 +586,7 @@ def _flush_and_resume(
     max_children: int,
     rep: Reporter,
     restart: bool = True,
+    flush: bool = True,
 ) -> str | None:
     """止めておいた同期で削除をクラウドに反映し、常駐の同期を再開する。
 
@@ -598,6 +599,7 @@ def _flush_and_resume(
         max_children: 消したパスの子の数の最大値。
         rep: 進捗の通知先。
         restart: 反映の後に常駐の同期を再開するか。止める前から止まっていた（利用者が止めていた）なら False。
+        flush: その場で同期して反映するか。少数の変更で、次の定期の同期に任せられるなら False（再開だけする）。
     """
     expected = set(paths)
     seen: set[str] = set()
@@ -607,14 +609,18 @@ def _flush_and_resume(
             seen.add(path)
             rep.advance()
 
-    rep.phase("削除をクラウドに反映", total=len(expected))
-    try:
-        sync.flush(max_children, on_deleted=on_deleted, on_line=rep.note)
-    except SyncError as e:
-        log.error("削除をクラウドに反映できませんでした。常駐の同期は止めたままです: %s", e)
-        _append(journal, {"event": "sync-error", "detail": str(e)})
-        return str(e)
-    _append(journal, {"event": "sync-flush", "deleted": len(seen), "expected": len(expected)})
+    if flush:
+        rep.phase("削除をクラウドに反映", total=len(expected))
+        try:
+            sync.flush(max_children, on_deleted=on_deleted, on_line=rep.note)
+        except SyncError as e:
+            log.error("削除をクラウドに反映できませんでした。常駐の同期は止めたままです: %s", e)
+            _append(journal, {"event": "sync-error", "detail": str(e)})
+            return str(e)
+        _append(journal, {"event": "sync-flush", "deleted": len(seen), "expected": len(expected)})
+    else:
+        log.info("変更が少ないので、クラウドへの反映は次の定期の同期に任せます")
+        _append(journal, {"event": "sync-flush-skipped", "expected": len(expected)})
     if not restart:
         # 利用者が止めていた同期は、止めたままにしておく（勝手に動かし始めない）
         log.info("同期は実行の前から止まっていたので、再開しません")
@@ -686,6 +692,13 @@ def apply_plan(
         max_children = max(children, default=0)
         use_sync = sync.needs_pause(children)
 
+    # 実行の前にルートにあったファイルの数（その場で同期して反映するかの判断に使う）
+    total_files = 0
+    if use_sync:
+        total_files = int(
+            conn.execute("SELECT count(*) FROM entries WHERE root_id = ? AND gone_at IS NULL AND is_dir = 0", (root_id,)).fetchone()[0]
+        )
+
     result = RunResult(plan.id, synced=use_sync)
     rep.phase("実行前のスナップショット")
     result.pre_snapshot = _take_pre(snapshot, f"tag-keeper apply {plan.id}")
@@ -732,7 +745,10 @@ def apply_plan(
             assert sync is not None
             quarantined = {op.path for op in ops if op.action == ACTION_QUARANTINE}
             paths = [sync.relpath(plan.root_path / o.path) for o in result.done if o.path in quarantined]
-            result.sync_error = _flush_and_resume(sync, journal, paths, max_children, rep, restart=was_active)
+            # 少数の変更なら、その場の同期（数分かかる）を省いて次の定期の同期に任せる（判断できない連携は常に反映する）
+            needed = getattr(sync, "flush_needed", None)
+            flush = True if needed is None else bool(needed(sum(o.files for o in result.done), total_files))
+            result.sync_error = _flush_and_resume(sync, journal, paths, max_children, rep, restart=was_active, flush=flush)
 
     rep.phase("実行後のスナップショット")
     result.post_snapshot = _take_post(snapshot, result.pre_snapshot, f"tag-keeper apply {plan.id}")

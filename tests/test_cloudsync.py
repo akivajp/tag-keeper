@@ -99,6 +99,23 @@ def test_flush_failure_is_reported(guard: tuple[CloudSyncGuard, Path, Path], tmp
         g.flush(1)
 
 
+def test_small_changes_are_left_to_the_next_scheduled_sync(guard: tuple[CloudSyncGuard, Path, Path], tmp_path: Path) -> None:
+    """少数の変更は、その場の同期（数分かかる）を省く。定期の同期の削除の上限（max_delete %）の半分が境目。"""
+    g, _calls, _state = guard
+    # 既定の上限は 10%。10,000 件のうち 1 件や 499 件は任せ、500 件（5%）からはその場で反映する
+    assert not g.flush_needed(1, 10_000)
+    assert not g.flush_needed(499, 10_000)
+    assert g.flush_needed(500, 10_000)
+    # 何も動かしていなければ反映しない。全体の数が分からなければ、念のため反映する
+    assert not g.flush_needed(0, 10_000)
+    assert g.flush_needed(1, 0)
+    # 設定の max_delete（全体・項目ごと）に従う
+    g.config_file = write(tmp_path / "cs2.toml", 'max_delete = 40\n[remotes.onedrive]\nremote = "onedrive:"\nlocal = "/x"\n')
+    assert not g.flush_needed(1999, 10_000) and g.flush_needed(2000, 10_000)
+    g.config_file = write(tmp_path / "cs3.toml", 'max_delete = 40\n[remotes.onedrive]\nremote = "onedrive:"\nlocal = "/x"\nmax_delete = 2\n')
+    assert g.flush_needed(100, 10_000)
+
+
 def test_status_and_interrupted_detection(guard: tuple[CloudSyncGuard, Path, Path]) -> None:
     g, _calls, state = guard
     st = g.status()
@@ -254,6 +271,35 @@ def test_pause_that_gives_up_restarts_the_timer_it_stopped(guard: tuple[CloudSyn
         g.pause()
     lines = calls.read_text().splitlines()
     assert lines[-2:] == ["systemctl --user stop cloud-sync-onedrive.timer", "systemctl --user start cloud-sync-onedrive.timer"]
+
+
+def test_small_delete_skips_the_flush_but_restarts_the_timer(guard: tuple[CloudSyncGuard, Path, Path], tmp_path: Path) -> None:
+    """多くのファイルのうち1件だけを消すときは、timer を止めて隔離し、同期を待たずに timer を再開する。"""
+    from tag_keeper.catalog import connect, ensure_root
+    from tag_keeper.config import SafetyConfig
+    from tag_keeper.plan import ACTION_QUARANTINE, Plan, PlanOp, apply_plan, fingerprint, journal_path, read_journal, sync_paused
+    from tag_keeper.scan import scan_root
+
+    g, calls, _state = guard
+    root = g.sync_dir()
+    for i in range(40):
+        write(root / f"keep{i}.txt", "keep")
+    write(root / "junk.tmp", "junk")
+    conn = connect(tmp_path / "catalog.db")
+    root_id = ensure_root(conn, "od", root)
+    scan_root(conn, root_id, root, SafetyConfig())
+    fp = fingerprint(root / "junk.tmp")
+    assert fp is not None
+    plan = Plan(id="p1", root="od", root_path=root, created_at="t")
+    plan.ops.append(PlanOp(ACTION_QUARANTINE, "junk.tmp", False, fp.files, fp.size, fp.inode, fp.mtime_ns, "一時", "test"))
+    result = apply_plan(conn, plan, quarantine_dir=tmp_path / "q", journal_dir=tmp_path / "j", snapshot=None, sync=g)
+    assert result.sync_error is None and len(result.done) == 1
+    log = calls.read_text()
+    assert "cloud-sync run" not in log  # その場の同期はしない
+    assert log.index("stop cloud-sync-onedrive.timer") < log.index("start cloud-sync-onedrive.timer")
+    events = [r["event"] for r in read_journal(journal_path(tmp_path / "j", "p1"))]
+    assert "sync-flush-skipped" in events and "sync-flush" not in events and events[-2] == "sync-resume"
+    assert sync_paused(journal_path(tmp_path / "j", "p1")) is None
 
 
 def test_timer_stopped_by_the_user_is_left_stopped(guard: tuple[CloudSyncGuard, Path, Path], tmp_path: Path) -> None:

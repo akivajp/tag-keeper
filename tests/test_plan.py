@@ -235,6 +235,37 @@ def test_undo_does_not_overwrite_new_files(
     assert (tmp_path / "quarantine" / plan.id / "docs" / "Thumbs.db").read_text() == "junk"
 
 
+def test_cli_apply_reports_moves_and_quarantine_separately(
+    tmp_path: Path, tree: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """移動・改名は「隔離」と言わず、隔離したものと分けて数える。"""
+    from tag_keeper.plan import ACTION_MOVE, ACTION_QUARANTINE, CAT_MOVE, Plan, PlanOp, fingerprint, write_plan
+
+    cfg = write(
+        tmp_path / "c.toml",
+        f'[[roots]]\nname = "data"\npath = "{tree}"\n'
+        f'[hygiene]\ndevice_names = []\n[plan]\nquarantine_dir = "{tmp_path / "quarantine"}"\nsnapper_config = ""\n',
+    )
+    common = ["--config", str(cfg), "--db", str(tmp_path / "catalog.db")]
+    assert main([*common, "scan"]) == 0
+    plan = Plan(id="mixed", root="data", root_path=tree, created_at="t")
+    for action, rel, dest in ((ACTION_MOVE, "docs/report.pdf", "archive/report.pdf"), (ACTION_QUARANTINE, "docs/Thumbs.db", "")):
+        fp = fingerprint(tree / rel)
+        assert fp is not None
+        plan.ops.append(PlanOp(action, rel, False, fp.files, fp.size, fp.inode, fp.mtime_ns, CAT_MOVE if dest else "一時", "t", dest=dest))
+    plan_file = tmp_path / "mixed.toml"
+    write_plan(plan, plan_file)
+
+    assert main([*common, "apply", str(plan_file)]) == 0
+    out = capsys.readouterr().out
+    assert "隔離（" in out and "移動・改名（" in out and "実行できる 2 件" in out
+    assert main([*common, "apply", str(plan_file), "--yes"]) == 0
+    # ログは rich が標準エラーに出す（幅で折り返すので、空白を詰めて比べる）
+    err = "".join(capsys.readouterr().err.split())
+    assert "隔離した1件" in err and "移動・改名した1件" in err
+    assert (tree / "archive" / "report.pdf").exists()
+
+
 def test_cli_plan_apply_undo(tmp_path: Path, tree: Path) -> None:
     quarantine = tmp_path / "quarantine"
     cfg = write(

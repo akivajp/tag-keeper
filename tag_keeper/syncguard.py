@@ -520,6 +520,37 @@ class CloudSyncGuard:
             time.sleep(self.poll_seconds)
         return was_active
 
+    def flush_needed(self, changed: int, total: int) -> bool:
+        """この実行で動かした件数が多く、その場で同期して反映する必要があるか。
+
+        cloud-sync の定期の同期は、削除が max_delete（%。既定 10）を超えると止まる。rclone bisync は移動も
+        「削除と新規」として数えるので、移動した分も数に入れる。上限の半分に届かない少数の変更は、
+        次の定期の同期に任せる（1件の削除のたびに同期の完了を数分待たせないため）。
+
+        Args:
+            changed: この実行で隔離・移動したファイルの数。
+            total: 実行の前に、ルートにあったファイルの数（分からなければ 0）。
+        """
+        if changed <= 0:
+            return False
+        if total <= 0:
+            return True
+        raw = self._entry_config().get("max_delete", self._global_max_delete())
+        try:
+            limit = float(raw)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            limit = 10.0
+        return changed * 100 >= total * limit / 2
+
+    def _global_max_delete(self) -> object:
+        """cloud-sync の設定ファイルの、全体の max_delete（項目ごとの指定が無いときの既定）。"""
+        path = self.config_file or Path(os.path.expanduser("~/.config/cloud-sync/config.toml"))
+        try:
+            raw = tomllib.loads(path.read_text(encoding="utf-8"))
+        except (OSError, tomllib.TOMLDecodeError):
+            return 10
+        return raw.get("max_delete", 10)
+
     def flush(
         self,
         max_children: int,
