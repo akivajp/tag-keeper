@@ -330,7 +330,7 @@ content hash and model, so a file is read once per model.
 
 `tag-keeper mcp` is an MCP server (over stdio) for AI agents such as Claude Code and Claude
 Desktop. Ask the agent to "find the quotes from last year and tag them with the client" and it
-searches the catalog, reads extracted text and adds tags and attributes. It needs the optional
+searches the catalog, reads extracted text, adds tags and attributes, and moves or deletes files (undoably). It needs the optional
 extra `mcp` (`pipx install 'tag-keeper[mcp]'`).
 
 In Claude Code the easiest way is the plugin (it runs `tag-keeper[mcp]` with `uvx`, so nothing
@@ -352,14 +352,19 @@ $ claude mcp add -s user tag-keeper -- tag-keeper --config ~/my.toml mcp  # with
 | Tool | What it does |
 |---|---|
 | `list_roots` | root names, paths, file counts and the last scan |
-| `search` | search by name, text, kind, tags, attributes, folder, date and size (same as the Web UI) |
+| `search` | search by name, text, kind, tags, attributes, folder, date and size (same as the Web UI); `untagged` for items with no tag, `direct_only` to ignore tags inherited from folders |
 | `get_item` | one item: direct and inherited tags and attributes, relations, identical files; a folder's children |
 | `read_text` | extracted text (PDF, Office documents, OCR, transcripts) |
-| `list_tags` | existing tags (counts, aliases, parents), attribute definitions, saved searches |
-| `add_tags`, `remove_tags` | add or remove tags |
+| `list_tags` | existing tags (direct count, number of files the tag applies to including inheritance, aliases, parents), attribute definitions, saved searches |
+| `add_tags`, `remove_tags` | add or remove tags; `add_tags` takes `items` to give different tags to different files in one call |
 | `set_attr`, `unset_attr` | set or clear a defined attribute |
+| `move_items` | move or rename files and folders (tags and attributes follow; never overwrites) |
+| `delete_items` | delete files and folders (moved to the quarantine folder, not erased) |
+| `undo_plan` | undo a `move_items` or `delete_items` run |
 
-- It never writes to your files: there are no move, rename or delete tools (tidy up in the Web UI).
+- Moves, renames and deletions run as one-off plans, as in the Web UI (snapshots before and
+  after, a journal, undo). Deleting only moves things to the quarantine folder; there is no
+  tool to empty it. The runs also show up on the Plans page.
 - Tags and attributes from the agent are recorded with the source `agent` (people's are
   `manual`, readings are `ai`).
 - The tag log is append-only and reloads changes from other processes, so it can run alongside

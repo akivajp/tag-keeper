@@ -846,12 +846,35 @@ def create_app(
 
     @app.route("/api/tags")
     def api_tags() -> dict[str, Any]:
-        """使われているタグ（件数・別名・親・子）と、属性の定義・保存した検索。"""
-        store = settings.tags()
+        """使われているタグ（件数・別名・親・子）と、属性の定義・保存した検索。
+
+        count は直接付いているアイテムの数、files はフォルダからの継承と親子を含めて効いているファイルの数（全ルートの合計）。
+        """
+        config = settings.config()
+        store = settings.tags(config)
         counts = store.all_tags()
         dictionary = store.dictionary()
+        effective: dict[str, int] = {}
+        conn = open_db()
+        try:
+            for rc in config.roots:
+                files = [
+                    r["relpath"]
+                    for r in conn.execute(
+                        "SELECT e.relpath FROM entries e JOIN roots r ON r.id = e.root_id"
+                        " WHERE r.name = ? AND e.gone_at IS NULL AND e.is_dir = 0",
+                        (rc.name,),
+                    )
+                ]
+                for tag, n in store.effective_counts(rc.name, files).items():
+                    effective[tag] = effective.get(tag, 0) + n
+        finally:
+            conn.close()
         return {
-            "tags": [{"tag": t, "count": counts.get(t, 0), **dictionary.get(t, {})} for t in sorted(set(counts) | set(dictionary))],
+            "tags": [
+                {"tag": t, "count": counts.get(t, 0), "files": effective.get(t, 0), **dictionary.get(t, {})}
+                for t in sorted(set(counts) | set(dictionary))
+            ],
             "aliases": {a: c for c, d in dictionary.items() for a in d.get("aliases", [])},
             "attrs": store.attr_defs_list(),
             "searches": store.saved_searches(),
@@ -1651,6 +1674,7 @@ def create_app(
         問い合わせ: root、q（名前・フォルダに含む語。空白区切りで、すべて含むもの）、text（本文に含む語）、
         kind（種類: KINDS のキー）、under（このフォルダの配下）、after・before（更新日 YYYY-MM-DD）、min_size・max_size（バイト）、
         tag・not・mode（タグ。別名は正式な名前に、親のタグは子のタグが付いたものも含む。フォルダのタグは配下にも効く）、
+        untagged=1（タグが1つも効いていないものだけ）、direct=1（フォルダからの継承を見ず、直接付いたタグだけで判定する）、
         attr（属性。「名前」「名前=値」「名前>=値」など。フォルダの値は配下が継承する）、
         gone=1（今は無いものも含める）、collapse=1（同じ内容のファイルを1件にまとめる）、folders=1（フォルダも出す）、limit。
         """
@@ -1670,6 +1694,8 @@ def create_app(
         under = clean_relpath(uq.get("under", ""))
         conds = [_parse_attr_cond(x) for x in uq.getall("attr") if x.strip()]
         files_only = uq.get("folders") != "1"
+        untagged = uq.get("untagged") == "1"
+        direct = uq.get("direct") == "1"
 
         def number(key: str) -> int | None:
             raw = uq.get(key, "").strip()
@@ -1685,7 +1711,7 @@ def create_app(
         after, before = uq.get("after", "").strip(), uq.get("before", "").strip()
         min_size, max_size = number("min_size"), number("max_size")
         if not (include or exclude or words or text or kind or under or after or before or min_size is not None
-                or max_size is not None or conds):
+                or max_size is not None or conds or untagged):
             raise fail(400, "探す条件を入れてください")
         terms = query_terms(text)
         conn = open_db()
@@ -1699,8 +1725,11 @@ def create_app(
                 raise fail(400, f"日付は YYYY-MM-DD で指定してください（{e}）") from None
             paths = [r["relpath"] for r in rows]
             info = {r["relpath"]: r for r in rows}
-            if include or exclude:
-                paths = tags_search(((p, bool(info[p]["is_dir"])) for p in paths), store.tagged_paths(rc.name, implied=True), include, mode, exclude)
+            if include or exclude or untagged:
+                paths = tags_search(
+                    ((p, bool(info[p]["is_dir"])) for p in paths), store.tagged_paths(rc.name, implied=True), include, mode, exclude,
+                    inherit=not direct, untagged=untagged,
+                )
             if conds:
                 defs = {d["name"]: d for d in store.attr_defs_list()}
                 values = store.attr_paths(rc.name)

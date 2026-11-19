@@ -365,3 +365,6 @@ textarea { width: 100%; font: inherit; }
 
 /* 書き起こし */
 pre.transcript { max-height: 24rem; overflow: auto; white-space: pre-wrap; }
+
+/* 検索の結果の、選ぶためのチェックボックスの列 */
+th.check, td.check { width: 1.8rem; text-align: center; }

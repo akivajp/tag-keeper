@@ -350,6 +350,18 @@ def test_tag_management_and_search(env: dict) -> None:
     assert item["tags"]["direct"][0]["tag"] == "type:report" and item["tags"]["inherited"][0]["tag"] == "area:docs"
     app.get("/api/tags/search", {"root": "data"}, status=400)
 
+    # 検索の画面の API: タグ無し（継承を含めて何も効いていないもの）と、直接付けたタグだけでの判定
+    def find(**q: object) -> list[str]:
+        return [x["path"] for x in app.get("/api/search", {"root": "data", **q}).json["items"]]
+
+    untagged = find(untagged="1")
+    assert untagged and not any(p.startswith("docs/") for p in untagged)
+    assert "docs/sub/memo.txt" in find(untagged="1", direct="1") and "docs/report.pdf" not in find(untagged="1", direct="1")
+    assert find(tag="area:docs", direct="1") == []
+    # タグの一覧には、継承を含めて効いているファイルの数（files）も載る
+    tags = {x["tag"]: x for x in app.get("/api/tags").json["tags"]}
+    assert tags["area:docs"]["count"] == 1 and tags["area:docs"]["files"] == len(search(tag="area:docs"))
+
     # 日本語のタグでも探せる（複数の値をとる問い合わせも UTF-8 として読む）
     app.post_json("/api/tags", {"root": "data", "paths": ["docs/report.pdf"], "tag": "種類:報告書"}, headers=origin)
     assert search(tag="種類:報告書") == ["docs/report.pdf"]

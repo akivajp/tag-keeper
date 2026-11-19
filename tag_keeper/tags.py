@@ -1247,6 +1247,39 @@ class TagStore:
             self.reload_if_changed()
             return Counter(t for (root, _path), tags in self.items.items() if only is None or root in only for t in tags)
 
+    def effective_counts(self, root: str, files: Iterable[str]) -> Counter[str]:
+        """タグごとに、効いているファイルの数（直接付いたもの・祖先のフォルダからの継承・親子を合わせて数える）。
+
+        all_tags() は直接付いた件数だけを返すので、フォルダに付けたタグは 1 件にしか見えない。
+        こちらは「そのタグで探すと何件のファイルが出るか」と同じ数になる。
+
+        Args:
+            root: ルートの名前。
+            files: 数える対象のファイルの相対パス（カタログにある、今あるファイル）。
+        """
+        with self.lock:
+            self.reload_if_changed()
+            direct = {path: set(tags) for (r, path), tags in self.items.items() if r == root and tags}
+            # フォルダごとの「効いているタグ」は使い回す（同じフォルダのファイルで祖先を何度もたどらない）
+            cache: dict[str, frozenset[str]] = {}
+
+            def of_dir(d: str) -> frozenset[str]:
+                got = cache.get(d)
+                if got is None:
+                    own = direct.get(d, set())
+                    got = frozenset(own) if d == "" else of_dir(d.rpartition("/")[0]) | own
+                    cache[d] = got
+                return got
+
+            out: Counter[str] = Counter()
+            for raw in files:
+                path = _nk(raw)
+                have = set(of_dir(path.rpartition("/")[0])) | direct.get(path, set())
+                for t in list(have):
+                    have |= self._ancestors_of(t)
+                out.update(have)
+            return out
+
     def items_with(self, tag: str, root: str | None = None) -> list[tuple[str, str]]:
         """そのタグが直接付いたアイテム（ルート名, 相対パス）。フォルダなら配下も検索結果になる。"""
         tag = normalize_tag(tag)
@@ -1273,6 +1306,9 @@ def search(
     include: Sequence[str],
     mode: str = "and",
     exclude: Sequence[str] = (),
+    *,
+    inherit: bool = True,
+    untagged: bool = False,
 ) -> list[str]:
     """タグでアイテムを絞り込む。フォルダに付いたタグは、配下のアイテムにも効く（継承）。
 
@@ -1282,6 +1318,8 @@ def search(
         include: 含むタグ。空なら、除外だけで絞る。
         mode: "and"（すべて含む）か "or"（どれかを含む）。
         exclude: 含まないタグ（どれか1つでも効いていれば除く）。
+        inherit: フォルダに付いたタグを配下にも効かせるか。False なら、アイテム自身に直接付いたタグだけで判定する。
+        untagged: タグが1つも効いていないアイテムだけにする（inherit が False なら、直接付いたタグが無いもの）。
 
     Returns:
         当てはまるアイテムの相対パス（entries の順）。
@@ -1292,14 +1330,23 @@ def search(
     def has(path: str, paths: set[str]) -> bool:
         if not paths:
             return False
-        if path in paths or "" in paths:
+        if path in paths:
+            return True
+        if not inherit:
+            return False
+        if "" in paths:
             return True
         parts = path.split("/")
         return any("/".join(parts[:i]) in paths for i in range(1, len(parts)))
 
+    # 「タグ無し」の判定用: 何かのタグが付いているアイテムの全体
+    anything: set[str] = set().union(*tagged.values()) if untagged and tagged else set()
+
     out = []
     for raw, _is_dir in entries:
         path = _nk(raw)
+        if untagged and has(path, anything):
+            continue
         if inc:
             hits = (has(path, s) for s in inc)
             if not (all(hits) if mode == "and" else any(hits)):

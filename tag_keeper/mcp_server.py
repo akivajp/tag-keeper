@@ -1,11 +1,12 @@
 """AI エージェント（Claude Code・Claude Desktop など）から使う MCP サーバー（tag-keeper mcp）。
 
 標準入出力（stdio）で MCP を話し、カタログの検索・アイテムの詳細・抽出した本文の読み出し・
-タグと属性の付け外しを、ツールとしてエージェントに渡す。
+タグと属性の付け外し・移動と改名・削除（隔離）を、ツールとしてエージェントに渡す。
 
-- 中身は既存の部品（find_entries・TagStore・タグでの絞り込み）を薄く包むだけ。Web の画面・CLI と同じ結果になる。
-- ファイルそのものには書き込まない（移動・改名・削除のツールは置かない）。書き込むのはタグのログだけで、
-  エージェントが付けたものは出所 "agent" として記録する（人が付けた "manual"、読み取りの "ai" と見分けられる）。
+- 中身は既存の部品（find_entries・TagStore・タグでの絞り込み・整理プラン）を薄く包むだけ。Web の画面・CLI と同じ結果になる。
+- タグは、エージェントが付けたものを出所 "agent" として記録する（人が付けた "manual"、読み取りの "ai" と見分けられる）。
+- 移動・改名・削除は、Web の画面と同じく1回ごとの整理プランとして実行する（実行直前の確認・前後のスナップショット・
+  実行記録・取り消し）。削除は完全には消さず、隔離フォルダへ移すだけ（隔離を空にするツールは置かない）。
 - タグのログは追記専用で、別のプロセスが書いたものも読み直すので、Web の画面のサーバーと同時に動かしてよい。
 - 標準出力は MCP の通信に使うため、ログは標準エラー（rich）にだけ出す。
 
@@ -21,10 +22,28 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from tag_keeper import __version__
-from tag_keeper.catalog import connect, last_scan
+from tag_keeper import __version__, rules
+from tag_keeper.catalog import connect, last_scan, utcnow
 from tag_keeper.config import Config, ConfigError, RootConfig, load_config
 from tag_keeper.fulltext import KINDS, find_entries, query_terms, snippets
+from tag_keeper.plan import (
+    ACTION_MOVE,
+    ACTION_QUARANTINE,
+    CAT_MOVE,
+    Plan,
+    PlanError,
+    PlanOp,
+    RunResult,
+    SnapshotError,
+    Snapper,
+    apply_plan,
+    fingerprint,
+    journal_path,
+    new_plan_id,
+    undo_plan,
+    write_plan,
+)
+from tag_keeper.syncguard import SyncError, make_guard
 from tag_keeper.tags import TagError, TagStore
 from tag_keeper.tags import search as tags_search
 from tag_keeper.web.files import PathError, clean_relpath, resolve_within
@@ -32,6 +51,11 @@ from tag_keeper.web.files import PathError, clean_relpath, resolve_within
 from tag_keeper.web.server import _attrs_match, _parse_attr_cond
 
 log = logging.getLogger(__name__)
+
+# 削除（隔離）のプランのカテゴリ（Web の画面のファイルブラウザからの削除と同じ表示名）
+CAT_DELETE = "削除（隔離フォルダへ）"
+# 1回の呼び出しで動かせる件数の上限（取り違えで大量に動かさないため）
+MAX_FILE_OPS = 500
 
 # エージェントの文脈を食いつぶさないための上限
 MAX_RESULTS = 500
@@ -45,7 +69,10 @@ tag-keeper のカタログ（既存のフォルダ構成のまま、ファイル
 - 1件の詳細（付いているタグ・属性・同じ内容のファイル）は get_item、抽出した本文は read_text で読む。
 - タグを付ける前に list_tags で既存のタグを確かめ、なるべく既存のタグ（または別名）を使う。むやみに新しいタグを作らない。
 - フォルダに付けたタグ・属性は配下のアイテムにも効く（継承）。まとめて付けるときはフォルダに付けるとよい。
-- ファイルの移動・改名・削除はこのサーバーではできない（利用者が Web の画面で行う）。
+- ファイルごとに違うタグを付けるときは、add_tags の items にまとめて1回で渡す。
+- まだタグが1つも効いていないもの（未整理）は、search の untagged=true で探せる。
+- 移動・改名は move_items、削除は delete_items。削除は隔離フォルダへ移すだけで、どちらも undo_plan で取り消せる。
+  利用者に確かめずに消さない。迷うものは消さずに「状態:削除候補」のようなタグを付けて、利用者に判断を任せる。
 """
 
 
@@ -144,8 +171,13 @@ class AgentTools:
         max_size: int | None = None,
         folders: bool = False,
         limit: int = 50,
+        untagged: bool = False,
+        direct_only: bool = False,
     ) -> dict[str, Any]:
-        """アイテムを探す（Web の画面の検索と同じ条件）。root を省くと全ルートを探す。"""
+        """アイテムを探す（Web の画面の検索と同じ条件）。root を省くと全ルートを探す。
+
+        untagged はタグが1つも効いていないもの、direct_only はフォルダからの継承を見ずに、直接付いたタグだけで判定する。
+        """
         config = self._config()
         store = self._store(config)
         words = [w for w in (words or []) if w.strip()]
@@ -155,8 +187,10 @@ class AgentTools:
         if kind and kind not in KINDS:
             raise ValueError(f"種類が不正です: {kind}（使えるもの: {', '.join(sorted(KINDS))}）")
         if not (words or text.strip() or kind or include or exclude or conds or under or after or before
-                or min_size is not None or max_size is not None):
-            raise ValueError("探す条件（words・text・kind・tags・exclude_tags・attrs・under・after・before・大きさ のどれか）を指定してください")
+                or min_size is not None or max_size is not None or untagged):
+            raise ValueError("探す条件（words・text・kind・tags・exclude_tags・untagged・attrs・under・after・before・大きさ のどれか）を指定してください")
+        if untagged and include:
+            raise ValueError("untagged（タグ無し）と tags は一緒に指定できません")
         limit = max(1, min(int(limit), MAX_RESULTS))
         under_rel = clean_relpath(under)
         terms = query_terms(text)
@@ -179,11 +213,12 @@ class AgentTools:
                     raise ValueError(f"日付は YYYY-MM-DD で指定してください（{e}）") from None
                 info = {r["relpath"]: r for r in rows}
                 paths = list(info)
-                if include or exclude:
+                if include or exclude or untagged:
                     paths = tags_search(
                         ((p, bool(info[p]["is_dir"])) for p in paths),
                         store.tagged_paths(rc.name, implied=True),
                         include, "or" if any_tag else "and", exclude,
+                        inherit=not direct_only, untagged=untagged,
                     )
                 if conds:
                     defs = {d["name"]: d for d in store.attr_defs_list()}
@@ -286,15 +321,21 @@ class AgentTools:
         }
 
     def list_tags(self) -> dict[str, Any]:
-        """タグ（件数・別名・親）・属性の定義・保存した検索を返す。"""
-        store = self._store(self._config())
+        """タグ（件数・別名・親）・属性の定義・保存した検索を返す。
+
+        count は直接付いているアイテム（ファイル・フォルダ）の数、files はフォルダからの継承と親子を含めて
+        そのタグが効いているファイルの数（そのタグで search したときの件数）。
+        """
+        config = self._config()
+        store = self._store(config)
         # 先に辞書を読み、続けて件数を読む（CLI の tags と同じ順）
         dictionary = store.dictionary()
         counts = store.all_tags()
+        effective = self._effective_counts(config, store)
         tags = []
         for tag in sorted(set(counts) | set(dictionary)):
             d = dictionary.get(tag, {})
-            entry: dict[str, Any] = {"tag": tag, "count": counts.get(tag, 0)}
+            entry: dict[str, Any] = {"tag": tag, "count": counts.get(tag, 0), "files": effective.get(tag, 0)}
             if d.get("aliases"):
                 entry["aliases"] = d["aliases"]
             if d.get("parents"):
@@ -302,19 +343,65 @@ class AgentTools:
             tags.append(entry)
         return {"tags": tags, "attributes": store.attr_defs_list(), "saved_searches": store.saved_searches()}
 
-    # --- 書き込み（タグのログだけ。ファイルには触れない） ---
+    def _effective_counts(self, config: Config, store: TagStore) -> dict[str, int]:
+        """タグごとの、継承と親子を含めて効いているファイルの数（全ルートの合計）。"""
+        out: dict[str, int] = {}
+        conn = connect(self.db_path)
+        try:
+            for rc in config.roots:
+                files = [
+                    r["relpath"]
+                    for r in conn.execute(
+                        "SELECT e.relpath FROM entries e JOIN roots r ON r.id = e.root_id"
+                        " WHERE r.name = ? AND e.gone_at IS NULL AND e.is_dir = 0",
+                        (rc.name,),
+                    )
+                ]
+                for tag, n in store.effective_counts(rc.name, files).items():
+                    out[tag] = out.get(tag, 0) + n
+        finally:
+            conn.close()
+        return out
 
-    def add_tags(self, root: str, paths: list[str], tags: list[str]) -> dict[str, Any]:
-        """アイテムにタグを付ける（別名は正式な名前になる）。付けた件数をタグごとに返す。"""
-        rc, rels, store = self._targets(root, paths)
-        added = {}
-        for tag in _nonempty(tags, "tags"):
-            n = store.add(rc.name, rels, tag, source="agent")
-            # 同じタグ（別名を含む）が重ねて渡されても、件数は足し上げる
-            key = store.canonical(tag)
-            added[key] = added.get(key, 0) + n
+    # --- 書き込み（タグのログ） ---
+
+    def add_tags(
+        self, root: str, paths: list[str] | None = None, tags: list[str] | None = None,
+        items: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        """アイテムにタグを付ける（別名は正式な名前になる）。付けた件数をタグごとに返す。
+
+        paths と tags の組を1つ渡すか、items（[{"paths": [...], "tags": [...]}, …]）で組をいくつも渡す。
+        どれかの組が不正なら、何も付けずにエラーにする（途中まで付いた状態を残さない）。
+        """
+        config = self._config()
+        rc = self._root(config, root)
+        store = self._store(config)
+        groups: list[tuple[list[str], list[str]]] = []
+        if paths or tags:
+            groups.append((list(paths or []), list(tags or [])))
+        for i, it in enumerate(items or []):
+            if not isinstance(it, dict):
+                raise ValueError(f"items[{i}] は {{\"paths\": [...], \"tags\": [...]}} の形にしてください")
+            one = it.get("paths") or ([it["path"]] if it.get("path") else [])
+            groups.append((list(one), list(it.get("tags") or [])))
+        if not groups:
+            raise ValueError("paths と tags、または items を指定してください")
+        # 先に全部を確かめる（パスの誤りは、1つも付ける前に知らせる）
+        checked = [
+            ([self._relpath(rc, p) for p in _nonempty(ps, "paths")], _nonempty(ts, "tags")) for ps, ts in groups
+        ]
+        added: dict[str, int] = {}
+        touched: list[str] = []
+        for rels, ts in checked:
+            for tag in ts:
+                n = store.add(rc.name, rels, tag, source="agent")
+                # 同じタグ（別名を含む）が重ねて渡されても、件数は足し上げる
+                key = store.canonical(tag)
+                added[key] = added.get(key, 0) + n
+            touched += [r for r in rels if r not in touched]
         log.info("エージェントがタグを付けました: %s %s", rc.name, added)
-        return {"root": rc.name, "paths": rels, "added": added}
+        return {"root": rc.name, "paths": touched, "added": added}
 
     def remove_tags(self, root: str, paths: list[str], tags: list[str]) -> dict[str, Any]:
         """アイテムからタグを外す（直接付いたものだけ。継承したものは元のフォルダから外す）。"""
@@ -339,11 +426,129 @@ class AgentTools:
         n = store.unset_attr(rc.name, rels, name)
         return {"root": rc.name, "paths": rels, "name": name, "changed": n}
 
+    # --- 書き込み（ファイルを動かす。1回ごとの整理プランとして実行する） ---
+
+    def move_items(self, root: str, items: list[dict[str, Any]]) -> dict[str, Any]:
+        """ファイル・フォルダを移動・改名する（items は [{"path": 今の場所, "dest": 新しい場所（名前を含む）}, …]）。
+
+        タグ・属性・関係は移動に追従する。移動先のフォルダが無ければ作る。既にあるものは上書きしない。
+        """
+        config = self._config()
+        rc = self._root(config, root)
+        if not items or not all(isinstance(it, dict) for it in items):
+            raise ValueError('items は [{"path": ..., "dest": ...}] の形で1つ以上指定してください')
+        if len(items) > MAX_FILE_OPS:
+            raise ValueError(f"1回に動かせるのは {MAX_FILE_OPS} 件までです（{len(items)} 件）")
+        ops: list[PlanOp] = []
+        dests: set[str] = set()
+        for it in items:
+            src = self._relpath(rc, str(it.get("path", "")))
+            dest = self._relpath(rc, str(it.get("dest", "")), must_exist=False)
+            if not src or not dest:
+                raise PathError("ルートそのものは動かせません")
+            if dest == src:
+                continue
+            if dest.startswith(src + "/"):
+                raise PathError(f"フォルダをそれ自身の中へは移せません: {src}")
+            problem = rules.cloud_name_problem(dest)
+            if problem:
+                raise PathError(f"{dest}: {problem}")
+            clash = rules.case_conflict(rc.path, dest, src)
+            if rules.name_key(dest) in dests or (rc.path / dest).exists() or (rc.path / dest).is_symlink() or clash:
+                raise PathError(f"移動先に同じ名前のものがあります: {clash or dest}")
+            dests.add(rules.name_key(dest))
+            ops.append(self._op(rc, ACTION_MOVE, src, CAT_MOVE, str(it.get("reason", "") or "エージェントによる移動")[:200], dest))
+        if not ops:
+            raise ValueError("動かすものがありません（名前も場所も変わらない）")
+        return self._run_plan(config, rc, ops, "move")
+
+    def delete_items(self, root: str, paths: list[str], reason: str = "") -> dict[str, Any]:
+        """ファイル・フォルダを削除する（完全には消さず、隔離フォルダへ移す。undo_plan で元に戻せる）。"""
+        config = self._config()
+        rc = self._root(config, root)
+        rels = list(dict.fromkeys(self._relpath(rc, p) for p in _nonempty(paths, "paths")))
+        if "" in rels:
+            raise PathError("ルートそのものは削除できません")
+        if len(rels) > MAX_FILE_OPS:
+            raise ValueError(f"1回に削除できるのは {MAX_FILE_OPS} 件までです（{len(rels)} 件）")
+        # 選んだフォルダの中にあるものは、フォルダごと移るので重ねて扱わない
+        rels = [r for r in rels if not any(r.startswith(o + "/") for o in rels)]
+        why = (reason or "エージェントによる削除")[:200]
+        ops = [self._op(rc, ACTION_QUARANTINE, r, CAT_DELETE, why) for r in rels]
+        return self._run_plan(config, rc, ops, "delete")
+
+    def undo_plan(self, plan_id: str) -> dict[str, Any]:
+        """move_items・delete_items（や、ほかの整理プラン）の実行を取り消し、動かしたものを元の場所へ戻す。"""
+        config = self._config()
+        if not journal_path(self._journal_dir, plan_id).exists():
+            raise ValueError(f"実行記録がありません: {plan_id}")
+        conn = connect(self.db_path)
+        try:
+            result = undo_plan(
+                conn, plan_id, journal_dir=self._journal_dir,
+                snapshot=Snapper(config.plan.snapper_config) if config.plan.snapper_config else None,
+                tags=self._store(config),
+            )
+        finally:
+            conn.close()
+        log.info("エージェントがプランを取り消しました: %s（戻した %d 件）", plan_id, len(result.done))
+        return {"plan_id": plan_id, **_outcomes(result, "restored")}
+
+    @property
+    def _journal_dir(self) -> Path:
+        """実行記録の置き場所（CLI・Web の画面と同じ、カタログの隣の journal/）。"""
+        return Path(self.db_path).parent / "journal"
+
+    @staticmethod
+    def _op(rc: RootConfig, action: str, rel: str, category: str, reason: str, dest: str = "") -> PlanOp:
+        """今の状態（inode・件数・大きさ・更新日時）を控えた操作を作る。シンボリックリンクは扱わない。"""
+        full = resolve_within(rc.path, rel)
+        fp = fingerprint(full)
+        if fp is None or full.is_symlink():
+            raise PathError(f"ありません: {rc.name}/{rel}")
+        return PlanOp(action, rel, full.is_dir(), fp.files, fp.size, fp.inode, fp.mtime_ns, category, reason, dest=dest)
+
+    def _run_plan(self, config: Config, rc: RootConfig, ops: list[PlanOp], kind: str) -> dict[str, Any]:
+        """操作を1つの整理プランとして書き出し、すぐ実行する（Web の画面のファイル操作と同じ流れ）。"""
+        plans_dir = Path(self.db_path).parent / "plans"
+        plan = Plan(id=new_plan_id(rc.name, f"agent-{kind}"), root=rc.name, root_path=rc.path, created_at=utcnow(), ops=ops)
+        base, n = plan.id, 1
+        while (plans_dir / f"{plan.id}.toml").exists() or journal_path(self._journal_dir, plan.id).exists():
+            n += 1
+            plan.id = f"{base}-{n}"
+        write_plan(plan, plans_dir / f"{plan.id}.toml")
+        conn = connect(self.db_path)
+        try:
+            result = apply_plan(
+                conn, plan,
+                quarantine_dir=config.plan.quarantine_dir,
+                journal_dir=self._journal_dir,
+                snapshot=Snapper(config.plan.snapper_config) if config.plan.snapper_config else None,
+                sync=make_guard(rc.sync_client, rc.sync_service, rc.sync_guard),
+                tags=self._store(config),
+            )
+        finally:
+            conn.close()
+        log.info("エージェントがプランを実行しました: %s（%d 件）", plan.id, len(result.done))
+        out: dict[str, Any] = {"root": rc.name, "plan_id": plan.id, **_outcomes(result, "done")}
+        out["undo"] = f"取り消すには undo_plan(plan_id=\"{plan.id}\")"
+        if result.sync_error:
+            out["sync_error"] = result.sync_error
+        return out
+
     def _targets(self, root: str, paths: list[str], *, must_exist: bool = True) -> tuple[RootConfig, list[str], TagStore]:
         config = self._config()
         rc = self._root(config, root)
         rels = [self._relpath(rc, p, must_exist=must_exist) for p in _nonempty(paths, "paths")]
         return rc, rels, self._store(config)
+
+
+def _outcomes(result: RunResult, key: str) -> dict[str, Any]:
+    """実行・取り消しの結果を、できたもの（パスの一覧）と飛ばしたもの（理由つき）に分ける。"""
+    return {
+        key: [o.path for o in result.done],
+        "skipped": [{"path": o.path, "reason": o.detail} for o in result.skipped],
+    }
 
 
 def _nonempty(values: list[str] | None, name: str) -> list[str]:
@@ -386,6 +591,9 @@ def build_server(tools: AgentTools) -> Any:
     server = MCPServer("tag-keeper", instructions=INSTRUCTIONS, version=__version__)
     read_only = ToolAnnotations(readOnlyHint=True, openWorldHint=False)
     writes = ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=False)
+    # ファイルを動かすもの（取り消せるが、同じ呼び出しを繰り返すと結果が変わる）
+    moves = ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False)
+    deletes = ToolAnnotations(readOnlyHint=False, destructiveHint=True, idempotentHint=False, openWorldHint=False)
 
     def guarded(fn: Callable[..., Any]) -> Callable[..., Any]:
         """想定内のエラー（ルート・パス・タグの誤り）を、エージェントが読める ToolError にする。"""
@@ -394,7 +602,7 @@ def build_server(tools: AgentTools) -> Any:
         def wrapper(*args: Any, **kwargs: Any) -> Any:
             try:
                 return fn(*args, **kwargs)
-            except (ConfigError, PathError, TagError, ValueError, OSError) as e:
+            except (ConfigError, PathError, TagError, PlanError, SnapshotError, SyncError, ValueError, OSError) as e:
                 raise ToolError(str(e)) from e
 
         return wrapper
@@ -423,6 +631,8 @@ def build_server(tools: AgentTools) -> Any:
         max_size: int | None = None,
         folders: bool = False,
         limit: int = 50,
+        untagged: bool = False,
+        direct_only: bool = False,
     ) -> dict[str, Any]:
         """ファイル（folders=true ならフォルダも）を探す。条件はすべて AND で、少なくとも1つ要る。
 
@@ -442,9 +652,11 @@ def build_server(tools: AgentTools) -> Any:
             max_size: この大きさ（バイト）以下。
             folders: フォルダも結果に含める。
             limit: 返す件数の上限（最大 500）。total には全件数が入る。
+            untagged: true なら、タグが1つも効いていないもの（未整理）だけ。tags とは一緒に使えない。
+            direct_only: true なら、フォルダからの継承を見ず、そのアイテムに直接付いたタグだけで tags・exclude_tags・untagged を判定する。
         """
         return tools.search(root, words, text, kind, tags, exclude_tags, any_tag, attrs, under, after, before,
-                            min_size, max_size, folders, limit)
+                            min_size, max_size, folders, limit, untagged, direct_only)
 
     @server.tool(annotations=read_only)
     @guarded
@@ -461,20 +673,28 @@ def build_server(tools: AgentTools) -> Any:
     @server.tool(annotations=read_only)
     @guarded
     def list_tags() -> dict[str, Any]:
-        """既存のタグ（件数・別名・親）、属性の定義（型・選択肢）、保存した検索を一覧する。タグを付ける前に確かめる。"""
+        """既存のタグ（別名・親）、属性の定義（型・選択肢）、保存した検索を一覧する。タグを付ける前に確かめる。
+
+        count は直接付いているアイテムの数、files はフォルダからの継承を含めてそのタグが効いているファイルの数。
+        """
         return tools.list_tags()
 
     @server.tool(annotations=writes)
     @guarded
-    def add_tags(root: str, paths: list[str], tags: list[str]) -> dict[str, Any]:
+    def add_tags(
+        root: str, paths: list[str] | None = None, tags: list[str] | None = None,
+        items: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
         """ファイル・フォルダにタグを付ける（ファイル自体は変えない）。別名は正式な名前になる。フォルダに付けると配下にも効く。
 
         Args:
             root: ルートの名前。
             paths: ルートからの相対パス（複数可）。
-            tags: 付けるタグ（複数可。「分類:値」の形も使える）。
+            tags: 付けるタグ（複数可。「分類:値」の形も使える）。paths のすべてに付ける。
+            items: ファイルごとに違うタグを付けるときの組の一覧（[{"paths": [...], "tags": [...]}, …]）。
+                paths・tags の代わりに（または併せて）渡すと、1回の呼び出しで済む。
         """
-        return tools.add_tags(root, paths, tags)
+        return tools.add_tags(root, paths, tags, items)
 
     @server.tool(annotations=writes)
     @guarded
@@ -493,6 +713,38 @@ def build_server(tools: AgentTools) -> Any:
     def unset_attr(root: str, paths: list[str], name: str) -> dict[str, Any]:
         """ファイル・フォルダから属性の値を外す。"""
         return tools.unset_attr(root, paths, name)
+
+    @server.tool(annotations=moves)
+    @guarded
+    def move_items(root: str, items: list[dict[str, Any]]) -> dict[str, Any]:
+        """ファイル・フォルダを移動・改名する。タグ・属性は追従し、undo_plan で取り消せる。既にある名前へは上書きしない。
+
+        Args:
+            root: ルートの名前。
+            items: [{"path": 今の相対パス, "dest": 新しい相対パス（ファイル名・フォルダ名まで含める）}, …]。
+                移動先のフォルダが無ければ作る。名前だけ変えるなら、同じフォルダの中の新しい名前を dest にする。
+        """
+        return tools.move_items(root, items)
+
+    @server.tool(annotations=deletes)
+    @guarded
+    def delete_items(root: str, paths: list[str], reason: str = "") -> dict[str, Any]:
+        """ファイル・フォルダを削除する。完全には消さず隔離フォルダへ移すだけで、undo_plan で元に戻せる（同期先のクラウドからは消える）。
+
+        利用者が削除を頼んだものか、同じ内容の写しが別にあると確かめたものだけに使う。迷うものはタグで印を付けて利用者に任せる。
+
+        Args:
+            root: ルートの名前。
+            paths: 削除するものの相対パス（フォルダは中身ごと）。
+            reason: 削除の理由（プランの画面に残る）。
+        """
+        return tools.delete_items(root, paths, reason)
+
+    @server.tool(annotations=moves)
+    @guarded
+    def undo_plan(plan_id: str) -> dict[str, Any]:
+        """move_items・delete_items の実行を取り消す（結果の plan_id を渡す）。元の場所に別のものがあれば、上書きせずに飛ばす。"""
+        return tools.undo_plan(plan_id)
 
     return server
 

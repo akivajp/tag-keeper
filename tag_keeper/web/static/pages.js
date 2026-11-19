@@ -937,6 +937,9 @@ function searchState(params) {
     attrs: params.getAll('attr'),
     gone: params.get('gone') === '1',
     collapse: params.get('nocollapse') !== '1',
+    // タグが1つも効いていないもの（未整理）だけ／フォルダからの継承を見ず、直接付いたタグだけで判定する
+    untagged: params.get('untagged') === '1',
+    direct: params.get('direct') === '1',
   };
 }
 
@@ -951,12 +954,14 @@ function searchQuery(state) {
   if (state.folders) q.set('folders', '1');
   if (state.gone) q.set('gone', '1');
   if (!state.collapse) q.set('nocollapse', '1');
+  if (state.untagged) q.set('untagged', '1');
+  if (state.direct) q.set('direct', '1');
   return q;
 }
 
 /** 条件が1つでもあるか（何も無ければ探さない）。 */
 function searchHasCondition(s) {
-  return s.include.length || s.exclude.length || s.q || s.text || s.kind || s.under || s.after || s.before || s.min || s.max || s.attrs.length;
+  return s.include.length || s.exclude.length || s.q || s.text || s.kind || s.under || s.after || s.before || s.min || s.max || s.attrs.length || s.untagged;
 }
 
 /** 検索の条件を、検索の API の問い合わせにする。 */
@@ -973,6 +978,8 @@ function searchApiQuery(state, root, limit) {
   if (state.folders) q.set('folders', '1');
   if (state.gone) q.set('gone', '1');
   if (state.collapse) q.set('collapse', '1');
+  if (state.untagged) q.set('untagged', '1');
+  if (state.direct) q.set('direct', '1');
   if (limit) q.set('limit', String(limit));
   return q;
 }
@@ -1089,11 +1096,11 @@ async function pageTags(main, params) {
           (x.parents || []).length ? t('親: {names}', { names: x.parents.join('、') }) : '',
         ].filter(Boolean).join(' ／ ');
         return h('div', { class: `tag-row ${inc ? 'included' : ''} ${exc ? 'excluded' : ''}` },
-          h('button', { class: 'tag-pick', title: t('検索に含める'), onclick: () => { toggle(state.include, x.tag); state.exclude = state.exclude.filter((y) => y !== x.tag); go(); } },
+          h('button', { class: 'tag-pick', title: t('検索に含める'), onclick: () => { toggle(state.include, x.tag); state.exclude = state.exclude.filter((y) => y !== x.tag); state.untagged = false; go(); } },
             h('span', { class: 'mark' }, inc ? '✓' : exc ? '⊘' : '＋'),
             h('span', { class: 'tag-name', translate: 'no' }, ns ? x.tag.slice(ns.length + 1) : x.tag,
               extra ? h('span', { class: 'tag-extra muted small' }, extra) : null)),
-          h('span', { class: 'muted small num' }, num(x.count)),
+          h('span', { class: 'muted small num', title: t('効いているファイル {files} 件（フォルダからの継承を含む）／直接付けたもの {count} 件', { files: num(x.files ?? x.count), count: num(x.count) }) }, num(x.files ?? x.count)),
           h('button', { class: 'chip-x', title: t('検索から除く'), onclick: () => { toggle(state.exclude, x.tag); state.include = state.include.filter((y) => y !== x.tag); go(); } }, '⊘'),
           h('button', { class: 'chip-x', title: t('別名と親…'), onclick: () => dictionaryDialog(x) }, '⚙'),
           h('button', { class: 'chip-x', title: t('名前を変える…'), onclick: () => renameTag(x.tag) }, '✎'),
@@ -1180,7 +1187,7 @@ async function pageTags(main, params) {
     h('div', { class: 'card' },
       h('h2', {}, 'タグ'),
       h('input', { type: 'search', placeholder: t('タグを探す'), value: filter, oninput: (e) => { filter = tagListFilter = e.target.value; renderList(); } }),
-      h('p', { class: 'muted small' }, t('＋ で検索に含め、⊘ で除きます。件数は直接付いている数です。')),
+      h('p', { class: 'muted small' }, t('＋ で検索に含め、⊘ で除きます。件数は、そのタグが効いているファイルの数です（フォルダからの継承を含む）。')),
       listEl),
     h('div', { class: 'card' },
       h('h2', {}, '属性'),
@@ -1189,9 +1196,11 @@ async function pageTags(main, params) {
   renderList();
 
   // --- 右: 探す条件と、結果・選んだファイルの詳細 ---
-  const chipsOf = (list, cls) => list.map((x) => h('span', { class: `chip ${cls}`, translate: 'no' }, x));
+  // 選んだタグのチップ。「×」で、その場で条件から外せる（左の一覧まで戻らなくてよい）
+  const chipsOf = (key, cls) => state[key].map((x) => h('span', { class: `chip ${cls}`, translate: 'no' }, x,
+    h('button', { type: 'button', class: 'chip-x', title: t('この条件を外す'), 'aria-label': t('この条件を外す'), onclick: () => { state[key] = state[key].filter((y) => y !== x); go(); } }, '×')));
   const folderList = h('datalist', { id: `folders-${enc(root)}` });
-  const narrowed = state.under || state.after || state.before || state.min || state.max || state.gone || !state.collapse;
+  const narrowed = state.under || state.after || state.before || state.min || state.max || state.gone || !state.collapse || state.direct;
   const conditions = [
     h('div', { class: 'toolbar' },
       h('input', { type: 'search', placeholder: t('名前やフォルダで探す'), value: state.q, onchange: (e) => { state.q = e.target.value.trim(); go(); } }),
@@ -1199,6 +1208,8 @@ async function pageTags(main, params) {
       h('select', { 'aria-label': t('種類'), onchange: (e) => { state.kind = e.target.value; go(); } },
         SEARCH_KINDS.map(([v, label]) => h('option', { value: v, selected: state.kind === v }, t(label)))),
       h('label', { class: 'small' }, h('input', { type: 'checkbox', checked: state.folders, onchange: (e) => { state.folders = e.target.checked; go(); } }), ' ', t('フォルダも出す')),
+      h('label', { class: 'small', title: t('タグが1つも効いていないもの（未整理）だけを出します。フォルダから継承したタグも数えます。') },
+        h('input', { type: 'checkbox', checked: state.untagged, onchange: (e) => { state.untagged = e.target.checked; if (state.untagged) state.include = []; go(); } }), ' ', t('タグ無しだけ')),
       h('button', { class: 'small', onclick: () => { Object.assign(state, searchState(new URLSearchParams())); go(); } }, t('条件を消す')),
       searchHasCondition(state) ? h('button', { class: 'small', onclick: saveSearchDialog }, t('この条件を保存…')) : null),
     h('details', { class: 'narrow', open: !!narrowed },
@@ -1212,9 +1223,11 @@ async function pageTags(main, params) {
         h('label', { class: 'small' }, t('大きさ'), ' ', h('input', { class: 'size-input', placeholder: t('例: 1MB'), value: state.min, onchange: (e) => { state.min = e.target.value.trim(); go(); } }),
           ' 〜 ', h('input', { class: 'size-input', placeholder: t('例: 1GB'), value: state.max, onchange: (e) => { state.max = e.target.value.trim(); go(); } })),
         h('label', { class: 'small' }, h('input', { type: 'checkbox', checked: state.collapse, onchange: (e) => { state.collapse = e.target.checked; go(); } }), ' ', t('同じ内容をまとめる')),
-        h('label', { class: 'small' }, h('input', { type: 'checkbox', checked: state.gone, onchange: (e) => { state.gone = e.target.checked; go(); } }), ' ', t('今は無いものも含める')))),
+        h('label', { class: 'small' }, h('input', { type: 'checkbox', checked: state.gone, onchange: (e) => { state.gone = e.target.checked; go(); } }), ' ', t('今は無いものも含める')),
+        h('label', { class: 'small', title: t('フォルダから継承したタグを見ず、ファイルやフォルダに直接付けたタグだけで探します。') },
+          h('input', { type: 'checkbox', checked: state.direct, onchange: (e) => { state.direct = e.target.checked; go(); } }), ' ', t('直接付けたタグだけで探す')))),
     state.include.length || state.exclude.length || state.attrs.length ? h('div', { class: 'toolbar' },
-      h('div', { class: 'chips' }, chipsOf(state.include, 'active'), state.exclude.length ? [h('span', { class: 'muted small' }, t('除外:')), chipsOf(state.exclude, 'excluded-chip')] : null,
+      h('div', { class: 'chips' }, chipsOf('include', 'active'), state.exclude.length ? [h('span', { class: 'muted small' }, t('除外:')), chipsOf('exclude', 'excluded-chip')] : null,
         state.attrs.map((c) => h('span', { class: 'chip attr', translate: 'no' }, c,
           h('button', { class: 'chip-x', title: t('この条件を外す'), onclick: () => { state.attrs = state.attrs.filter((x) => x !== c); go(); } }, '×')))),
       state.include.length > 1 ? h('select', { onchange: (e) => { state.mode = e.target.value; go(); } },
@@ -1235,13 +1248,29 @@ async function pageTags(main, params) {
       const body = h('tbody');
       const detail = h('div', { class: 'tag-detail' });
       const head = h('tr');
+      // チェックして、まとめて削除できる（今は無いものは選べない）
+      const picked = new Set();
+      const live = res.items.filter((x) => !x.gone_at);
+      const pickInfo = h('span', { class: 'muted small' });
+      const pickDelete = h('button', { class: 'small danger-outline', disabled: true, onclick: () => {
+        deleteDialog(root, live.filter((x) => picked.has(x.path)).map((x) => ({ path: x.path, is_dir: x.is_dir, size: x.size })));
+      } }, t('選んだものを削除…'));
+      const updatePicked = () => {
+        pickInfo.textContent = picked.size ? t('{n} 件を選択中', { n: num(picked.size) }) : '';
+        pickDelete.disabled = !picked.size;
+      };
       const renderRows = () => {
-        setChildren(head, sortHeader(t('名前'), 'name', sort, renderRows), sortHeader(t('場所'), 'path', sort, renderRows, 'hide-narrow'),
+        setChildren(head,
+          h('th', { class: 'check' }, h('input', { type: 'checkbox', title: t('すべて選ぶ'), 'aria-label': t('すべて選ぶ'), checked: live.length > 0 && picked.size === live.length,
+            onchange: (e) => { picked.clear(); if (e.target.checked) live.forEach((x) => picked.add(x.path)); updatePicked(); renderRows(); } })),
+          sortHeader(t('名前'), 'name', sort, renderRows), sortHeader(t('場所'), 'path', sort, renderRows, 'hide-narrow'),
           h('th', {}, t('タグ・属性')), sortHeader(t('サイズ'), 'size', sort, renderRows, 'num'), sortHeader(t('更新日時'), 'mtime', sort, renderRows, 'num hide-narrow'));
         setChildren(body, sortItems(res.items, sort, getters, (x) => x.path).map((x) => {
           const name = x.path.split('/').pop();
           const dir = x.path.split('/').slice(0, -1).join('/');
           return h('tr', { class: `clickable ${x.gone_at ? 'gone' : ''}`, onclick: () => showDetail(x) },
+            h('td', { class: 'check', onclick: (e) => e.stopPropagation() }, h('input', { type: 'checkbox', disabled: !!x.gone_at, checked: picked.has(x.path), 'aria-label': name,
+              onchange: (e) => { if (e.target.checked) picked.add(x.path); else picked.delete(x.path); updatePicked(); } })),
             h('td', { class: 'path' }, x.is_dir ? '📁 ' : `${fileIcon(name)} `, name,
               x.gone_at ? [' ', h('span', { class: 'badge', title: t('{when} に見えなくなりました', { when: when(x.gone_at) }) }, '今は無い')] : null,
               // 本文で探したときは、一致したところの前後を見せる
@@ -1265,7 +1294,9 @@ async function pageTags(main, params) {
         const parts = [h('h2', { class: 'path' }, name), h('div', { class: 'muted mono' }, x.path),
           h('div', { class: 'buttons' },
             h('a', { class: 'button small', href: x.is_dir ? browseHref(root, x.path) : browseHref(root, x.path.split('/').slice(0, -1).join('/'), '', x.gone_at ? '' : name) }, t('フォルダを開く')),
-            x.is_dir || x.gone_at ? null : h('a', { class: 'button small', href: fileUrl(root, x.path), target: '_blank', rel: 'noopener' }, t('新しいタブで開く')))];
+            x.is_dir || x.gone_at ? null : h('a', { class: 'button small', href: fileUrl(root, x.path), target: '_blank', rel: 'noopener' }, t('新しいタブで開く')),
+            // 検索の結果から、そのまま続けて消せる（隔離フォルダへ移すだけで、プランの画面から戻せる）
+            x.gone_at ? null : h('button', { class: 'small danger-outline', onclick: () => deleteDialog(root, [{ path: x.path, is_dir: x.is_dir, size: x.size }]) }, t('削除…')))];
         if (x.gone_at) {
           parts.push(h('p', { class: 'muted' }, t('{when} に見えなくなりました。過去の版は、フォルダを開いて「この時点を見る」から探せます。', { when: when(x.gone_at) })));
         } else {
@@ -1284,6 +1315,7 @@ async function pageTags(main, params) {
         h('p', { class: 'muted small' }, res.total > res.items.length
           ? t('{total} 件のうち {n} 件を表示', { total: num(res.total), n: num(res.items.length) })
           : t('{n} 件', { n: num(res.total) })),
+        h('div', { class: 'toolbar' }, pickDelete, pickInfo),
         detail,
         h('div', { class: 'card table-wrap' }, h('table', {}, h('thead', {}, head), body)));
       // 本文で探したときは、索引がどこまでできているか（抽出待ちが残っていれば、見つからないことがある）

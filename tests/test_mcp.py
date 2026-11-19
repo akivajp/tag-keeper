@@ -93,7 +93,7 @@ def test_tags_and_attrs_are_recorded_as_agent(tools: AgentTools, tmp_path: Path)
     assert res["added"] == {"会議": 1}
     item = tools.get_item("data", "docs/memo.txt")
     assert item["tags"]["direct"] == [{"tag": "会議", "source": "agent"}]
-    assert tools.list_tags()["tags"] == [{"tag": "会議", "count": 1}]
+    assert tools.list_tags()["tags"] == [{"tag": "会議", "count": 1, "files": 1}]
     assert tools.remove_tags("data", ["docs/memo.txt"], ["会議"])["removed"] == {"会議": 1}
     # 属性は定義済みのものだけ。型に合う値を付けられる
     store = TagStore(tools._config().tags.dir)
@@ -104,6 +104,68 @@ def test_tags_and_attrs_are_recorded_as_agent(tools: AgentTools, tmp_path: Path)
     direct = tools.get_item("data", "docs/見積書_2026.txt")["attrs"]["direct"]
     assert direct[0]["name"] == "金額" and direct[0]["source"] == "agent"
     assert tools.unset_attr("data", ["docs/見積書_2026.txt"], "金額")["changed"] == 1
+
+
+def test_untagged_direct_only_and_effective_counts(tools: AgentTools) -> None:
+    # フォルダに付けたタグは配下に継承される。直接付いた件数（count）は 1、効いているファイル（files）は 2
+    tools.add_tags("data", ["docs"], ["書類"])
+    tags = {t["tag"]: t for t in tools.list_tags()["tags"]}
+    assert tags["書類"]["count"] == 1 and tags["書類"]["files"] == 2
+    # タグ無し: 継承を含めて何も効いていないものだけ
+    assert [i["path"] for i in tools.search(untagged=True)["items"]] == ["photos/a.jpg"]
+    # 直接付いたタグだけで見ると、docs の中のファイルもタグ無し。フォルダ自身は付いている
+    assert {i["path"] for i in tools.search(untagged=True, direct_only=True)["items"]} == {
+        "docs/memo.txt", "docs/見積書_2026.txt", "photos/a.jpg",
+    }
+    assert tools.search(tags=["書類"], direct_only=True)["total"] == 0
+    assert [i["path"] for i in tools.search(tags=["書類"], direct_only=True, folders=True)["items"]] == ["docs"]
+    # タグ無しと tags は両立しない
+    with pytest.raises(ValueError):
+        tools.search(untagged=True, tags=["書類"])
+
+
+def test_add_tags_takes_several_groups_at_once(tools: AgentTools) -> None:
+    res = tools.add_tags("data", items=[
+        {"paths": ["docs/memo.txt"], "tags": ["会議"]},
+        {"path": "photos/a.jpg", "tags": ["写真", "会議"]},
+    ])
+    assert res["added"] == {"会議": 2, "写真": 1}
+    assert set(res["paths"]) == {"docs/memo.txt", "photos/a.jpg"}
+    # どれかの組が不正なら、何も付けない
+    with pytest.raises(PathError):
+        tools.add_tags("data", items=[{"paths": ["docs/見積書_2026.txt"], "tags": ["見積"]}, {"paths": ["nope.txt"], "tags": ["x"]}])
+    assert tools.get_item("data", "docs/見積書_2026.txt")["tags"]["direct"] == []
+    with pytest.raises(ValueError):
+        tools.add_tags("data")
+
+
+def test_move_delete_and_undo(tools: AgentTools, root: Path) -> None:
+    tools.add_tags("data", ["docs/memo.txt"], ["会議"])
+    # 移動・改名: 移動先のフォルダは作られ、タグは追従する
+    res = tools.move_items("data", [{"path": "docs/memo.txt", "dest": "notes/2026/打ち合わせ.txt"}])
+    assert res["done"] == ["docs/memo.txt"] and res["skipped"] == []
+    assert (root / "notes" / "2026" / "打ち合わせ.txt").exists() and not (root / "docs" / "memo.txt").exists()
+    assert tools.get_item("data", "notes/2026/打ち合わせ.txt")["tags"]["direct"][0]["tag"] == "会議"
+    # 既にある名前へは上書きしない・ルートの外へは出さない
+    with pytest.raises(PathError, match="同じ名前"):
+        tools.move_items("data", [{"path": "photos/a.jpg", "dest": "docs/見積書_2026.txt"}])
+    with pytest.raises(PathError):
+        tools.move_items("data", [{"path": "photos/a.jpg", "dest": "../a.jpg"}])
+    # 取り消すと元の場所に戻る
+    undone = tools.undo_plan(res["plan_id"])
+    assert undone["restored"] == ["docs/memo.txt"] and (root / "docs" / "memo.txt").exists()
+    # 削除は隔離フォルダへ移すだけで、取り消せる
+    res = tools.delete_items("data", ["photos/a.jpg"], reason="テスト")
+    assert res["done"] == ["photos/a.jpg"] and not (root / "photos" / "a.jpg").exists()
+    quarantine = tools._config().plan.quarantine_dir / res["plan_id"] / "photos" / "a.jpg"
+    assert quarantine.exists()
+    assert tools.undo_plan(res["plan_id"])["restored"] == ["photos/a.jpg"]
+    assert (root / "photos" / "a.jpg").exists()
+    # ルートそのものは消せない
+    with pytest.raises(PathError):
+        tools.delete_items("data", [str(root)])
+    with pytest.raises(ValueError, match="実行記録"):
+        tools.undo_plan("nope")
 
 
 def test_mcp_server_lists_and_calls_tools(tools: AgentTools) -> None:
@@ -123,7 +185,12 @@ def test_mcp_server_lists_and_calls_tools(tools: AgentTools) -> None:
 
     listed, ok, bad = asyncio.run(run())
     names = {t.name for t in listed}
-    assert names == {"list_roots", "search", "get_item", "read_text", "list_tags", "add_tags", "remove_tags", "set_attr", "unset_attr"}
+    assert names == {
+        "list_roots", "search", "get_item", "read_text", "list_tags", "add_tags", "remove_tags", "set_attr", "unset_attr",
+        "move_items", "delete_items", "undo_plan",
+    }
+    # 削除（隔離）には、破壊的な操作の印が付く
+    assert next(t for t in listed if t.name == "delete_items").annotations.destructive_hint is True
     # 読み取りのツールには読み取り専用の印が付く
     assert next(t for t in listed if t.name == "search").annotations.read_only_hint is True
     assert not ok.is_error and ok.structured_content["total"] == 1

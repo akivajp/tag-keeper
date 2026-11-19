@@ -8,7 +8,7 @@
   "plugins": [
     {
       "name": "tag-keeper",
-      "description": "Search, read and tag the files in your tag-keeper catalog from Claude Code (MCP server; never moves or deletes files)",
+      "description": "Search, read, tag and tidy the files in your tag-keeper catalog from Claude Code (MCP server; moves and deletions are undoable plans, and deleting only quarantines).",
       "category": "productivity",
       "source": "./plugins/tag-keeper",
       "homepage": "https://github.com/akivajp/tag-keeper"

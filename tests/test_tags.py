@@ -103,6 +103,23 @@ def test_search_with_inheritance() -> None:
     assert search(entries, tagged, ["type:invoice"], "and", ["draft"]) == ["Finance/Invoices/a.pdf", "Inbox/x.pdf"]
     assert search(entries, tagged, [], "and", ["area:finance"]) == ["Inbox/x.pdf", "Inbox/y.pdf"]
     assert search(entries, tagged, ["無い"], "and") == []
+    # タグ無し: 継承を含めて何も効いていないもの。inherit=False なら、直接付いたタグだけで見る
+    assert search(entries, tagged, [], untagged=True) == ["Inbox/y.pdf"]
+    assert search(entries, tagged, [], untagged=True, inherit=False) == ["Finance/Invoices/a.pdf", "Finance/Receipts/r.pdf", "Inbox/y.pdf"]
+    assert search(entries, tagged, ["type:invoice"], inherit=False) == ["Inbox/x.pdf"]
+    assert search(entries, {}, [], untagged=True) == [p for p, _ in entries]
+
+
+def test_effective_counts_include_inherited_and_implied(tmp_path: Path) -> None:
+    """効いているファイルの数は、フォルダからの継承と、親子（子のタグ → 親のタグ）を含める。"""
+    store = TagStore(tmp_path / "tags", host="a")
+    store.add("r", ["Finance"], "分野:経理")
+    store.add("r", ["Finance/a.pdf"], "種別:請求書")
+    store.add_parent("種別:請求書", "種別:証憑")
+    counts = store.effective_counts("r", ["Finance/a.pdf", "Finance/sub/b.pdf", "Other/c.pdf"])
+    assert counts == {"分野:経理": 2, "種別:請求書": 1, "種別:証憑": 1}
+    # 直接付いた件数（all_tags）は、フォルダに付けた分を 1 件としか数えない
+    assert store.all_tags()["分野:経理"] == 1
 
 
 def test_moves_found_together_are_applied_as_if_at_once(tmp_path: Path) -> None:
