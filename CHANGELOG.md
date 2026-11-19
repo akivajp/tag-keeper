@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.25.0] - 2026-11-19
+
+### Added
+
+- **Search page**: each selected tag chip has a `×` to drop it from the search; results have
+  checkboxes with **Delete selected…**, and the preview has a **Delete…** button, so files
+  can be deleted in a row without leaving the search. **Untagged only** lists items no tag
+  applies to, and **Match direct tags only** ignores tags inherited from folders
+  (`untagged=1` and `direct=1` on `/api/search`).
+- The tag list shows the number of files a tag applies to, including tags inherited from
+  folders and parent tags (`files` in `/api/tags`); the direct count is in the tooltip.
+- **MCP**: `move_items`, `delete_items` and `undo_plan` move, rename and delete (quarantine)
+  as one-off plans with snapshots, a journal and undo. `search` takes `untagged` and
+  `direct_only`, `list_tags` returns `files` next to `count`, and `add_tags` takes `items`
+  (`[{"paths": [...], "tags": [...]}]`) to tag different files differently in one call.
+
+### Changed
+
+- With cloud-sync (rclone bisync on a timer), a small change is no longer followed by a full
+  sync run that the job waits for: when fewer files were quarantined or moved than half of
+  cloud-sync's `max_delete`, the timer is restarted and the next scheduled sync reflects it.
+  Deleting one file from the file browser took about two minutes before; now it returns at once.
+- `tag-keeper apply` reports moves and renames separately from quarantined items, instead of
+  calling everything "quarantined".
+
+### Fixed
+
+- Transcribing a video without an audio track (a screen recording) failed with
+  `IndexError: tuple index out of range`; it is now skipped with the reason.
+
 ## [0.24.1] - 2026-11-19
 
 ### Added
