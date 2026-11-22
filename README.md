@@ -352,12 +352,15 @@ $ claude mcp add -s user tag-keeper -- tag-keeper --config ~/my.toml mcp  # with
 | Tool | What it does |
 |---|---|
 | `list_roots` | root names, paths, file counts and the last scan |
-| `search` | search by name, text, kind, tags, attributes, folder, date and size (same as the Web UI); `untagged` for items with no tag, `direct_only` to ignore tags inherited from folders |
+| `search` | search by name, text, kind, tags, attributes, folder, date and size (same as the Web UI); `untagged` for items with no tag, `direct_only` to ignore tags inherited from folders; `offset` and `next_offset` page through long results |
 | `get_item` | one item: direct and inherited tags and attributes, relations, identical files; a folder's children |
 | `read_text` | extracted text (PDF, Office documents, OCR, transcripts) |
 | `list_tags` | existing tags (direct count, number of files the tag applies to including inheritance, aliases, parents), attribute definitions, saved searches |
 | `add_tags`, `remove_tags` | add or remove tags; `add_tags` takes `items` to give different tags to different files in one call |
 | `set_attr`, `unset_attr` | set or clear a defined attribute |
+| `define_tag` | add or remove aliases (a name already in use is merged into the tag) and parents of a tag |
+| `rename_tag` | rename a tag everywhere; renaming to an existing tag merges them and reports `merged` |
+| `define_attr` | define an attribute (`choice`, `flag`, `date`, `number` or `text`) before `set_attr` |
 | `move_items` | move or rename files and folders (tags and attributes follow; never overwrites) |
 | `delete_items` | delete files and folders (moved to the quarantine folder, not erased) |
 | `undo_plan` | undo a `move_items` or `delete_items` run |

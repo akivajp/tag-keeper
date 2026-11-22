@@ -11,7 +11,7 @@ import pytest
 from conftest import write
 from tag_keeper.cli import main
 from tag_keeper.mcp_server import AgentTools
-from tag_keeper.tags import TagStore
+from tag_keeper.tags import TagError, TagStore
 from tag_keeper.web.files import PathError
 
 
@@ -168,6 +168,51 @@ def test_move_delete_and_undo(tools: AgentTools, root: Path) -> None:
         tools.undo_plan("nope")
 
 
+def test_search_pages_with_offset(tools: AgentTools) -> None:
+    # パス順に並ぶので、next_offset をたどると全件を重ならずに読める
+    first = tools.search(untagged=True, limit=2)
+    assert first["total"] == 3 and first["returned"] == 2 and first["next_offset"] == 2
+    rest = tools.search(untagged=True, limit=2, offset=first["next_offset"])
+    assert rest["returned"] == 1 and "next_offset" not in rest
+    paths = [i["path"] for i in first["items"] + rest["items"]]
+    assert paths == ["docs/memo.txt", "docs/見積書_2026.txt", "photos/a.jpg"]
+    # 全件数を超えた offset は空
+    assert tools.search(untagged=True, offset=10)["returned"] == 0
+
+
+def test_define_tag_rename_tag_and_define_attr(tools: AgentTools) -> None:
+    tools.add_tags("data", ["docs/memo.txt"], ["会議"])
+    tools.add_tags("data", ["docs/見積書_2026.txt"], ["ミーティング"])
+    # 既に使われている名前を別名にすると、付いたアイテムごと正式な名前へまとまる
+    res = tools.define_tag("会議", aliases=["ミーティング"], parents=["仕事"])
+    assert res["tag"] == "会議" and res["aliases"] == ["ミーティング"] and res["parents"] == ["仕事"]
+    assert tools.search(tags=["会議"])["total"] == 2
+    # 親のタグでも探せる
+    assert tools.search(tags=["仕事"])["total"] == 2
+    # 循環する親子・ほかのタグの別名を外すのは断る
+    with pytest.raises(TagError):
+        tools.define_tag("仕事", parents=["会議"])
+    with pytest.raises(TagError):
+        tools.define_tag("仕事", remove_aliases=["ミーティング"])
+    assert tools.define_tag("会議", remove_parents=["仕事"])["parents"] == []
+    # 名前の変更: 新しい名前なら統合ではない。既にあるタグへの変更は統合として知らせる
+    res = tools.rename_tag("会議", "打ち合わせ")
+    assert res == {"from": "会議", "to": "打ち合わせ", "changed": 2, "merged": False}
+    tools.add_tags("data", ["photos/a.jpg"], ["写真"])
+    assert tools.rename_tag("写真", "打ち合わせ")["merged"] is True
+    with pytest.raises(ValueError, match="ありません"):
+        tools.rename_tag("無いタグ", "x")
+    # 属性を定義すれば、set_attr で値を付けられる
+    d = tools.define_attr("状態", "choice", ["未処理", "済み"])
+    assert d["type"] == "choice" and d["choices"] == ["未処理", "済み"]
+    tools.set_attr("data", ["docs/memo.txt"], "状態", "済み")
+    assert tools.search(attrs=["状態=済み"])["total"] == 1
+    with pytest.raises(TagError):
+        tools.define_attr("x", "nope")
+    with pytest.raises(TagError):
+        tools.define_attr("y", "choice", ["1つだけ"])
+
+
 def test_mcp_server_lists_and_calls_tools(tools: AgentTools) -> None:
     pytest.importorskip("mcp")
     from mcp import Client
@@ -187,7 +232,7 @@ def test_mcp_server_lists_and_calls_tools(tools: AgentTools) -> None:
     names = {t.name for t in listed}
     assert names == {
         "list_roots", "search", "get_item", "read_text", "list_tags", "add_tags", "remove_tags", "set_attr", "unset_attr",
-        "move_items", "delete_items", "undo_plan",
+        "move_items", "delete_items", "undo_plan", "define_tag", "rename_tag", "define_attr",
     }
     # 削除（隔離）には、破壊的な操作の印が付く
     assert next(t for t in listed if t.name == "delete_items").annotations.destructive_hint is True

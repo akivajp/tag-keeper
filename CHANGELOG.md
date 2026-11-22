@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **MCP**: `define_tag` adds or removes aliases and parents of a tag (an alias that is already
+  a tag in use is merged into it), `rename_tag` renames a tag everywhere and reports `merged`
+  when the new name was an existing tag, and `define_attr` defines an attribute, so an agent
+  can now use `set_attr` without the Web UI. `search` takes `offset` and returns
+  `next_offset` while more results remain; before, only the first 500 could be reached.
+
 ## [0.25.0] - 2026-11-19
 
 ### Added

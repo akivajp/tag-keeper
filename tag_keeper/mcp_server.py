@@ -44,7 +44,7 @@ from tag_keeper.plan import (
     write_plan,
 )
 from tag_keeper.syncguard import SyncError, make_guard
-from tag_keeper.tags import TagError, TagStore
+from tag_keeper.tags import TagError, TagStore, normalize_tag
 from tag_keeper.tags import search as tags_search
 from tag_keeper.web.files import PathError, clean_relpath, resolve_within
 # 属性の条件の解析と照合は、Web の画面の検索と同じものを使う（結果をそろえるため）
@@ -70,7 +70,8 @@ tag-keeper のカタログ（既存のフォルダ構成のまま、ファイル
 - タグを付ける前に list_tags で既存のタグを確かめ、なるべく既存のタグ（または別名）を使う。むやみに新しいタグを作らない。
 - フォルダに付けたタグ・属性は配下のアイテムにも効く（継承）。まとめて付けるときはフォルダに付けるとよい。
 - ファイルごとに違うタグを付けるときは、add_tags の items にまとめて1回で渡す。
-- まだタグが1つも効いていないもの（未整理）は、search の untagged=true で探せる。
+- まだタグが1つも効いていないもの（未整理）は、search の untagged=true で探せる。件数が多ければ next_offset で続きを読む。
+- 表記ゆれは define_tag の aliases で別名にまとめ、分類の上下は parents で表す。属性は define_attr で定義してから set_attr で付ける。
 - 移動・改名は move_items、削除は delete_items。削除は隔離フォルダへ移すだけで、どちらも undo_plan で取り消せる。
   利用者に確かめずに消さない。迷うものは消さずに「状態:削除候補」のようなタグを付けて、利用者に判断を任せる。
 """
@@ -173,10 +174,12 @@ class AgentTools:
         limit: int = 50,
         untagged: bool = False,
         direct_only: bool = False,
+        offset: int = 0,
     ) -> dict[str, Any]:
         """アイテムを探す（Web の画面の検索と同じ条件）。root を省くと全ルートを探す。
 
         untagged はタグが1つも効いていないもの、direct_only はフォルダからの継承を見ずに、直接付いたタグだけで判定する。
+        offset は先頭から飛ばす件数（ルート名・パスの順に並ぶので、next_offset を渡せば続きが読める）。
         """
         config = self._config()
         store = self._store(config)
@@ -192,6 +195,9 @@ class AgentTools:
         if untagged and include:
             raise ValueError("untagged（タグ無し）と tags は一緒に指定できません")
         limit = max(1, min(int(limit), MAX_RESULTS))
+        offset = max(0, int(offset))
+        # 全ルートを通して、まだ飛ばしていない件数
+        skip = offset
         under_rel = clean_relpath(under)
         terms = query_terms(text)
         roots = [self._root(config, root)] if root else list(config.roots)
@@ -225,8 +231,10 @@ class AgentTools:
                     values = store.attr_paths(rc.name)
                     paths = [p for p in paths if _attrs_match(p, conds, values, defs)]
                 total += len(paths)
-                # 返す件数の上限は、全ルートを通して数える
-                shown = paths[: max(limit - len(items), 0)]
+                # 飛ばす件数と返す件数の上限は、全ルートを通して数える
+                dropped = min(skip, len(paths))
+                skip -= dropped
+                shown = paths[dropped: dropped + max(limit - len(items), 0)]
                 snips = snippets(conn, [info[p]["sha256"] for p in shown if info[p]["sha256"]], terms) if terms else {}
                 for p in shown:
                     r = info[p]
@@ -242,7 +250,11 @@ class AgentTools:
                     })
         finally:
             conn.close()
-        return {"total": total, "returned": len(items), "items": items}
+        out: dict[str, Any] = {"total": total, "offset": offset, "returned": len(items), "items": items}
+        if offset + len(items) < total:
+            # 続きがあれば、次に渡す offset を添える
+            out["next_offset"] = offset + len(items)
+        return out
 
     def get_item(self, root: str, path: str) -> dict[str, Any]:
         """ファイル・フォルダ1件の詳細（タグ・属性・関係・同じ内容のファイル・抽出した本文の有無）を返す。"""
@@ -425,6 +437,71 @@ class AgentTools:
         rc, rels, store = self._targets(root, paths, must_exist=False)
         n = store.unset_attr(rc.name, rels, name)
         return {"root": rc.name, "paths": rels, "name": name, "changed": n}
+
+    # --- 書き込み（タグの辞書・属性の定義） ---
+
+    def define_tag(
+        self, tag: str, aliases: list[str] | None = None, parents: list[str] | None = None,
+        remove_aliases: list[str] | None = None, remove_parents: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """タグの別名・親を登録する（または外す）。登録後のそのタグの辞書（別名・親・子）を返す。
+
+        別名に既に使われているタグを渡すと、そのタグが付いたアイテムは正式な名前へまとめられる。
+        親を登録すると、tag が付いたものは親のタグでも探せるようになる（循環するものは断る）。
+        """
+        config = self._config()
+        store = self._store(config)
+        canon = store.canonical(tag)
+        if not canon:
+            raise ValueError("tag を指定してください")
+        if not (aliases or parents or remove_aliases or remove_parents):
+            raise ValueError("aliases・parents・remove_aliases・remove_parents のどれかを指定してください")
+        # 外すものを先に、足すものを後に（入れ替えを1回で頼めるように）
+        own_aliases = set(store.dictionary().get(canon, {}).get("aliases", []))
+        for a in remove_aliases or []:
+            if not a.strip():
+                continue
+            # ほかのタグの別名を、取り違えて外さない
+            if normalize_tag(a) not in own_aliases:
+                raise TagError(f"{canon} の別名ではありません: {a}")
+            store.remove_alias(a)
+        for p in remove_parents or []:
+            if p.strip():
+                store.remove_parent(canon, p)
+        for a in aliases or []:
+            if a.strip():
+                store.add_alias(canon, a)
+        for p in parents or []:
+            if p.strip():
+                store.add_parent(canon, p)
+        entry = store.dictionary().get(canon, {"aliases": [], "parents": [], "children": []})
+        log.info("エージェントがタグの辞書を変えました: %s %s", canon, entry)
+        return {"tag": canon, **entry}
+
+    def rename_tag(self, old: str, new: str) -> dict[str, Any]:
+        """タグの名前を変える（全ルートのすべてのアイテムと、別名・親子の中の名前も）。変わったアイテムの数を返す。
+
+        new が既にあるタグなら、old はそのタグへ統合される（後から分けられない）。
+        """
+        store = self._store(self._config())
+        if not old.strip() or not new.strip():
+            raise ValueError("old と new を指定してください")
+        src, dest = store.canonical(old), store.canonical(new)
+        if src not in store.dictionary():
+            raise ValueError(f"そのタグはありません: {old}")
+        merged = dest in store.dictionary()
+        n = store.rename_tag(src, dest)
+        log.info("エージェントがタグの名前を変えました: %s → %s（%d 件）", src, dest, n)
+        return {"from": src, "to": dest, "changed": n, "merged": merged}
+
+    def define_attr(self, name: str, type: str, choices: list[str] | None = None) -> dict[str, Any]:  # noqa: A002
+        """属性を定義する（同じ名前なら定義し直す）。type は choice・flag・date・number・text。choice は選択肢を2つ以上。"""
+        store = self._store(self._config())
+        if not name.strip():
+            raise ValueError("name を指定してください")
+        d = store.define_attr(name, type, choices or ())
+        log.info("エージェントが属性を定義しました: %s", d.to_dict())
+        return d.to_dict()
 
     # --- 書き込み（ファイルを動かす。1回ごとの整理プランとして実行する） ---
 
@@ -633,6 +710,7 @@ def build_server(tools: AgentTools) -> Any:
         limit: int = 50,
         untagged: bool = False,
         direct_only: bool = False,
+        offset: int = 0,
     ) -> dict[str, Any]:
         """ファイル（folders=true ならフォルダも）を探す。条件はすべて AND で、少なくとも1つ要る。
 
@@ -654,9 +732,10 @@ def build_server(tools: AgentTools) -> Any:
             limit: 返す件数の上限（最大 500）。total には全件数が入る。
             untagged: true なら、タグが1つも効いていないもの（未整理）だけ。tags とは一緒に使えない。
             direct_only: true なら、フォルダからの継承を見ず、そのアイテムに直接付いたタグだけで tags・exclude_tags・untagged を判定する。
+            offset: 先頭から飛ばす件数。結果に next_offset があれば、それを渡すと続きが返る（並びはルート・パスの順）。
         """
         return tools.search(root, words, text, kind, tags, exclude_tags, any_tag, attrs, under, after, before,
-                            min_size, max_size, folders, limit, untagged, direct_only)
+                            min_size, max_size, folders, limit, untagged, direct_only, offset)
 
     @server.tool(annotations=read_only)
     @guarded
@@ -713,6 +792,44 @@ def build_server(tools: AgentTools) -> Any:
     def unset_attr(root: str, paths: list[str], name: str) -> dict[str, Any]:
         """ファイル・フォルダから属性の値を外す。"""
         return tools.unset_attr(root, paths, name)
+
+    @server.tool(annotations=writes)
+    @guarded
+    def define_tag(
+        tag: str, aliases: list[str] | None = None, parents: list[str] | None = None,
+        remove_aliases: list[str] | None = None, remove_parents: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """タグの別名・親（分類の上下）を登録する、または外す。登録後のそのタグの別名・親・子を返す。
+
+        Args:
+            tag: 対象のタグ（別名を渡すと正式な名前に読み替える）。
+            aliases: 別名にする名前（表記ゆれなど）。既にタグとして使われている名前なら、付いたアイテムごと tag へまとめる。
+            parents: 親にするタグ。tag が付いたものは親のタグでも探せるようになる（循環するものは断る）。
+            remove_aliases: 外す別名。
+            remove_parents: 外す親。
+        """
+        return tools.define_tag(tag, aliases, parents, remove_aliases, remove_parents)
+
+    @server.tool(annotations=deletes)
+    @guarded
+    def rename_tag(old: str, new: str) -> dict[str, Any]:
+        """タグの名前を変える（全ルートのすべてのアイテム、別名・親子の中の名前も）。
+
+        new が既にあるタグなら old はそれへ統合され、後から分けられない（結果の merged が true）。統合は利用者に確かめてから行う。
+        """
+        return tools.rename_tag(old, new)
+
+    @server.tool(annotations=writes)
+    @guarded
+    def define_attr(name: str, type: str, choices: list[str] | None = None) -> dict[str, Any]:  # noqa: A002
+        """属性を定義する（set_attr で値を付ける前に要る。同じ名前なら定義し直す）。
+
+        Args:
+            name: 属性の名前（例: 金額・期限・状態）。
+            type: choice（択一）・flag（あり/なし）・date（YYYY-MM-DD）・number（数）・text（文字）のどれか。
+            choices: choice の選択肢（2つ以上）。
+        """
+        return tools.define_attr(name, type, choices)
 
     @server.tool(annotations=moves)
     @guarded

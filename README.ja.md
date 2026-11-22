@@ -267,12 +267,15 @@ $ claude mcp add -s user tag-keeper -- tag-keeper --config ~/my.toml mcp   # 設
 | ツール | すること |
 |---|---|
 | `list_roots` | ルートの名前・場所・ファイル数・最後の走査 |
-| `search` | 名前・本文・種類・タグ・属性・場所・日付・大きさで探す（Web の画面の検索と同じ条件）。`untagged` でタグ無しだけ、`direct_only` で直接付けたタグだけで判定 |
+| `search` | 名前・本文・種類・タグ・属性・場所・日付・大きさで探す（Web の画面の検索と同じ条件）。`untagged` でタグ無しだけ、`direct_only` で直接付けたタグだけで判定。多いときは `offset`（結果の `next_offset`）で続きを読む |
 | `get_item` | 1件の詳細（直接付いた・継承したタグと属性、関係、同じ内容のファイル。フォルダなら直下の一覧） |
 | `read_text` | 抽出した本文（PDF・Office 文書・OCR・書き起こし）を読む |
 | `list_tags` | 既存のタグ（直接付けた件数と、フォルダからの継承を含めて効いているファイルの数・別名・親）、属性の定義、保存した検索 |
 | `add_tags`・`remove_tags` | タグを付ける・外す。`add_tags` は `items` で、ファイルごとに違うタグを1回で付けられる |
 | `set_attr`・`unset_attr` | 定義済みの属性の値を付ける・外す |
+| `define_tag` | タグの別名（既に使われている名前なら、そのタグへまとめる）・親を登録する・外す |
+| `rename_tag` | タグの名前を変える。既にあるタグへ変えると統合になり、結果の `merged` で知らせる |
+| `define_attr` | 属性を定義する（`choice`・`flag`・`date`・`number`・`text`）。`set_attr` の前に要る |
 | `move_items` | ファイル・フォルダを移動・改名する（タグ・属性は追従。既にある名前へは上書きしない） |
 | `delete_items` | ファイル・フォルダを削除する（完全には消さず、隔離フォルダへ移すだけ） |
 | `undo_plan` | `move_items`・`delete_items` の実行を取り消す |
