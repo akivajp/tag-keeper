@@ -1,6 +1,6 @@
 {
   "name": "tag-keeper",
-  "version": "0.26.0",
+  "version": "0.27.0",
   "description": "Search, read, tag and tidy the files in your tag-keeper catalog from Claude Code. Runs `tag-keeper mcp` with uvx; moves, renames and deletions run as undoable plans, and deleting only moves files to the quarantine folder.",
   "author": {
     "name": "Akiva Miura"
