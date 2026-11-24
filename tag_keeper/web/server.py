@@ -51,7 +51,7 @@ from tag_keeper.config import (
 from tag_keeper.analyze import AnalyzeWorker
 from tag_keeper.snapwatch import Watch
 from tag_keeper.decisions import DecisionLog
-from tag_keeper.fulltext import KINDS, ExtractWorker, find_entries, index_status, query_terms, snippets
+from tag_keeper.fulltext import KINDS, ORDERS, ExtractWorker, find_entries, index_status, query_terms, snippets
 from tag_keeper.hashing import hash_root, sha256_file
 from tag_keeper.history import HistoryError
 from tag_keeper.jobs import AutoRefresh, JobBusyError, JobManager, JobReporter, RootTiming
@@ -1676,7 +1676,9 @@ def create_app(
         tag・not・mode（タグ。別名は正式な名前に、親のタグは子のタグが付いたものも含む。フォルダのタグは配下にも効く）、
         untagged=1（タグが1つも効いていないものだけ）、direct=1（フォルダからの継承を見ず、直接付いたタグだけで判定する）、
         attr（属性。「名前」「名前=値」「名前>=値」など。フォルダの値は配下が継承する）、
-        gone=1（今は無いものも含める）、collapse=1（同じ内容のファイルを1件にまとめる）、folders=1（フォルダも出す）、limit。
+        gone=1（今は無いものも含める）、collapse=1（同じ内容のファイルを1件にまとめる）、folders=1（フォルダも出す）、limit、
+        order（並び順: 空ならパスの順、mtime は更新日時の新しい順、added はカタログに現れた日時の新しい順。
+        並び順を指定すれば、ほかの条件が無くても全件を並べる）、offset（先頭から飛ばす件数。続きを読むため）。
         """
         # getall() などは値を latin-1 のまま返すので、UTF-8 に直した写しから読む（日本語の語とタグのため）
         uq = bottle.request.query.decode()
@@ -1696,6 +1698,9 @@ def create_app(
         files_only = uq.get("folders") != "1"
         untagged = uq.get("untagged") == "1"
         direct = uq.get("direct") == "1"
+        order = uq.get("order", "")
+        if order not in ORDERS:
+            raise fail(400, f"並び順が不正です: {order}")
 
         def number(key: str) -> int | None:
             raw = uq.get(key, "").strip()
@@ -1708,10 +1713,11 @@ def create_app(
 
         limit = number("limit") or 500
         limit = max(1, min(limit, 5000))
+        offset = max(0, number("offset") or 0)
         after, before = uq.get("after", "").strip(), uq.get("before", "").strip()
         min_size, max_size = number("min_size"), number("max_size")
         if not (include or exclude or words or text or kind or under or after or before or min_size is not None
-                or max_size is not None or conds or untagged):
+                or max_size is not None or conds or untagged or order):
             raise fail(400, "探す条件を入れてください")
         terms = query_terms(text)
         conn = open_db()
@@ -1719,7 +1725,7 @@ def create_app(
             try:
                 rows = find_entries(
                     conn, root_id_of(conn, rc), words=words, text=text, kind=kind, files_only=files_only, under=under,
-                    after=after, before=before, min_size=min_size, max_size=max_size, gone=uq.get("gone") == "1",
+                    after=after, before=before, min_size=min_size, max_size=max_size, gone=uq.get("gone") == "1", order=order,
                 )
             except ValueError as e:
                 raise fail(400, f"日付は YYYY-MM-DD で指定してください（{e}）") from None
@@ -1749,19 +1755,22 @@ def create_app(
                         copies[p] = []
                     kept.append(p)
                 paths = kept
-            shown = paths[:limit]
+            shown = paths[offset : offset + limit]
             snips = snippets(conn, [info[p]["sha256"] for p in shown if info[p]["sha256"]], terms) if terms else {}
         finally:
             conn.close()
         return {
             "root": rc.name,
             "total": len(paths),
+            "offset": offset,
             "items": [
                 {
                     "path": path,
                     "is_dir": bool(info[path]["is_dir"]),
                     "size": info[path]["size"],
                     "mtime": info[path]["mtime_ns"] // 1_000_000_000,
+                    # カタログに初めて現れた日時（UTC の ISO 8601）。「追加順」で並べたときに見せる
+                    "added": info[path]["first_seen"],
                     "tags": store.tags_of(rc.name, path),
                     "attrs": store.attrs_of(rc.name, path),
                     "snippet": snips.get(info[path]["sha256"] or "", ""),

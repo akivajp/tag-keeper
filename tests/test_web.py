@@ -600,6 +600,46 @@ def test_purge_from_the_web(env: dict) -> None:
 # ---------- タグの辞書・属性・検索の絞り込み・保存した検索（0.12） ----------
 
 
+def test_search_orders_by_modified_or_added_and_pages(env: dict) -> None:
+    """並び順（更新・追加が新しい順）を選べば、ほかの条件が無くても全件を新しい順に並べ、offset で続きを読める。"""
+    import os
+    import sqlite3
+
+    app, root = env["app"], env["root"]
+    write(root / "x" / "old.txt", "old")
+    write(root / "y" / "new.txt", "new")
+    os.utime(root / "x" / "old.txt", (1_600_000_000, 1_600_000_000))
+    os.utime(root / "y" / "new.txt", (1_900_000_000, 1_900_000_000))
+    run_job(env, "/api/roots/data/refresh")
+    # 追加日時（カタログに初めて現れた日時）は、更新日時と逆の順にしておく（古いファイルを後から足した場合）
+    conn = sqlite3.connect(env["settings"].db_path)
+    with conn:
+        conn.execute("UPDATE entries SET first_seen = '2020-01-01T00:00:00+00:00'")
+        conn.execute("UPDATE entries SET first_seen = '2026-11-24T00:00:00+00:00' WHERE relpath = 'x/old.txt'")
+    conn.close()
+
+    def find(**params: object) -> list[str]:
+        return [x["path"] for x in app.get("/api/search", params).json["items"]]
+
+    # 条件が無くても、並び順を選べば全ファイルを返す（フォルダの構造に関係なくフラットに）
+    by_mtime = find(order="mtime")
+    assert by_mtime[0] == "y/new.txt" and by_mtime[-1] == "x/old.txt"
+    assert len(by_mtime) == 5
+    by_added = find(order="added")
+    assert by_added[0] == "x/old.txt"
+    # 追加日時を返す
+    first = app.get("/api/search", {"order": "added", "limit": 1}).json
+    assert first["items"][0]["added"] == "2026-11-24T00:00:00+00:00" and first["total"] == 5
+    # offset で続きを読むと、重ならずに全件そろう
+    pages = [x["path"] for off in range(0, 5, 2) for x in app.get("/api/search", {"order": "mtime", "limit": 2, "offset": off}).json["items"]]
+    assert pages == by_mtime
+    # ほかの条件と組み合わせられる
+    assert find(order="mtime", under="x") == ["x/old.txt"]
+    # 並び順を選ばず条件も無ければ、今までどおり断る。不正な並び順も断る
+    app.get("/api/search", status=400)
+    app.get("/api/search", {"order": "nope"}, status=400)
+
+
 def test_search_filters_attributes_dictionary_and_saved_searches(env: dict) -> None:
     import os
 

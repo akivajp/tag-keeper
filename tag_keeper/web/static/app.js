@@ -978,7 +978,9 @@ async function route() {
   const params = new URLSearchParams(hashQuery || '');
   // #/tags は前の版の URL（ブックマーク）のため。検索の画面を開く
   const navOf = { report: 'roots', relink: 'roots', browse: 'browse', organize: 'organize', search: 'search', tags: 'search', review: 'review', plans: 'plans' };
-  document.querySelectorAll('[data-nav]').forEach((a) => a.classList.toggle('active', (navOf[parts[0]] || 'roots') === a.dataset.nav));
+  // 並び順を選んだ検索は「最近」のビューとして、上部の「最近」を選んだ状態にする
+  const navKey = parts[0] === 'search' && params.get('order') ? 'recent' : (navOf[parts[0]] || 'roots');
+  document.querySelectorAll('[data-nav]').forEach((a) => a.classList.toggle('active', navKey === a.dataset.nav));
   // 検索の画面は、条件を1つ変えるたびに URL を変えて描き直す。その間に次の欄へ入力を始めていても、
   // 文字とフォーカスが消えないよう、描き直した画面の同じ欄に引き継ぐ
   const kind = parts[0] === 'tags' ? 'search' : (parts[0] || '');

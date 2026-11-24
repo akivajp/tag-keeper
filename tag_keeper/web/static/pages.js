@@ -919,6 +919,12 @@ async function dirCardDialog(root, path, card) {
   catch (e) { toast(e.message, 'danger'); }
 }
 
+// 検索の結果の並び順（URL の order。空はパスの順）。並び順を選べば、ほかの条件が無くても全件を新しい順に並べる
+const SEARCH_ORDERS = [['', 'パスの順'], ['mtime', '更新が新しい順'], ['added', '追加が新しい順']];
+
+// 並び順を選んだときに、1回に読む件数（「さらに読み込む」で続きを読む）
+const ORDERED_PAGE = 200;
+
 /** 検索の条件（URL の問い合わせ）を読む。保存した検索の件数を数えるときにも使う。 */
 function searchState(params) {
   return {
@@ -940,6 +946,8 @@ function searchState(params) {
     // タグが1つも効いていないもの（未整理）だけ／フォルダからの継承を見ず、直接付いたタグだけで判定する
     untagged: params.get('untagged') === '1',
     direct: params.get('direct') === '1',
+    // 並び順（mtime: 更新が新しい順／added: カタログに追加された日時が新しい順）
+    order: SEARCH_ORDERS.some(([v]) => v && v === params.get('order')) ? params.get('order') : '',
   };
 }
 
@@ -949,7 +957,7 @@ function searchQuery(state) {
   state.include.forEach((x) => q.append('t', x));
   state.exclude.forEach((x) => q.append('not', x));
   if (state.mode === 'or') q.set('mode', 'or');
-  for (const k of ['q', 'text', 'kind', 'under', 'after', 'before', 'min', 'max']) if (state[k]) q.set(k, state[k]);
+  for (const k of ['q', 'text', 'kind', 'under', 'after', 'before', 'min', 'max', 'order']) if (state[k]) q.set(k, state[k]);
   state.attrs.forEach((x) => q.append('attr', x));
   if (state.folders) q.set('folders', '1');
   if (state.gone) q.set('gone', '1');
@@ -961,15 +969,15 @@ function searchQuery(state) {
 
 /** 条件が1つでもあるか（何も無ければ探さない）。 */
 function searchHasCondition(s) {
-  return s.include.length || s.exclude.length || s.q || s.text || s.kind || s.under || s.after || s.before || s.min || s.max || s.attrs.length || s.untagged;
+  return s.include.length || s.exclude.length || s.q || s.text || s.kind || s.under || s.after || s.before || s.min || s.max || s.attrs.length || s.untagged || s.order;
 }
 
 /** 検索の条件を、検索の API の問い合わせにする。 */
-function searchApiQuery(state, root, limit) {
+function searchApiQuery(state, root, limit, offset = 0) {
   const q = new URLSearchParams({ root, mode: state.mode });
   state.include.forEach((x) => q.append('tag', x));
   state.exclude.forEach((x) => q.append('not', x));
-  for (const k of ['q', 'text', 'kind', 'under', 'after', 'before']) if (state[k]) q.set(k, state[k]);
+  for (const k of ['q', 'text', 'kind', 'under', 'after', 'before', 'order']) if (state[k]) q.set(k, state[k]);
   const min = parseSize(state.min);
   const max = parseSize(state.max);
   if (min !== null) q.set('min_size', String(min));
@@ -981,6 +989,7 @@ function searchApiQuery(state, root, limit) {
   if (state.untagged) q.set('untagged', '1');
   if (state.direct) q.set('direct', '1');
   if (limit) q.set('limit', String(limit));
+  if (offset) q.set('offset', String(offset));
   return q;
 }
 
@@ -989,7 +998,7 @@ let tagListFilter = '';
 
 async function pageTags(main, params) {
   // 検索の条件は URL に持つ（#/search?t=含むタグ&not=除くタグ&mode=and|or&q=名前&text=本文&kind=種類&under=場所
-  // &after=&before=（更新日）&min=&max=（大きさ）&attr=属性の条件&gone=1&nocollapse=1&folders=1）。#/tags は前の版の URL
+  // &after=&before=（更新日）&min=&max=（大きさ）&attr=属性の条件&gone=1&nocollapse=1&folders=1&order=mtime|added）。#/tags は前の版の URL
   const state = searchState(params);
   // 探すルート（#/search?root=名前。指定が無ければ最初のルート）。条件を変えても同じルートで探す
   const rootParam = params.get('root') || '';
@@ -1207,6 +1216,9 @@ async function pageTags(main, params) {
       h('input', { type: 'search', placeholder: t('本文に含む語'), title: t('PDF・Office・テキストの本文から探します（文字の無いスキャンは OCR で読んだもの）'), value: state.text, onchange: (e) => { state.text = e.target.value.trim(); go(); } }),
       h('select', { 'aria-label': t('種類'), onchange: (e) => { state.kind = e.target.value; go(); } },
         SEARCH_KINDS.map(([v, label]) => h('option', { value: v, selected: state.kind === v }, t(label)))),
+      h('select', { 'aria-label': t('並び順'), title: t('更新・追加が新しい順を選ぶと、ほかの条件が無くても全ファイルを新しい順に並べます（フォルダの構造に関係なく）'),
+        onchange: (e) => { state.order = e.target.value; go(); } },
+        SEARCH_ORDERS.map(([v, label]) => h('option', { value: v, selected: state.order === v }, t(label)))),
       h('label', { class: 'small' }, h('input', { type: 'checkbox', checked: state.folders, onchange: (e) => { state.folders = e.target.checked; go(); } }), ' ', t('フォルダも出す')),
       h('label', { class: 'small', title: t('タグが1つも効いていないもの（未整理）だけを出します。フォルダから継承したタグも数えます。') },
         h('input', { type: 'checkbox', checked: state.untagged, onchange: (e) => { state.untagged = e.target.checked; if (state.untagged) state.include = []; go(); } }), ' ', t('タグ無しだけ')),
@@ -1236,21 +1248,28 @@ async function pageTags(main, params) {
   ];
   const right = h('div', {}, conditions);
   if (!searchHasCondition(state)) {
-    right.append(h('p', { class: 'muted' }, t('名前・本文・種類で探すか、左の一覧からタグを選んでください。フォルダに付いたタグは、中のファイルにも効きます。')));
+    right.append(h('p', { class: 'muted' }, t('名前・本文・種類で探すか、左の一覧からタグを選んでください。フォルダに付いたタグは、中のファイルにも効きます。')),
+      h('p', { class: 'muted small' }, t('最近の追加・更新を見るときは、並び順で「更新が新しい順」か「追加が新しい順」を選んでください。')));
     const st = await indexStatus(root);
     if (st) right.append(st);
   } else {
     let res;
-    try { res = await api(`/api/search?${searchApiQuery(state, root)}`); } catch (e) { res = null; right.append(h('div', { class: 'alert danger' }, e.message)); }
+    // 並び順を選んだときは、新しいものから少しずつ読む（全件は「さらに読み込む」で）
+    const pageSize = state.order ? ORDERED_PAGE : 0;
+    try { res = await api(`/api/search?${searchApiQuery(state, root, pageSize)}`); } catch (e) { res = null; right.append(h('div', { class: 'alert danger' }, e.message)); }
     if (res) {
-      const sort = sortState('tag-search', { field: 'path', dir: 'asc' });
-      const getters = { name: (x) => x.path.split('/').pop(), path: (x) => x.path, size: (x) => (x.is_dir ? null : x.size), mtime: (x) => x.mtime };
+      // 並び順を選んだときは、見出しでの並べ替えも既定をその項目の新しい順にする（パスの順の覚えを持ち込まない）
+      const sort = state.order
+        ? sortState(`tag-search-${state.order}`, { field: state.order, dir: 'desc' })
+        : sortState('tag-search', { field: 'path', dir: 'asc' });
+      const getters = { name: (x) => x.path.split('/').pop(), path: (x) => x.path, size: (x) => (x.is_dir ? null : x.size), mtime: (x) => x.mtime, added: (x) => x.added || '' };
       const body = h('tbody');
       const detail = h('div', { class: 'tag-detail' });
       const head = h('tr');
       // チェックして、まとめて削除できる（今は無いものは選べない）
       const picked = new Set();
-      const live = res.items.filter((x) => !x.gone_at);
+      // 「さらに読み込む」で増えるので、let にしておく
+      let live = res.items.filter((x) => !x.gone_at);
       const pickInfo = h('span', { class: 'muted small' });
       const pickDelete = h('button', { class: 'small danger-outline', disabled: true, onclick: () => {
         deleteDialog(root, live.filter((x) => picked.has(x.path)).map((x) => ({ path: x.path, is_dir: x.is_dir, size: x.size })));
@@ -1264,7 +1283,9 @@ async function pageTags(main, params) {
           h('th', { class: 'check' }, h('input', { type: 'checkbox', title: t('すべて選ぶ'), 'aria-label': t('すべて選ぶ'), checked: live.length > 0 && picked.size === live.length,
             onchange: (e) => { picked.clear(); if (e.target.checked) live.forEach((x) => picked.add(x.path)); updatePicked(); renderRows(); } })),
           sortHeader(t('名前'), 'name', sort, renderRows), sortHeader(t('場所'), 'path', sort, renderRows, 'hide-narrow'),
-          h('th', {}, t('タグ・属性')), sortHeader(t('サイズ'), 'size', sort, renderRows, 'num'), sortHeader(t('更新日時'), 'mtime', sort, renderRows, 'num hide-narrow'));
+          h('th', {}, t('タグ・属性')), sortHeader(t('サイズ'), 'size', sort, renderRows, 'num'), sortHeader(t('更新日時'), 'mtime', sort, renderRows, 'num hide-narrow'),
+          // 追加順で並べたときだけ、カタログに追加された日時の列を出す
+          state.order === 'added' ? sortHeader(t('追加日時'), 'added', sort, renderRows, 'num hide-narrow') : null);
         setChildren(body, sortItems(res.items, sort, getters, (x) => x.path).map((x) => {
           const name = x.path.split('/').pop();
           const dir = x.path.split('/').slice(0, -1).join('/');
@@ -1286,7 +1307,8 @@ async function pageTags(main, params) {
               x.attrs.direct.map((a) => h('span', { class: 'chip attr' }, attrText(a.name, a.value))),
               x.attrs.inherited.map((a) => h('span', { class: 'chip attr inherited', title: t('{from} から継承', { from: a.from || root }) }, attrText(a.name, a.value))))),
             h('td', { class: 'num' }, x.is_dir ? '' : size(x.size)),
-            h('td', { class: 'num hide-narrow' }, when(new Date(x.mtime * 1000).toISOString())));
+            h('td', { class: 'num hide-narrow' }, when(new Date(x.mtime * 1000).toISOString())),
+            state.order === 'added' ? h('td', { class: 'num hide-narrow' }, x.added ? when(x.added) : '') : null);
         }));
       };
       const showDetail = async (x) => {
@@ -1311,13 +1333,32 @@ async function pageTags(main, params) {
         detail.scrollIntoView({ block: 'nearest' });
       };
       renderRows();
-      right.append(
-        h('p', { class: 'muted small' }, res.total > res.items.length
+      // 件数の表示と、続きを読むボタン（並び順を選んだときだけ。サーバーの並びの続きを足す）
+      const countLine = h('p', { class: 'muted small' });
+      const more = h('div', { class: 'buttons' });
+      const renderCount = () => {
+        countLine.textContent = res.total > res.items.length
           ? t('{total} 件のうち {n} 件を表示', { total: num(res.total), n: num(res.items.length) })
-          : t('{n} 件', { n: num(res.total) })),
+          : t('{n} 件', { n: num(res.total) });
+        setChildren(more, state.order && res.items.length < res.total ? h('button', { class: 'small', onclick: async (e) => {
+          e.target.disabled = true;
+          try {
+            const next = await api(`/api/search?${searchApiQuery(state, root, ORDERED_PAGE, res.items.length)}`);
+            res.items = res.items.concat(next.items);
+            res.total = next.total;
+            live = res.items.filter((x) => !x.gone_at);
+            renderRows();
+            renderCount();
+          } catch (err) { e.target.disabled = false; toast(err.message, 'danger'); }
+        } }, t('さらに読み込む')) : null);
+      };
+      renderCount();
+      right.append(
+        countLine,
         h('div', { class: 'toolbar' }, pickDelete, pickInfo),
         detail,
-        h('div', { class: 'card table-wrap' }, h('table', {}, h('thead', {}, head), body)));
+        h('div', { class: 'card table-wrap' }, h('table', {}, h('thead', {}, head), body)),
+        more);
       // 本文で探したときは、索引がどこまでできているか（抽出待ちが残っていれば、見つからないことがある）
       if (state.text) {
         const st = await indexStatus(root);
@@ -1325,7 +1366,7 @@ async function pageTags(main, params) {
       }
     }
   }
-  setChildren(main, await tagDatalist(), h('h1', {}, t('検索')), splitPane('tags', left, right, 30));
+  setChildren(main, await tagDatalist(), h('h1', {}, t(state.order ? '最近の追加・更新' : '検索')), splitPane('tags', left, right, 30));
 }
 
 // ---------- 整理の提案の部品（受け皿の一覧とファイルブラウザで共通） ----------

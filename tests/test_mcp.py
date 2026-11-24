@@ -168,6 +168,26 @@ def test_move_delete_and_undo(tools: AgentTools, root: Path) -> None:
         tools.undo_plan("nope")
 
 
+def test_search_orders_newest_first(tools: AgentTools) -> None:
+    """order を指定すれば、条件が無くても新しい順に返す。added はカタログに現れた日時。"""
+    import sqlite3
+
+    # 更新日時と追加日時は、カタログの値を直接書き換えて決める
+    conn = sqlite3.connect(tools.db_path)
+    with conn:
+        conn.execute("UPDATE entries SET mtime_ns = 1900000000000000000 WHERE relpath = 'photos/a.jpg'")
+        conn.execute("UPDATE entries SET mtime_ns = 1600000000000000000 WHERE relpath = 'docs/memo.txt'")
+        conn.execute("UPDATE entries SET first_seen = '2020-01-01T00:00:00+00:00'")
+        conn.execute("UPDATE entries SET first_seen = '2026-11-24T00:00:00+00:00' WHERE relpath = 'docs/memo.txt'")
+    conn.close()
+    res = tools.search(order="mtime")
+    assert [i["path"] for i in res["items"]] == ["photos/a.jpg", "docs/見積書_2026.txt", "docs/memo.txt"]
+    res = tools.search(order="added", limit=1)
+    assert res["items"][0]["path"] == "docs/memo.txt" and res["items"][0]["added"] and res["next_offset"] == 1
+    with pytest.raises(ValueError, match="並び順"):
+        tools.search(order="nope")
+
+
 def test_search_pages_with_offset(tools: AgentTools) -> None:
     # パス順に並ぶので、next_offset をたどると全件を重ならずに読める
     first = tools.search(untagged=True, limit=2)

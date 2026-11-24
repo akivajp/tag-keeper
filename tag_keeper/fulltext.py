@@ -347,6 +347,15 @@ def _day_start_ns(day: str) -> int:
     return int(dt.datetime.combine(dt.date.fromisoformat(day.strip()), dt.time()).timestamp()) * 1_000_000_000
 
 
+# find_entries の並び順（キー → ORDER BY 句）。日時が同じものはパスの順にして、結果の順を毎回そろえる
+ORDERS: dict[str, str] = {
+    "": " ORDER BY relpath, gone_at",
+    "mtime": " ORDER BY mtime_ns DESC, relpath, gone_at",
+    # first_seen は UTC の ISO 8601 文字列なので、文字の順がそのまま時刻の順になる
+    "added": " ORDER BY first_seen DESC, relpath, gone_at",
+}
+
+
 def find_entries(
     conn: sqlite3.Connection,
     root_id: int,
@@ -361,6 +370,7 @@ def find_entries(
     min_size: int | None = None,
     max_size: int | None = None,
     gone: bool = False,
+    order: str = "",
 ) -> list[sqlite3.Row]:
     """名前・パス・本文・種類・場所・日付・大きさで、アイテムを探す（タグと属性での絞り込みは呼び出し側で行う）。
 
@@ -377,11 +387,15 @@ def find_entries(
         min_size: これ以上の大きさ（バイト）のファイルだけ。
         max_size: これ以下の大きさのファイルだけ。
         gone: 今は無いもの（消えた・動いた前のパス）も含める（F-VS-4）。今あるパスと同じものは除き、同じパスは最後の記録だけ。
+        order: 並び順。""（パスの順）、"mtime"（更新日時の新しい順）、"added"（カタログに初めて現れた日時の新しい順）。
+            同じ日時のものはパスの順。
 
     Returns:
-        relpath・is_dir・size・mtime_ns・sha256・gone_at を持つ行（パスの順）。
+        relpath・is_dir・size・mtime_ns・first_seen・sha256・gone_at を持つ行（order の順）。
     """
-    sql = "SELECT relpath, is_dir, size, mtime_ns, sha256, gone_at FROM entries WHERE root_id = ?"
+    if order not in ORDERS:
+        raise ValueError(f"並び順が不正です: {order}")
+    sql = "SELECT relpath, is_dir, size, mtime_ns, first_seen, sha256, gone_at FROM entries WHERE root_id = ?"
     args: list[Any] = [root_id]
     if not gone:
         sql += " AND gone_at IS NULL"
@@ -415,7 +429,7 @@ def find_entries(
         sub, sub_args = text_match_sql(conn, terms)
         sql += f" AND sha256 IN ({sub})"
         args.extend(sub_args)
-    rows = conn.execute(sql + " ORDER BY relpath, gone_at", args).fetchall()
+    rows = conn.execute(sql + ORDERS[order], args).fetchall()
     if kind:
         exts = KINDS.get(kind, frozenset())
         rows = [r for r in rows if ext_of(r["relpath"]) in exts]
@@ -429,8 +443,9 @@ def find_entries(
             cur = latest.get(r["relpath"])
             if cur is None or str(r["gone_at"]) > str(cur["gone_at"]):
                 latest[r["relpath"]] = r
-        rows = [r for r in rows if r["gone_at"] is None] + list(latest.values())
-        rows.sort(key=lambda r: r["relpath"])
+        keep = {id(r) for r in rows if r["gone_at"] is None} | {id(r) for r in latest.values()}
+        # 元の並び（order の順）を保ったまま、残すものだけにする
+        rows = [r for r in rows if id(r) in keep]
     return rows
 
 

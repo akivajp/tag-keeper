@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Recent**: a new link in the top bar lists every file in a root newest first, regardless
+  of folder structure. The search page has an order selector — by path, **Recently modified
+  first**, or **Recently added first** (when the catalog first saw the file, which moves and
+  renames keep) — that works with no other condition and combines with all of them; ordered
+  results load 200 at a time with **Load more** (`order` and `offset` on `/api/search`, and
+  `added` in each result). Before, sorting by date only reordered the first 500 results in
+  path order.
+- **MCP**: `search` takes `order` (`mtime` or `added`) to list items newest first across
+  all roots, and returns `added` for each item.
+
 ## [0.26.0] - 2026-11-22
 
 ### Added

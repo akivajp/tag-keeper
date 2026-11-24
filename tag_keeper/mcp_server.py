@@ -25,7 +25,7 @@ from typing import Any
 from tag_keeper import __version__, rules
 from tag_keeper.catalog import connect, last_scan, utcnow
 from tag_keeper.config import Config, ConfigError, RootConfig, load_config
-from tag_keeper.fulltext import KINDS, find_entries, query_terms, snippets
+from tag_keeper.fulltext import KINDS, ORDERS, find_entries, query_terms, snippets
 from tag_keeper.plan import (
     ACTION_MOVE,
     ACTION_QUARANTINE,
@@ -175,11 +175,13 @@ class AgentTools:
         untagged: bool = False,
         direct_only: bool = False,
         offset: int = 0,
+        order: str = "",
     ) -> dict[str, Any]:
         """アイテムを探す（Web の画面の検索と同じ条件）。root を省くと全ルートを探す。
 
         untagged はタグが1つも効いていないもの、direct_only はフォルダからの継承を見ずに、直接付いたタグだけで判定する。
-        offset は先頭から飛ばす件数（ルート名・パスの順に並ぶので、next_offset を渡せば続きが読める）。
+        offset は先頭から飛ばす件数（既定はルート名・パスの順に並ぶので、next_offset を渡せば続きが読める）。
+        order は並び順（""・"mtime"・"added"。fulltext.ORDERS）。指定すると全ルートを通して新しい順に並べ、ほかの条件が無くても探せる。
         """
         config = self._config()
         store = self._store(config)
@@ -190,19 +192,19 @@ class AgentTools:
         if kind and kind not in KINDS:
             raise ValueError(f"種類が不正です: {kind}（使えるもの: {', '.join(sorted(KINDS))}）")
         if not (words or text.strip() or kind or include or exclude or conds or under or after or before
-                or min_size is not None or max_size is not None or untagged):
+                or min_size is not None or max_size is not None or untagged or order):
             raise ValueError("探す条件（words・text・kind・tags・exclude_tags・untagged・attrs・under・after・before・大きさ のどれか）を指定してください")
         if untagged and include:
             raise ValueError("untagged（タグ無し）と tags は一緒に指定できません")
+        if order not in ORDERS:
+            raise ValueError(f"並び順が不正です: {order}（使えるもの: mtime・added・空）")
         limit = max(1, min(int(limit), MAX_RESULTS))
         offset = max(0, int(offset))
-        # 全ルートを通して、まだ飛ばしていない件数
-        skip = offset
         under_rel = clean_relpath(under)
         terms = query_terms(text)
         roots = [self._root(config, root)] if root else list(config.roots)
-        items: list[dict[str, Any]] = []
-        total = 0
+        # 当てはまったもの（ルート名, パス, 行）。並び順はルートの順のあと、各ルートの中で order の順
+        matched: list[tuple[str, str, Any]] = []
         conn = connect(self.db_path)
         try:
             for rc in roots:
@@ -213,7 +215,7 @@ class AgentTools:
                 try:
                     rows = find_entries(
                         conn, int(row["id"]), words=words, text=text, kind=kind, files_only=not folders, under=under_rel,
-                        after=after, before=before, min_size=min_size, max_size=max_size,
+                        after=after, before=before, min_size=min_size, max_size=max_size, order=order,
                     )
                 except ValueError as e:
                     raise ValueError(f"日付は YYYY-MM-DD で指定してください（{e}）") from None
@@ -230,24 +232,28 @@ class AgentTools:
                     defs = {d["name"]: d for d in store.attr_defs_list()}
                     values = store.attr_paths(rc.name)
                     paths = [p for p in paths if _attrs_match(p, conds, values, defs)]
-                total += len(paths)
-                # 飛ばす件数と返す件数の上限は、全ルートを通して数える
-                dropped = min(skip, len(paths))
-                skip -= dropped
-                shown = paths[dropped: dropped + max(limit - len(items), 0)]
-                snips = snippets(conn, [info[p]["sha256"] for p in shown if info[p]["sha256"]], terms) if terms else {}
-                for p in shown:
-                    r = info[p]
-                    items.append({
-                        "root": rc.name,
-                        "path": p,
-                        "is_dir": bool(r["is_dir"]),
-                        "size": r["size"],
-                        "modified": _iso(r["mtime_ns"]),
-                        "tags": _flat_tags(store.tags_of(rc.name, p)),
-                        "attrs": _flat_attrs(store.attrs_of(rc.name, p)),
-                        **({"snippet": snips[r["sha256"]]} if r["sha256"] in snips else {}),
-                    })
+                matched.extend((rc.name, p, info[p]) for p in paths)
+            if order and len(roots) > 1:
+                # 全ルートを通して新しい順にする（同じ日時は、設定のルートの順・パスの順のまま。sort は安定）
+                col = "mtime_ns" if order == "mtime" else "first_seen"
+                matched.sort(key=lambda m: m[2][col], reverse=True)
+            total = len(matched)
+            shown = matched[offset : offset + limit]
+            snips = snippets(conn, [m[2]["sha256"] for m in shown if m[2]["sha256"]], terms) if terms else {}
+            items: list[dict[str, Any]] = []
+            for name, p, r in shown:
+                items.append({
+                    "root": name,
+                    "path": p,
+                    "is_dir": bool(r["is_dir"]),
+                    "size": r["size"],
+                    "modified": _iso(r["mtime_ns"]),
+                    # カタログに初めて現れた日時（この端末の時刻帯）
+                    "added": _iso_text(r["first_seen"]),
+                    "tags": _flat_tags(store.tags_of(name, p)),
+                    "attrs": _flat_attrs(store.attrs_of(name, p)),
+                    **({"snippet": snips[r["sha256"]]} if r["sha256"] in snips else {}),
+                })
         finally:
             conn.close()
         out: dict[str, Any] = {"total": total, "offset": offset, "returned": len(items), "items": items}
@@ -641,6 +647,13 @@ def _iso(mtime_ns: int | None) -> str | None:
     return datetime.fromtimestamp(mtime_ns / 1e9, timezone.utc).astimezone().isoformat(timespec="seconds")
 
 
+def _iso_text(stamp: str | None) -> str | None:
+    """カタログに残した UTC の ISO 8601 文字列を、この端末の時刻帯にそろえる（modified と同じ形にするため）。"""
+    if not stamp:
+        return None
+    return datetime.fromisoformat(stamp).astimezone().isoformat(timespec="seconds")
+
+
 def _flat_tags(tags: dict[str, list[dict[str, str]]]) -> list[str]:
     """tags_of の結果（直接・継承・親子の別）を、検索結果向けに効いているタグの一覧へまとめる。"""
     return sorted({t["tag"] for group in ("direct", "inherited", "implied") for t in tags.get(group, [])})
@@ -711,6 +724,7 @@ def build_server(tools: AgentTools) -> Any:
         untagged: bool = False,
         direct_only: bool = False,
         offset: int = 0,
+        order: str = "",
     ) -> dict[str, Any]:
         """ファイル（folders=true ならフォルダも）を探す。条件はすべて AND で、少なくとも1つ要る。
 
@@ -732,10 +746,12 @@ def build_server(tools: AgentTools) -> Any:
             limit: 返す件数の上限（最大 500）。total には全件数が入る。
             untagged: true なら、タグが1つも効いていないもの（未整理）だけ。tags とは一緒に使えない。
             direct_only: true なら、フォルダからの継承を見ず、そのアイテムに直接付いたタグだけで tags・exclude_tags・untagged を判定する。
-            offset: 先頭から飛ばす件数。結果に next_offset があれば、それを渡すと続きが返る（並びはルート・パスの順）。
+            offset: 先頭から飛ばす件数。結果に next_offset があれば、それを渡すと続きが返る（既定の並びはルート・パスの順）。
+            order: 並び順。"mtime" は更新日時の新しい順、"added" はカタログに現れた（追加された）日時の新しい順で、全ルートを通して並べる。
+                指定すれば、ほかの条件が無くても全件から新しい順に返す（最近の追加・更新を見るとき）。結果の added が追加日時。
         """
         return tools.search(root, words, text, kind, tags, exclude_tags, any_tag, attrs, under, after, before,
-                            min_size, max_size, folders, limit, untagged, direct_only, offset)
+                            min_size, max_size, folders, limit, untagged, direct_only, offset, order)
 
     @server.tool(annotations=read_only)
     @guarded

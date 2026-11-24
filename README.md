@@ -238,6 +238,11 @@ and the theme (system, light or dark).
   deleted, or moved away from that path — which link to the version history. **Save** any set
   of conditions under a name: saved searches sit at the top of the page with their current
   counts, as work lists.
+- **Recent** in the top bar lists every file in a root newest first, regardless of folder
+  structure. Switch the order to *Recently added first* to sort by when the catalog first saw
+  each file (so copies and downloads that keep an old modification time still show up when
+  they arrived; moves and renames keep the date). It combines with the other conditions and
+  tags, and *Load more* reads further.
 - **Find and manage tags** on the same page: filter the tag list, search with several tags
   (all of them or any of them, minus excluded ones) — tags on a folder count for everything
   inside — and rename a tag everywhere (renaming onto an existing tag merges the two) or
@@ -352,7 +357,7 @@ $ claude mcp add -s user tag-keeper -- tag-keeper --config ~/my.toml mcp  # with
 | Tool | What it does |
 |---|---|
 | `list_roots` | root names, paths, file counts and the last scan |
-| `search` | search by name, text, kind, tags, attributes, folder, date and size (same as the Web UI); `untagged` for items with no tag, `direct_only` to ignore tags inherited from folders; `offset` and `next_offset` page through long results |
+| `search` | search by name, text, kind, tags, attributes, folder, date and size (same as the Web UI); `untagged` for items with no tag, `direct_only` to ignore tags inherited from folders; `order` (`mtime`, `added`) sorts newest first across roots; `offset` and `next_offset` page through long results |
 | `get_item` | one item: direct and inherited tags and attributes, relations, identical files; a folder's children |
 | `read_text` | extracted text (PDF, Office documents, OCR, transcripts) |
 | `list_tags` | existing tags (direct count, number of files the tag applies to including inheritance, aliases, parents), attribute definitions, saved searches |

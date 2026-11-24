@@ -14,6 +14,10 @@ const I18N_EN = {
   'タグ無しだけ': 'Untagged only',
   'フォルダから継承したタグを見ず、ファイルやフォルダに直接付けたタグだけで探します。': 'Ignores tags inherited from folders and matches only tags set directly on the file or folder.',
   '直接付けたタグだけで探す': 'Match direct tags only',
+  '最近': 'Recent', '最近の追加・更新': 'Recently added and modified', '並び順': 'Order', 'パスの順': 'By path',
+  '更新が新しい順': 'Recently modified first', '追加が新しい順': 'Recently added first', '追加日時': 'Added', 'さらに読み込む': 'Load more',
+  '更新・追加が新しい順を選ぶと、ほかの条件が無くても全ファイルを新しい順に並べます（フォルダの構造に関係なく）': 'Choosing a newest-first order lists every file newest first, even with no other condition (regardless of folder structure)',
+  '最近の追加・更新を見るときは、並び順で「更新が新しい順」か「追加が新しい順」を選んでください。': 'To see recent additions and changes, choose "Recently modified first" or "Recently added first" as the order.',
   '選んだものを削除…': 'Delete selected…', 'すべて選ぶ': 'Select all',
   // --- 上部・共通 ---
   'ルート': 'Roots', 'ルート名': 'Root', 'ファイル': 'Files', '整理': 'Inbox', 'タグ': 'Tags', 'プラン': 'Plans',
